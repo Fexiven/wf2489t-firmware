@@ -1,0 +1,45 @@
+# Builds the firmware exactly like a local `make`: same pinned container, same Buildroot release.
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Cache source downloads
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: dl-${{ hashFiles('Makefile', 'external/configs/*', 'external/**/*.hash') }}
+          restore-keys: dl-
+
+      - name: Build
+        run: make
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: wf2489t-images
+          path: |
+            output/images/uboot-copy1.img
+            output/images/Image
+            output/images/*.dtb
+            output/images/rootfs.squashfs
+          if-no-files-found: error

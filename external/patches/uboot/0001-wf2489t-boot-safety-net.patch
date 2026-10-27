@@ -1,0 +1,84 @@
+WF2489T boot safety net
+
+First thing in U-Boot proper (arch_cpu_init): save the boot-mode register,
+set BOOT_BROM_DOWNLOAD (0xEF08A53C @ 0x26024040) and arm the DW watchdog
+(~89 s). If U-Boot hangs, the watchdog resets the SoC and the stock SPL
+enters maskrom. Boot-mode logic reads the saved value; the flag is cleared
+in board_quiesce_devices() right before Linux.
+
+diff --git a/arch/arm/mach-rockchip/board.c b/arch/arm/mach-rockchip/board.c
+index ccad3da..5263bad 100644
+--- a/arch/arm/mach-rockchip/board.c
++++ b/arch/arm/mach-rockchip/board.c
+@@ -1267,6 +1267,10 @@ int fit_write_trusty_rollback_index(u32 trusty_index)
+ 
+ void board_quiesce_devices(void *images)
+ {
++#if !defined(CONFIG_SPL_BUILD) && defined(CONFIG_ROCKCHIP_RK3576)
++	/* WF2489T safety net: U-Boot made it to the kernel, drop the maskrom flag */
++	writel(BOOT_NORMAL, (void *)CONFIG_ROCKCHIP_BOOT_MODE_REG);
++#endif
+ #ifdef CONFIG_ROCKCHIP_PRELOADER_ATAGS
+ 	/* Destroy atags makes next warm boot safer */
+ 	atags_destroy();
+diff --git a/arch/arm/mach-rockchip/boot_mode.c b/arch/arm/mach-rockchip/boot_mode.c
+index 46c28c6..9c2bfd9 100644
+--- a/arch/arm/mach-rockchip/boot_mode.c
++++ b/arch/arm/mach-rockchip/boot_mode.c
+@@ -157,6 +157,15 @@ int rockchip_get_boot_mode(void)
+ 	 * reboot loader/bootloader/fastboot > misc partition "recovery" > reboot xxx.
+ 	 */
+ 	reg_boot_mode = readl((void *)CONFIG_ROCKCHIP_BOOT_MODE_REG);
++#if !defined(CONFIG_SPL_BUILD) && defined(CONFIG_ROCKCHIP_RK3576)
++	{
++		/* WF2489T safety net replaced the register; use the value it saved */
++		extern u32 wf_saved_boot_mode;
++
++		if (reg_boot_mode == BOOT_BROM_DOWNLOAD && wf_saved_boot_mode != 0xffffffff)
++			reg_boot_mode = wf_saved_boot_mode;
++	}
++#endif
+ 	if (reg_boot_mode == BOOT_LOADER) {
+ 		printf("boot mode: loader\n");
+ 		boot_mode[PH] = BOOT_MODE_LOADER;
+diff --git a/arch/arm/mach-rockchip/rk3576/rk3576.c b/arch/arm/mach-rockchip/rk3576/rk3576.c
+index 9d74f45..96d59f2 100644
+--- a/arch/arm/mach-rockchip/rk3576/rk3576.c
++++ b/arch/arm/mach-rockchip/rk3576/rk3576.c
+@@ -551,11 +551,36 @@ int spl_fit_standalone_release(char *id, uintptr_t entry_point)
+ #endif
+ 
+ #ifndef CONFIG_TPL_BUILD
++#if !defined(CONFIG_SPL_BUILD) && !defined(CONFIG_SUPPORT_USBPLUG)
++/*
++ * WF2489T boot safety net: arm the DW watchdog (~89 s) and set the BootROM download
++ * flag as the first thing U-Boot proper does. If U-Boot hangs, the watchdog resets
++ * the SoC, the stock SPL sees BOOT_BROM_DOWNLOAD and enters maskrom (USB recovery).
++ * The flag is cleared in board_quiesce_devices() right before jumping to Linux; the
++ * kernel's dw_wdt driver keeps petting the still-running watchdog.
++ * The original boot-mode value is kept for rockchip_get_boot_mode().
++ */
++#define WF_WDT_BASE	0x2ace0000
++u32 wf_saved_boot_mode __attribute__((section(".data"))) = 0xffffffff;
++
++static void wf_boot_net_arm(void)
++{
++	wf_saved_boot_mode = readl(CONFIG_ROCKCHIP_BOOT_MODE_REG);
++	writel(BOOT_BROM_DOWNLOAD, CONFIG_ROCKCHIP_BOOT_MODE_REG);
++	writel(0xff, WF_WDT_BASE + 0x04);	/* TORR: TOP_INIT = TOP = 15, ~89 s @ 24 MHz */
++	writel(0x76, WF_WDT_BASE + 0x0c);	/* CRR: restart counter */
++	writel(0x01, WF_WDT_BASE + 0x00);	/* CR: enable, system reset on timeout */
++}
++#endif
++
+ int arch_cpu_init(void)
+ {
+ #ifdef CONFIG_MOS_SECONDARY
+ 	return 0;
+ #endif
++#if !defined(CONFIG_SPL_BUILD) && !defined(CONFIG_SUPPORT_USBPLUG)
++	wf_boot_net_arm();
++#endif
+ 
+ #if defined(CONFIG_SPL_BUILD) || defined(CONFIG_SUPPORT_USBPLUG)
+ 	u32 cru_glbrst_st = readl(TOP_CRU_BASE + TOPCRU_CRU_GLBRST_ST);

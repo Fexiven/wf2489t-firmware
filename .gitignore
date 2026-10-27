@@ -1,0 +1,8 @@
+/output/
+/dl/
+/buildroot-*/
+*.tar.xz
+/build-*.log
+/.wget-hsts
+/authorized_keys
+/wifi.conf

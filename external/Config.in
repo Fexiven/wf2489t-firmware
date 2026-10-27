@@ -1,0 +1,4 @@
+menu "WF2489T packages"
+	source "$BR2_EXTERNAL_WF2489T_PATH/package/wf2489t-rkbin/Config.in"
+	source "$BR2_EXTERNAL_WF2489T_PATH/package/wf2489t-aic8800/Config.in"
+endmenu

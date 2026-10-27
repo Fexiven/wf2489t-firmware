@@ -1,0 +1,7 @@
+# Drop display outputs the WF2489T does not have (eDP / ANALOGIX_DP stays);
+# keeps the FIT under the 2 MiB slot of the uboot partition.
+# CONFIG_DRM_ROCKCHIP_DW_HDMI_QP is not set
+# CONFIG_DRM_ROCKCHIP_DW_MIPI_DSI2 is not set
+# CONFIG_DRM_ROCKCHIP_DW_DP is not set
+# CONFIG_DRM_ROCKCHIP_RGB is not set
+# CONFIG_DRM_ROCKCHIP_SAMSUNG_MIPI_DCPHY is not set
