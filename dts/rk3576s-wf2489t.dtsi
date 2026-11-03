@@ -10,8 +10,8 @@
  * the same CPU limits as the RK3576; only blocks it lacks (GMAC, PCIe1,
  * SATA, CAN) stay disabled.
  *
- * Not yet: PWM (no RK3576 PWM driver in mainline yet), so the backlight is
- * on/off via gpio-backlight and the LED ring is on/off per colour.
+ * PWM (backlight, LED ring) uses the RK3576 PWMv4 series from Collabora,
+ * carried in kernel/patches until it is merged.
  */
 
 #include <dt-bindings/gpio/gpio.h>
@@ -59,43 +59,6 @@
 			label = "volume down";
 			linux,code = <KEY_VOLUMEDOWN>;
 			press-threshold-microvolt = <417000>;
-		};
-	};
-
-	/* on/off only until the RK3576 PWM is supported; the PWM pin is held high below */
-	backlight: backlight {
-		compatible = "gpio-backlight";
-		gpios = <&gpio0 RK_PB6 GPIO_ACTIVE_HIGH>;
-		default-on;
-		pinctrl-names = "default";
-		pinctrl-0 = <&bl_en>;
-	};
-
-	/* LED ring, on/off per colour until the RK3576 PWM is supported */
-	leds {
-		compatible = "gpio-leds";
-		pinctrl-names = "default";
-		pinctrl-0 = <&led_ring_pins>;
-
-		led-red {
-			color = <LED_COLOR_ID_RED>;
-			function = LED_FUNCTION_STATUS;
-			gpios = <&gpio4 RK_PC4 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
-		};
-
-		led-green {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_STATUS;
-			gpios = <&gpio4 RK_PC6 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
-		};
-
-		led-blue {
-			color = <LED_COLOR_ID_BLUE>;
-			function = LED_FUNCTION_STATUS;
-			gpios = <&gpio4 RK_PC5 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
 		};
 	};
 
@@ -348,14 +311,6 @@
 		/* B0-B7 */ "", "", "", "", "io-2", "", "", "",
 		/* C0-C7 */ "", "", "", "", "", "", "", "",
 		/* D0-D7 */ "", "", "", "io-1", "", "", "", "";
-
-	/* backlight PWM pin, held at 100 % until the PWM driver exists */
-	backlight-pwm-hog {
-		gpio-hog;
-		gpios = <RK_PB5 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "backlight-pwm";
-	};
 };
 
 &gpio3 {
@@ -1009,14 +964,6 @@
 	audio {
 		spk_con: spk-con {
 			rockchip,pins = <2 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
-	};
-
-	leds {
-		led_ring_pins: led-ring-pins {
-			rockchip,pins = <4 RK_PC4 RK_FUNC_GPIO &pcfg_pull_none>,
-					<4 RK_PC5 RK_FUNC_GPIO &pcfg_pull_none>,
-					<4 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 

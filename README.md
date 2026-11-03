@@ -69,6 +69,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 | Patch | Status |
 | --- | --- |
 | `0001` RK3576 eMMC HS400 timing from Rockchip's BSP kernel | local |
+| `0003`-`0007` RK3576 PWMv4 (Collabora, v5, not merged yet), `0008` its 7.4 adaptation | local |
 | `0002` mmc core: single-block recovery flag never cleared | [sent upstream](https://lore.kernel.org/linux-mmc/?q=s%3A%22clear+MQRQ_XFER_SINGLE_BLOCK+for+new+requests%22) |
 
 ## Status
@@ -82,5 +83,5 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
-- [ ] PWM: backlight dimming, LED ring colours and dimming
+- [ ] PWM: backlight (`/sys/class/backlight/backlight`) and RGB LED ring (`/sys/class/leds/rgb:status`) register with the Collabora PWMv4 series (kernel/patches 0003-0008); dimming and colours not yet checked by eye
 - [ ] Final partition table: `uboot` + one `root` partition
