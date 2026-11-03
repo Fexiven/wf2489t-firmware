@@ -106,4 +106,4 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Kiosk: `kiosk.service` runs cage + cog (WPE WebKit) full screen on the display; URL in `/etc/default/kiosk`
 - [ ] Kiosk GPU acceleration: WPE's web process renders in software so far (no `/dev/dri` in its sandbox)
 - [x] U-Boot USB mass storage: `ums 0 mmc 0` at the U-Boot prompt shows the whole eMMC on the PC (uboot/patches 0002, 0003)
-- [ ] Final partition table: `uboot` + one `root` partition
+- [x] Final partition table: `uboot` + one `root` partition (installed on the test tablet with U-Boot `gpt write` + `gzwrite`, or `tools/install-root.sh` via `ums`)
