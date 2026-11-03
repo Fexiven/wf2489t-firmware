@@ -24,6 +24,8 @@ echo 'dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576s-wf2489t.dtb' >> $SRC/arch/arm64/boo
 
 # reproducible: build date = date of the last commit of this repo
 export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+# no "-dirty" from the patched git tree in the kernel release (scripts/setlocalversion)
+export GIT_DIR=/nonexistent
 export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_BUILD_USER=wf2489t KBUILD_BUILD_HOST=build \
 	KBUILD_BUILD_TIMESTAMP="$(date -u -d @$SOURCE_DATE_EPOCH)"
 mkdir -p $OBJ
