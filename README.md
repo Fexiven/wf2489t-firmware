@@ -83,5 +83,5 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
-- [ ] PWM: backlight (`/sys/class/backlight/backlight`) and RGB LED ring (`/sys/class/leds/rgb:status`) register with the Collabora PWMv4 series (kernel/patches 0003-0008); dimming and colours not yet checked by eye
+- [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [ ] Final partition table: `uboot` + one `root` partition
