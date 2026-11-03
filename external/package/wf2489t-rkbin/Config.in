@@ -1,7 +1,0 @@
-config BR2_PACKAGE_WF2489T_RKBIN
-	bool "wf2489t-rkbin"
-	depends on BR2_aarch64
-	help
-	  Rockchip RK3576 BL31 (TF-A) v1.25 and BL32 (OP-TEE) v1.12 from
-	  rockchip-linux/rkbin, pinned to one commit. Both must come from the
-	  same rkbin release; they end up in the U-Boot FIT.

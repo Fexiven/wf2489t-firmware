@@ -1,8 +1,4 @@
-/output/
-/dl/
-/buildroot-*/
-*.tar.xz
+/build/
+/out/
 /build-*.log
-/.wget-hsts
-/authorized_keys
-/wifi.conf
+/debian/kdeb/

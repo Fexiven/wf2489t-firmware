@@ -1,0 +1,72 @@
+# Debian trixie (arm64) for the Apolosign WF2489T, built with debos.
+# Boot: mainline U-Boot -> extlinux.conf (written by u-boot-menu) -> kernel deb.
+# Built by debian/build-image.sh (stages the kernel package from out/kernel in kdeb/).
+# Output: wf2489t-debian.img, a disk image with one ext4 partition "root".
+{{- $suite := or .suite "trixie" -}}
+{{- $image := or .image "wf2489t-debian.img" }}
+
+architecture: arm64
+
+actions:
+  - action: debootstrap
+    suite: {{ $suite }}
+    components: [main, non-free-firmware]
+    mirror: https://deb.debian.org/debian
+    variant: minbase
+
+  - action: apt
+    description: base system
+    recommends: false
+    packages:
+      - systemd-sysv
+      - systemd-resolved
+      - systemd-timesyncd
+      - udev
+      - dbus
+      - kmod
+      - initramfs-tools
+      - u-boot-menu
+      - openssh-server
+      - firmware-realtek
+      - ca-certificates
+      - iproute2
+      - iputils-ping
+      - less
+      - nano
+      - i2c-tools
+      - gpiod
+      - e2fsprogs
+      - gdisk
+
+  - action: overlay
+    source: overlay
+
+  - action: overlay
+    description: kernel packages
+    source: kdeb
+    destination: /var/tmp/kernel
+
+  - action: run
+    description: kernel, root password, services
+    chroot: true
+    script: setup.sh
+
+  - action: image-partition
+    imagename: {{ $image }}
+    imagesize: 3GB
+    partitiontype: gpt
+    mountpoints:
+      - mountpoint: /
+        partition: root
+    partitions:
+      - name: root
+        fs: ext4
+        start: 1MiB
+        end: 100%
+        parttype: b921b045-1df0-41c3-af44-4c6f280d3fae
+        flags: [legacy_boot]
+        features: ["^metadata_csum_seed"]
+
+  - action: filesystem-deploy
+    setup-fstab: false
+    setup-kernel-cmdline: false

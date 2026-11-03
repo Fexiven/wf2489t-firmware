@@ -1,43 +1,80 @@
 # WF2489T firmware
 
-Reproducible firmware for the Apolosign WF2489T wall tablet (Rockchip RK3576), built with
-[Buildroot](https://buildroot.org) 2026.02.3 LTS as a `BR2_EXTERNAL` tree inside a pinned podman container.
+Mainline U-Boot, a mainline kernel and Debian for the Apolosign WF2489T wall
+tablet (Rockchip RK3576S), so it can be used like a generic Linux machine.
 
 ## Build
 
 ```sh
-nix-shell --run make        # on NixOS; elsewhere just `make` (needs make, curl, podman)
+make uboot     # out/uboot-copy1.img
+make kernel    # out/kernel/linux-image-*.deb, linux-headers-*.deb
+make image     # out/wf2489t-debian.img and out/root.ext4 (needs /dev/kvm)
+make all
 ```
 
-Outputs land in `output/images/`. Other targets: `make menuconfig`, `make savedefconfig`, `make shell`,
-and `make br-<target>` for any Buildroot target (e.g. `make br-linux-rebuild`).
+Needs `make` and `podman`. U-Boot and the kernel build in the container from
+`Containerfile` (Debian trixie, pinned by digest); the image is built with the
+[debos](https://github.com/go-debos/debos) container. Sources are fetched into
+`build/` and checked against the pinned commits.
 
-GitHub Actions (`.github/workflows/build.yml`) runs the same build on every push; the images are
-attached to each run as artifacts.
-
-Baseline login: `root` / `admin` (screen and SSH). Network: Ethernet with DHCP; Wi-Fi comes later.
+Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 
 ## What is pinned
 
-| Input | Where |
-| --- | --- |
-| Host tools | `Containerfile` (Debian trixie-slim by digest) |
-| Buildroot release | `Makefile` (`BR_VERSION`, `BR_SHA256`) |
-| Toolchain, packages, kernel/U-Boot sources | `external/configs/wf2489t_defconfig` and package `.hash` files |
+| Input | Version | Where |
+| --- | --- | --- |
+| Linux | v7.4-rc1 (`6628e7d4c6b2`) + `kernel/patches/` | `kernel/build.sh` |
+| U-Boot | v2026.10 (`5508406582f6`) + `uboot/patches/` | `uboot/build.sh` |
+| TF-A (BL31) | master `ba48f2d3b4d2` + `tf-a/patches/` | `uboot/build.sh` |
+| Debian | trixie | `debian/wf2489t.yaml` |
+| Build tools | Debian trixie by digest | `Containerfile` |
 
-## Layout on the tablet (target)
+## Boot chain
 
-| Region | Contents |
+| Stage | Where on the eMMC | Source |
+| --- | --- | --- |
+| DDR init + SPL (stock, Ctrl+B on the debug UART → maskrom) | sector 64 | stock, never written |
+| TF-A BL31 + U-Boot (FIT) | `uboot` partition, copy 1 (sector 16384) | `make uboot` |
+| fallback FIT | `uboot` partition, copy 2 | stock, never written |
+| kernel, initramfs, DTB via `extlinux.conf` | root filesystem, `/boot` | Debian + `make kernel` |
+
+U-Boot boots the first partition with the GPT "legacy BIOS bootable" flag that
+has `/boot/extlinux/extlinux.conf`; Debian's `u-boot-menu` keeps that file up to
+date on kernel updates. The root filesystem is found by its label `root`.
+
+## Layout
+
+| Path | Contents |
 | --- | --- |
-| first 4 MiB | stock partition table, loader, vendor storage: **never written** |
-| `uboot` | copy 1: our Rockchip U-Boot (safety net, A/B boot counting); copy 2: stock |
-| `system_a`, `system_b` | read-only system (SquashFS), updated with RAUC |
-| `data` | settings and state, kept across updates |
+| `dts/` | board device tree, used by both Linux and U-Boot |
+| `kernel/` | config fragment, patches, build script |
+| `uboot/` | defconfig, U-Boot DT additions, FIT generator, build script (U-Boot + TF-A) |
+| `tf-a/` | TF-A patches |
+| `debian/` | debos recipe, first-boot setup, config overlay |
+| `tools/` | maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
+| `docs/` | notes, e.g. the eMMC timing and kernel bug analysis (`docs/emmc.md`) |
+
+## Upstream TF-A and the stock loader
+
+The stock SPL arms the secure watchdog (`wdt_s`, ~11 s) for its A/B boot
+counting and leaves it running. Rockchip's BL31 stops it; upstream TF-A did
+not, so the tablet reset every 7–12 s. `tf-a/patches/0001` pauses it at BL31
+start, as TF-A already does for system suspend. With that, Rockchip's BL31 and
+OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
+
+## Kernel patches
+
+| Patch | Status |
+| --- | --- |
+| `0001` RK3576 eMMC HS400 timing from Rockchip's BSP kernel | local |
+| `0002` mmc core: single-block recovery flag never cleared | [sent upstream](https://lore.kernel.org/linux-mmc/?q=s%3A%22clear+MQRQ_XFER_SINGLE_BLOCK+for+new+requests%22) |
 
 ## Status
 
-1. [x] Project skeleton, toolchain build
-2. [x] U-Boot (Rockchip next-dev + safety net, rkbin pinned): `output/images/uboot-copy1.img`, byte-reproducible; FIT matches the known-good image except the U-Boot binary (different compiler)
-3. [x] Kernel (Rockchip develop-6.1 + WF2489T device tree + AIC8800): `Image`, `rk3576s-wf2489t.dtb`, Wi-Fi modules + firmware; builds, not yet booted on the tablet
-4. [ ] Baseline Linux (BusyBox init, SSH, Ethernet) booting on the tablet
-5. [ ] RAUC A/B updates
+- [x] Mainline U-Boot + upstream TF-A (no Rockchip binaries after the stock SPL, no OP-TEE), automatic extlinux boot
+- [x] Mainline kernel: display, touch, GPU, eMMC (HS400ES), Ethernet, PCIe, sensors, RTC, keys
+- [x] Debian trixie image (debos), kernel as a Debian package
+- [ ] MAC address from Rockchip vendor storage
+- [ ] Wi-Fi (AIC8800 SDIO)
+- [ ] Sound (SAI1 + ES8388), PWM backlight dimming and LEDs
+- [ ] Final partition table: `uboot` + one `root` partition

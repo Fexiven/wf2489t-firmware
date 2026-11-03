@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Apolosign WF2489T for U-Boot: the board hardware without the display path,
+ * which needs an eDP node that U-Boot's copy of rk3576.dtsi does not have yet.
+ */
+
+/dts-v1/;
+
+#include "rk3576s-wf2489t.dtsi"

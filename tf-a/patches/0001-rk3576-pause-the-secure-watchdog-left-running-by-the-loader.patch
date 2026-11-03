@@ -1,0 +1,36 @@
+Subject: [PATCH] feat(rk3576): pause the secure watchdog left running by the loader
+
+Rockchip's SPL arms the secure watchdog (wdt_s) for its A/B boot
+counting and does not stop it. Rockchip's own BL31 takes care of it;
+with upstream BL31 the board resets about 11 s after power-on (TORR 0xc,
+2^28 cycles at 24 MHz). Pause it the same way as for system suspend.
+
+---
+diff --git a/plat/rockchip/rk3576/drivers/soc/soc.c b/plat/rockchip/rk3576/drivers/soc/soc.c
+index a78e82e..5ef82dc 100644
+--- a/plat/rockchip/rk3576/drivers/soc/soc.c
++++ b/plat/rockchip/rk3576/drivers/soc/soc.c
+@@ -115,8 +115,23 @@ static void system_reset_init(void)
+ 	print_glb_reset_status();
+ }
+ 
++/*
++ * Rockchip's loader (SPL) arms the secure watchdog for its A/B boot counting
++ * and leaves it running: without this the board resets after about 11 s.
++ */
++static void secure_watchdog_pause_boot(void)
++{
++	if ((mmio_read_32(WDT_S_BASE + WDT_CR) & WDT_EN) == 0)
++		return;
++
++	mmio_write_32(SYS_SGRF_BASE + SYSSGRF_SOC_CON(0),
++		      BITS_WITH_WMASK(1, 0x1, 14));
++	NOTICE("BL31: paused the secure watchdog left running by the loader\n");
++}
++
+ void plat_rockchip_soc_init(void)
+ {
++	secure_watchdog_pause_boot();
+ 	rockchip_clock_init();
+ 	system_reset_init();
+ 	secure_init();

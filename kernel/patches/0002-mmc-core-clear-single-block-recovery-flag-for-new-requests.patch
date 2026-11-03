@@ -1,0 +1,39 @@
+Subject: [PATCH] mmc: core: clear MQRQ_XFER_SINGLE_BLOCK for new requests
+
+mmc_blk_mq_complete_rq() and mmc_blk_cqe_complete_rq() set
+MQRQ_XFER_SINGLE_BLOCK in the request PDU when a transfer fails, so the
+retry is done one block at a time. Nothing ever clears the flag again.
+
+The PDU belongs to the blk-mq tag and is reused for later requests, while
+mmc_mq_queue_rq() only resets ->retries for a new request. Every tag that
+has seen a single transfer error therefore keeps issuing single-block
+transfers (CMD17/CMD24) for the rest of the uptime.
+
+On an RK3576 board (HS400ES eMMC) with occasional data CRC errors, which
+are recovered correctly, sequential direct reads dropped from ~200 MB/s
+after boot to 3-10 MB/s within minutes and never recovered. The host
+registers showed only CMD17 with a 512 byte block size. With this change
+the read throughput stays at ~200 MB/s and writes at 60-90 MB/s while the
+data CRC errors continue to be retried.
+
+Reset the flags together with the retry counter when a request is
+prepared for the first time. Requeued requests keep RQF_DONTPREP, so the
+single-block retry of the failing request itself is unchanged.
+
+Fixes: d34124edffdb ("mmc: block: Use MQRQ_XFER_SINGLE_BLOCK for both read and write recovery")
+Cc: stable@vger.kernel.org
+---
+ drivers/mmc/core/queue.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@ -301,6 +301,8 @@
+
+ 	if (!(req->rq_flags & RQF_DONTPREP)) {
+ 		req_to_mmc_queue_req(req)->retries = 0;
++		/* the request PDU is reused: don't inherit single-block recovery */
++		req_to_mmc_queue_req(req)->flags = 0;
+ 		req->rq_flags |= RQF_DONTPREP;
+ 	}
+

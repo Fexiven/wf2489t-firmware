@@ -1,3 +1,0 @@
-# Locally computed, identical to the blobs in the known-good WF2489T U-Boot FIT
-sha256  a709eb309746a46c192405fe95b725a668c20ee05b134478838a69e723bfafb2  rk3576_bl31_v1.25.elf
-sha256  5831d011242f5aa941807ff10d9ec47e12ea16c584b1dfbacd23d09b2c3aaf63  rk3576_bl32_v1.12.bin

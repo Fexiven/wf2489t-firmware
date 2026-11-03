@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/* U-Boot additions for the Apolosign WF2489T */
+
+#include "rk3576-u-boot.dtsi"
+
+&sdhci {
+	/*
+	 * 52 MHz: mainline U-Boot's RK3576 HS200/HS400 is unreliable with this
+	 * eMMC (see docs/emmc.md). Linux runs HS400ES; boot costs ~1-2 s more.
+	 */
+	/delete-property/ mmc-hs400-1_8v;
+	/delete-property/ mmc-hs400-enhanced-strobe;
+	cap-mmc-highspeed;
+	max-frequency = <52000000>;
+};

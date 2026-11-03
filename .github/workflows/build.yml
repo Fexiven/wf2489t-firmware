@@ -1,4 +1,5 @@
-# Builds the firmware exactly like a local `make`: same pinned container, same Buildroot release.
+# Builds the firmware exactly like a local `make`: same pinned build container,
+# same pinned sources. The results are attached to each run as artifacts.
 name: build
 
 on:
@@ -12,34 +13,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  firmware:
+  uboot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Build TF-A + U-Boot
+        run: make uboot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uboot
+          path: out/uboot-copy1.img
+          if-no-files-found: error
 
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
       - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Build kernel packages
+        run: make kernel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: out/kernel/*.deb
+          if-no-files-found: error
+
+  image:
+    needs: kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: out/kernel
+      - name: Allow KVM for debos
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Cache source downloads
-        uses: actions/cache@v4
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Build Debian image
+        run: make image
+      - name: Compress
+        run: xz -T0 -6 out/root.ext4
+      - uses: actions/upload-artifact@v4
         with:
-          path: dl
-          key: dl-${{ hashFiles('Makefile', 'external/configs/*', 'external/**/*.hash') }}
-          restore-keys: dl-
-
-      - name: Build
-        run: make
-
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: wf2489t-images
-          path: |
-            output/images/uboot-copy1.img
-            output/images/Image
-            output/images/*.dtb
-            output/images/rootfs.squashfs
+          name: debian-root
+          path: out/root.ext4.xz
           if-no-files-found: error
