@@ -2,3 +2,4 @@
 /out/
 /build-*.log
 /debian/kdeb/
+/fake-scratch.img.*
