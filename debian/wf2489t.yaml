@@ -1,4 +1,4 @@
-# Debian trixie (arm64) for the Apolosign WF2489T, built with debos.
+# Debian trixie (arm64) for the WF2489T wall tablet, built with debos.
 # Boot: mainline U-Boot -> extlinux.conf (written by u-boot-menu) -> kernel deb.
 # Built by debian/build-image.sh (stages the kernel package from out/kernel in kdeb/).
 # Output: wf2489t-debian.img, a disk image with one ext4 partition "root".

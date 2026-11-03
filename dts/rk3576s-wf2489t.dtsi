@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * Apolosign WF2489T wall tablet (RK3576S, vendor board "R141 V10"): board hardware.
+ * WF2489T 15.6" wall tablet (RK3576S, vendor board "R141 V10"): board hardware.
  * The display path (VOP2 -> eDP -> panel) is in rk3576s-wf2489t.dts, so that
  * U-Boot, whose copy of rk3576.dtsi has no eDP node yet, can use this file alone.
  *
@@ -23,11 +23,12 @@
 #include "rk3576.dtsi"
 
 / {
-	model = "Apolosign WF2489T";
-	compatible = "apolosign,wf2489t", "rockchip,rk3576";
+	model = "WF2489T 15.6\" wall tablet (RK3576S)";
+	compatible = "oem,wf2489t", "rockchip,rk3576";
 
 	/* serial numbering as on the stock firmware: the Zigbee radio is ttyS6 */
 	aliases {
+		ethernet0 = &rtl8168;
 		mmc0 = &sdhci;
 		mmc1 = &sdio;
 		serial0 = &uart0;
@@ -803,6 +804,20 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&ufs_refclk>;
 	status = "okay";
+
+	pcie@0,0 {
+		reg = <0x000000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		device_type = "pci";
+		bus-range = <0x1 0xf>;
+
+		/* RTL8168H; U-Boot sets its MAC address from vendor storage */
+		rtl8168: ethernet@0,0 {
+			reg = <0x010000 0 0 0 0>;
+		};
+	};
 };
 
 &saradc {

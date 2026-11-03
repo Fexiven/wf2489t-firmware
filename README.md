@@ -1,7 +1,9 @@
 # WF2489T firmware
 
-Mainline U-Boot, a mainline kernel and Debian for the Apolosign WF2489T wall
-tablet (Rockchip RK3576S), so it can be used like a generic Linux machine.
+Mainline U-Boot, a mainline kernel and Debian for the WF2489T, a 15.6" wall
+tablet with a Rockchip RK3576S (vendor board "R141 V10"), so it can be used
+like a generic Linux machine. The tablet is unbranded (bought from an Alibaba
+seller); its stock Android reports brand "Apolosign", manufacturer "Electron".
 
 ## Build
 
@@ -74,7 +76,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Mainline U-Boot + upstream TF-A (no Rockchip binaries after the stock SPL, no OP-TEE), automatic extlinux boot
 - [x] Mainline kernel: display, touch, GPU, eMMC (HS400ES), Ethernet, PCIe, sensors, RTC, keys
 - [x] Debian trixie image (debos), kernel as a Debian package
-- [ ] MAC address from Rockchip vendor storage
+- [x] Ethernet MAC address from Rockchip vendor storage (U-Boot, passed to Linux in the device tree)
 - [ ] Wi-Fi (AIC8800 SDIO)
 - [ ] Sound (SAI1 + ES8388), PWM backlight dimming and LEDs
 - [ ] Final partition table: `uboot` + one `root` partition

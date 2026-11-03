@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
-/* U-Boot additions for the Apolosign WF2489T */
+/* U-Boot additions for the WF2489T wall tablet */
 
 #include "rk3576-u-boot.dtsi"
 
