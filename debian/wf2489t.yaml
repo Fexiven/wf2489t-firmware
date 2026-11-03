@@ -38,6 +38,7 @@ actions:
       - nano
       - i2c-tools
       - gpiod
+      - alsa-utils
       - e2fsprogs
       - gdisk
 
