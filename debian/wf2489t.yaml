@@ -39,6 +39,11 @@ actions:
       - i2c-tools
       - gpiod
       - alsa-utils
+      - cage
+      - cog
+      - libgl1-mesa-dri
+      - libpam-systemd
+      - fonts-dejavu-core
       - e2fsprogs
       - gdisk
 

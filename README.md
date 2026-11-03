@@ -84,4 +84,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
+- [x] Kiosk: `kiosk.service` runs cage + cog (WPE WebKit) full screen on the display; URL in `/etc/default/kiosk`
+- [ ] Kiosk GPU acceleration: WPE's web process renders in software so far (no `/dev/dri` in its sandbox)
+- [ ] U-Boot USB mass storage (`ums`), so the PC can write the whole eMMC
 - [ ] Final partition table: `uboot` + one `root` partition

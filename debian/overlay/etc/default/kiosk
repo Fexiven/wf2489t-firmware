@@ -1,0 +1,3 @@
+# Page shown full screen on the tablet by kiosk.service (cage + cog)
+KIOSK_URL=http://homeassistant.local:8123
+KIOSK_COG_OPTIONS=

@@ -8,6 +8,10 @@ echo root:admin | chpasswd
 dpkg -i /var/tmp/kernel/*.deb   # kernel, AIC8800 firmware + Wi-Fi driver
 rm -rf /var/tmp/kernel
 systemctl enable systemd-networkd systemd-resolved systemd-timesyncd
+# kiosk: browser on the display (URL in /etc/default/kiosk)
+useradd --system --create-home --groups video,render,input,audio kiosk
+systemctl enable kiosk.service
+systemctl set-default graphical.target
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 apt-get clean
 rm -rf /var/lib/apt/lists/*
