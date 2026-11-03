@@ -21,6 +21,25 @@ Needs `make` and `podman`. U-Boot and the kernel build in the container from
 
 Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 
+## Install
+
+1. U-Boot (once, or to update it): write `out/uboot-copy1.img` to sector 16384
+   (copy 1 of the `uboot` area) from maskrom (Ctrl+B on the debug UART at
+   power-on, then `tools/rk_maskrom_boot.py` with Rockchip's usbplug and
+   `rkdeveloptool wl 16384 out/uboot-copy1.img`).
+2. Debian: stop U-Boot at its prompt (debug UART), run `ums 0 mmc 0`; the eMMC
+   appears on the PC as a USB disk. Then as root on the PC:
+
+   ```sh
+   tools/install-root.sh /dev/sdX out/root.ext4 [kiosk URL]
+   ```
+
+   It writes a GPT with only `uboot` and `root` (loader at sector 64 and vendor
+   storage at sector 7168 stay untouched), installs the root filesystem and
+   grows it. Ctrl+C at the U-Boot prompt ends `ums`; `boot` starts Debian.
+
+The same `ums` path is the recovery for a broken root filesystem.
+
 ## What is pinned
 
 | Input | Version | Where |
