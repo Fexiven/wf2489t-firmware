@@ -1,0 +1,62 @@
+Linux 7.4 passes "enum nl80211_key_type type" instead of "bool pairwise"
+to the cfg80211 add_key/get_key/del_key operations.
+
+--- a/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -2299,13 +2299,20 @@
+ #if (LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION2)
+ 																	 int link_id,
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
++									 u8 key_index, enum nl80211_key_type type, const u8 *mac_addr,
++#else
+ 									 u8 key_index, bool pairwise, const u8 *mac_addr,
++#endif
+ 									 struct key_params *params)
+ 
+ {
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+ 	struct net_device *netdev = wdev->netdev;
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
++	bool pairwise = type == NL80211_KEYTYPE_PAIRWISE;
++#endif
+ 	struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
+ 	struct rwnx_vif *vif = netdev_priv(netdev);
+ 	int i, error = 0;
+@@ -2422,7 +2429,11 @@
+ #if (LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION2)
+                                                                  int link_id,
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
++								 u8 key_index, enum nl80211_key_type type, const u8 *mac_addr,
++#else
+ 								 u8 key_index, bool pairwise, const u8 *mac_addr,
++#endif
+ 								 void *cookie,
+ 								 void (*callback)(void *cookie, struct key_params*))
+ {
+@@ -2445,7 +2456,11 @@
+ #if (LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION2)
+                                                                  int link_id,
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
++								 u8 key_index, enum nl80211_key_type type, const u8 *mac_addr)
++#else
+ 								 u8 key_index, bool pairwise, const u8 *mac_addr)
++#endif
+ {
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+ 	struct net_device *netdev = wdev->netdev;
+@@ -2598,7 +2613,11 @@
+ #if (LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION2)
+                                 0,
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
++				sme->key_idx, NL80211_KEYTYPE_GROUP, NULL, &key_params);
++#else
+ 				sme->key_idx, false, NULL, &key_params);
++#endif
+ 	}
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0) || defined(CONFIG_WPA3_FOR_OLD_KERNEL)
+ 	else if ((sme->auth_type == NL80211_AUTHTYPE_SAE) &&

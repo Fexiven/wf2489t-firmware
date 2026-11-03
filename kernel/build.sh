@@ -37,4 +37,39 @@ make -s -C $SRC O=$PWD/$OBJ -j$(nproc) LOCALVERSION=-wf2489t KDEB_PKGVERSION=1 b
 
 mkdir -p out/kernel && rm -f out/kernel/*.deb
 cp build/linux-image-*-wf2489t_1_arm64.deb build/linux-headers-*_arm64.deb out/kernel/
+
+# Wi-Fi/BT: AIC8800D80 SDIO driver (out of tree) from Radxa's DKMS package,
+# built against this kernel and packaged for it; firmware: debian/build-image.sh
+AIC_VERSION=5.0+git20260123.5f7be68d-10
+AIC_DEB=aic8800-sdio-dkms_${AIC_VERSION}_all.deb
+AIC_SHA256=9dcf24ef5bc5417e06c059d786518728a6439212f457b8c31593f2765e6f95a2
+AIC=build/aic8800 KREL=$(cat $OBJ/include/config/kernel.release)
+mkdir -p build/dl
+[ -f build/dl/$AIC_DEB ] || curl -sSfL -o build/dl/$AIC_DEB \
+	https://github.com/radxa-pkg/aic8800/releases/download/$AIC_VERSION/$AIC_DEB
+echo "$AIC_SHA256  build/dl/$AIC_DEB" | sha256sum -c --quiet
+rm -rf $AIC && mkdir -p $AIC && dpkg-deb -x build/dl/$AIC_DEB $AIC/deb
+AIC_SRC=$AIC/deb/usr/src/aic8800-sdio-$AIC_VERSION
+for p in kernel/aic8800/*.patch; do [ -e "$p" ] || continue; patch -s -p1 -d $AIC_SRC < $p; done
+make -s -C $SRC O=$PWD/$OBJ M=$PWD/$AIC_SRC/SDIO/driver_fw/driver/aic8800 -j$(nproc) modules
+make -s -C $SRC O=$PWD/$OBJ M=$PWD/$AIC_SRC/SDIO/driver_fw/driver/aic8800 \
+	INSTALL_MOD_PATH=$PWD/$AIC/pkg INSTALL_MOD_DIR=updates/aic8800 INSTALL_MOD_STRIP=1 DEPMOD=true modules_install
+rm -f $AIC/pkg/lib/modules/$KREL/modules.*
+mkdir -p $AIC/pkg/DEBIAN
+cat > $AIC/pkg/DEBIAN/control <<CONTROL
+Package: aic8800-sdio-modules-$KREL
+Version: $AIC_VERSION
+Architecture: arm64
+Maintainer: wf2489t-firmware
+Depends: linux-image-$KREL, aic8800-firmware (= $AIC_VERSION)
+Section: kernel
+Priority: optional
+Description: AIC8800 SDIO Wi-Fi/Bluetooth driver for Linux $KREL
+ Radxa's aic8800 driver (radxa-pkg/aic8800 $AIC_VERSION), built for the
+ WF2489T kernel $KREL.
+CONTROL
+printf '#!/bin/sh\nset -e\ndepmod -a %s\n' $KREL > $AIC/pkg/DEBIAN/postinst
+cp $AIC/pkg/DEBIAN/postinst $AIC/pkg/DEBIAN/postrm
+chmod 755 $AIC/pkg/DEBIAN/postinst $AIC/pkg/DEBIAN/postrm
+dpkg-deb --root-owner-group -Zxz --build $AIC/pkg out/kernel/aic8800-sdio-modules-${KREL}_${AIC_VERSION}_arm64.deb >/dev/null
 ls -l out/kernel

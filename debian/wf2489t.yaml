@@ -31,6 +31,9 @@ actions:
       - ca-certificates
       - iproute2
       - iputils-ping
+      - iw
+      - wpasupplicant
+      - wireless-regdb
       - less
       - nano
       - i2c-tools

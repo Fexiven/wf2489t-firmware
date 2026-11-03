@@ -7,7 +7,17 @@ set -eu
 cd "$(dirname "$0")/.."
 ls out/kernel/linux-image-*.deb >/dev/null 2>&1 || { echo "no kernel package, run: make kernel"; exit 1; }
 rm -rf debian/kdeb && mkdir -p debian/kdeb out
-cp out/kernel/linux-image-*.deb debian/kdeb/
+cp out/kernel/linux-image-*.deb out/kernel/aic8800-sdio-modules-*.deb debian/kdeb/
+
+# AIC8800 Wi-Fi/BT firmware (Radxa), same version as the driver in out/kernel
+AIC_VERSION=5.0+git20260123.5f7be68d-10
+AIC_FW=aic8800-firmware_${AIC_VERSION}_all.deb
+AIC_FW_SHA256=0b7c5e229a4214f738e260cfdca45dc934abb5079890c709346577126dba94f8
+mkdir -p build/dl
+[ -f build/dl/$AIC_FW ] || curl -sSfL -o build/dl/$AIC_FW \
+	https://github.com/radxa-pkg/aic8800/releases/download/$AIC_VERSION/$AIC_FW
+echo "$AIC_FW_SHA256  build/dl/$AIC_FW" | sha256sum -c --quiet
+cp build/dl/$AIC_FW debian/kdeb/
 
 podman run --rm --device /dev/kvm --group-add keep-groups --userns keep-id \
 	--security-opt label=disable --tmpfs /scratch:exec,size=8g \

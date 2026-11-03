@@ -79,6 +79,6 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Ethernet MAC address from Rockchip vendor storage (U-Boot, passed to Linux in the device tree)
 - [x] LED ring red/green/blue (on/off), relays on I/O 3 and 4 (`gpioset -t 0 relay-1=1`)
 - [ ] Zigbee/Thread (EFR32 on `ttyS6`): not fitted on the test unit (no answer on UART6), untested
-- [ ] Wi-Fi (AIC8800 SDIO)
+- [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [ ] Sound (SAI1 + ES8388), PWM backlight dimming and LEDs
 - [ ] Final partition table: `uboot` + one `root` partition
