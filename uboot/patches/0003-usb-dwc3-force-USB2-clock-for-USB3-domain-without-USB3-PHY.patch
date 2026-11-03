@@ -1,0 +1,41 @@
+Subject: [PATCH] usb: dwc3: use the USB2 clock for the USB3 domain at high speed
+
+Set GUCTL1.DEV_FORCE_20_CLK_FOR_30_CLK on controllers from 2.90a when the
+maximum speed is high or full speed, as Linux does. Without it, a DWC3
+with a USB3 port but no USB3 PHY in use (RK3576 USB_DRD0 with only the
+USB2 PHY) gets no clock in its USB3 domain and device endpoint commands
+time out: "failed to enable ep0out", ums fails with -110.
+
+---
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -184,6 +184,7 @@
+ /* Global User Control 1 Register */
+ #define DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS	BIT(28)
+ #define DWC3_GUCTL1_DEV_L1_EXIT_BY_HW	BIT(24)
++#define DWC3_GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK	BIT(26)
+ 
+ /* Global USB2 PHY Configuration Register */
+ #define DWC3_GUSB2PHYCFG_PHYSOFTRST	(1 << 31)
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1215,6 +1215,19 @@
+ 		if (dwc->dis_tx_ipgap_linecheck_quirk)
+ 			reg |= DWC3_GUCTL1_TX_IPGAP_LINECHECK_DIS;
+ 
++		/*
++		 * Without a USB3 PHY (maximum speed high or full), clock the
++		 * USB3 domain from the USB2 clock, as Linux does; otherwise
++		 * device endpoint commands time out.
++		 */
++		if (dwc->revision >= DWC3_REVISION_290A) {
++			if (dwc->maximum_speed == USB_SPEED_FULL ||
++			    dwc->maximum_speed == USB_SPEED_HIGH)
++				reg |= DWC3_GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK;
++			else
++				reg &= ~DWC3_GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK;
++		}
++
+ 		dwc3_writel(dwc->regs, DWC3_GUCTL1, reg);
+ 	}
+ 

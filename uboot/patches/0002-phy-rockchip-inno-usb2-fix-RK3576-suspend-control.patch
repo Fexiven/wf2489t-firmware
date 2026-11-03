@@ -1,0 +1,29 @@
+Subject: [PATCH] phy: rockchip: inno-usb2: fix RK3576 suspend control
+
+The RK3576 PHY suspend control is bits 8:0 of the port register, 0 for
+normal operation and 0x1d1 for suspend, as in the Linux driver. U-Boot
+only switched bits 1:0, so a PHY left suspended by the loader stayed
+partly suspended (bits 4 and 6 still set), provided no UTMI clock, and the
+DWC3 gadget failed with "failed to enable ep0out" (ums: -110).
+
+---
+--- a/drivers/phy/rockchip/phy-rockchip-inno-usb2.c
++++ b/drivers/phy/rockchip/phy-rockchip-inno-usb2.c
+@@ -487,7 +487,7 @@
+ 		.clkout_ctl	= { 0x0008, 0, 0, 1, 0 },
+ 		.port_cfgs	= {
+ 			[USB2PHY_PORT_OTG] = {
+-				.phy_sus	= { 0x0000, 1, 0, 2, 1 },
++				.phy_sus	= { 0x0000, 8, 0, 0, 0x1d1 },
+ 			}
+ 		},
+ 	},
+@@ -496,7 +496,7 @@
+ 		.clkout_ctl	= { 0x2008, 0, 0, 1, 0 },
+ 		.port_cfgs	= {
+ 			[USB2PHY_PORT_OTG] = {
+-				.phy_sus	= { 0x2000, 1, 0, 2, 1 },
++				.phy_sus	= { 0x2000, 8, 0, 0, 0x1d1 },
+ 			}
+ 		},
+ 	},
