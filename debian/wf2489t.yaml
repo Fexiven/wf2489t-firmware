@@ -34,6 +34,7 @@ actions:
       - iw
       - wpasupplicant
       - wireless-regdb
+      - bluez
       - less
       - nano
       - i2c-tools

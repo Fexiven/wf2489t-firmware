@@ -1,0 +1,14 @@
+[Unit]
+Description=Bluetooth of the AIC8800D80 on ttyS4
+# the Wi-Fi driver (aic8800_bsp) loads the Bluetooth firmware patch
+After=sys-subsystem-net-devices-wlan0.device
+BindsTo=sys-subsystem-net-devices-wlan0.device
+Before=bluetooth.service
+
+[Service]
+ExecStartPre=/usr/sbin/modprobe hci_uart
+ExecStart=/usr/bin/btattach -B /dev/ttyS4 -P h4 -S 1500000
+Restart=on-failure
+
+[Install]
+WantedBy=sys-subsystem-net-devices-wlan0.device

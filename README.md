@@ -101,6 +101,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [ ] Zigbee/Thread (EFR32 on `ttyS6`): not fitted on the test unit (no answer on UART6), untested
 - [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
+- [x] Bluetooth (AIC8800D80 on `ttyS4`, H4 at 1.5 Mbaud): `aic8800-bluetooth.service` attaches it with btattach; BR/EDR + LE scan tested
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [x] Kiosk: `kiosk.service` runs cage + cog (WPE WebKit) full screen on the display; URL in `/etc/default/kiosk`
