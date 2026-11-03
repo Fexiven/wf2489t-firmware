@@ -295,7 +295,11 @@
 	cpu-supply = <&vdd_cpu_big_s0>;
 };
 
-/* GPIOs of the vendor io_control driver: I/O 1-4 on the tablet's connector */
+/*
+ * GPIOs of the vendor io_control driver, I/O 1-4 on the tablet's connector:
+ * I/O 1 and 2 are plain lines (I/O 1 was a door-contact input on stock),
+ * I/O 3 and 4 switch relays (tested: both click).
+ */
 &gpio0 {
 	gpio-line-names =
 		/* A0-A7 */ "", "", "", "", "", "", "", "",
@@ -315,7 +319,7 @@
 &gpio3 {
 	gpio-line-names =
 		/* A0-A7 */ "", "", "", "", "", "", "", "",
-		/* B0-B7 */ "io-3", "io-4", "", "", "", "", "", "",
+		/* B0-B7 */ "relay-1", "relay-2", "", "", "", "", "", "",
 		/* C0-C7 */ "", "", "", "", "", "", "", "",
 		/* D0-D7 */ "", "", "", "", "", "", "", "";
 };
