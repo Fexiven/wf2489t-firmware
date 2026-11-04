@@ -5,6 +5,8 @@ gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
 # dark: keyboard (GTK) dark, browser background black while pages load.
 # WPE has no system dark mode; pick "Dark" in Home Assistant's profile.
 gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+# German keyboard layout for the on-screen keyboard
+gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de')]"
 GTK_THEME=Adwaita:dark squeekboard &
 # maximized (not fullscreen) so the keyboard is not covered
 export COG_PLATFORM_WL_VIEW_MAXIMIZE=1

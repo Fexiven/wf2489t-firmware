@@ -44,6 +44,8 @@ actions:
       - squeekboard
       - dconf-gsettings-backend
       - libglib2.0-bin
+      - adwaita-icon-theme
+      - librsvg2-common
       - dbus-user-session
       - cog
       - libgl1-mesa-dri
