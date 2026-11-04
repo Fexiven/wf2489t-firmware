@@ -8,7 +8,7 @@ Depends: linux-image-wf2489t, u-boot-menu, firmware-realtek, wpasupplicant, iw,
  alsa-utils, pipewire, pipewire-pulse, pipewire-alsa, wireplumber,
  pulseaudio-utils, labwc, squeekboard, dconf-gsettings-backend, libglib2.0-bin,
  adwaita-icon-theme, librsvg2-common, dbus-user-session, libpam-systemd,
- libgl1-mesa-dri, fonts-dejavu-core, touchkio, wlopm, mosquitto-clients, sudo,
+ libgl1-mesa-dri, fonts-dejavu-core, fonts-noto-color-emoji, touchkio, wlopm, mosquitto-clients, sudo,
  python3, v4l-utils, plymouth, plymouth-themes
 Description: WF2489T wall tablet: Home Assistant kiosk and board support
  Boot splash (Debian logo), kiosk (labwc, TouchKio, squeekboard) on the display, LED ring and ambient
