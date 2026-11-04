@@ -22,8 +22,10 @@ cp build/dl/$AIC_FW debian/kdeb/
 # TouchKio: Home Assistant kiosk app (Electron), default kiosk browser
 TK_VERSION=1.6.0
 TK_DEB=touchkio_${TK_VERSION}_arm64.deb
+TK_SHA256=24ef7856a6e9d7ac66201015b2d2895bc642d1ea9d86d957f9142df28958891f
 [ -f build/dl/$TK_DEB ] || curl -sSfL -o build/dl/$TK_DEB \
 	https://github.com/leukipp/touchkio/releases/download/v$TK_VERSION/$TK_DEB
+echo "$TK_SHA256  build/dl/$TK_DEB" | sha256sum -c --quiet
 cp build/dl/$TK_DEB debian/kdeb/
 
 podman run --rm --device /dev/kvm --group-add keep-groups --userns keep-id \
