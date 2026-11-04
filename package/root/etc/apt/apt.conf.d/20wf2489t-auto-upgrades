@@ -1,0 +1,6 @@
+// Install Debian security and stable point-release updates automatically every day
+// (unattended-upgrades, origins in 50unattended-upgrades: Debian and Debian
+// security of trixie; the kernel and the kiosk from the wf2489t repository
+// stay manual).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

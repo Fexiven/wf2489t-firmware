@@ -1,2 +1,3 @@
 /etc/sudoers.d/wf2489t
 /etc/apt/sources.list.d/wf2489t.sources
+/etc/apt/apt.conf.d/20wf2489t-auto-upgrades
