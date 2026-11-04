@@ -1,0 +1,14 @@
+#!/bin/sh
+# Started by labwc: on-screen keyboard (pops up in text fields) and the
+# kiosk browser, restarted if it exits. URL from /etc/default/kiosk.
+gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+# dark: keyboard (GTK) dark, browser background black while pages load.
+# WPE has no system dark mode; pick "Dark" in Home Assistant's profile.
+gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+GTK_THEME=Adwaita:dark squeekboard &
+# maximized (not fullscreen) so the keyboard is not covered
+export COG_PLATFORM_WL_VIEW_MAXIMIZE=1
+while :; do
+	/usr/bin/cog --bg-color=black $KIOSK_COG_OPTIONS "$KIOSK_URL"
+	sleep 3
+done

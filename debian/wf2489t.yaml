@@ -40,7 +40,10 @@ actions:
       - i2c-tools
       - gpiod
       - alsa-utils
-      - cage
+      - labwc
+      - squeekboard
+      - dconf-gsettings-backend
+      - dbus-user-session
       - cog
       - libgl1-mesa-dri
       - libpam-systemd

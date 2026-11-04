@@ -10,6 +10,7 @@ rm -rf /var/tmp/kernel
 systemctl enable systemd-networkd systemd-resolved systemd-timesyncd
 # kiosk: browser on the display (URL in /etc/default/kiosk)
 useradd --system --create-home --groups video,render,input,audio kiosk
+chmod 755 /usr/local/bin/kiosk-session
 systemctl enable kiosk.service
 systemctl enable aic8800-bluetooth.service
 systemctl set-default graphical.target

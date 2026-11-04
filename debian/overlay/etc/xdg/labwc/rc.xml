@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!-- Kiosk: the browser maximized without decorations. Maximized, not
+     fullscreen, so the on-screen keyboard (a layer-shell surface with an
+     exclusive zone) stays visible and the page shrinks while it is open. -->
+<labwc_config>
+  <core>
+    <decoration>server</decoration>
+    <gap>0</gap>
+  </core>
+  <windowRules>
+    <windowRule identifier="com.igalia.Cog" serverDecoration="no">
+      <action name="Maximize"/>
+    </windowRule>
+  </windowRules>
+  <keyboard>
+    <default/>
+  </keyboard>
+</labwc_config>
