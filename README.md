@@ -24,6 +24,9 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 
 ## Install
 
+Prebuilt images: [Releases](https://github.com/Fexiven/wf2489t-firmware/releases)
+(`root.ext4.xz`, `uboot-copy1.img`, `SHA256SUMS`). Or build them with `make`.
+
 1. U-Boot (once, or to update it): write `out/uboot-copy1.img` to sector 16384
    (copy 1 of the `uboot` area) from maskrom (Ctrl+B on the debug UART at
    power-on, then `tools/rk_maskrom_boot.py` with Rockchip's usbplug and

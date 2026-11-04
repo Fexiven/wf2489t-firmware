@@ -124,3 +124,37 @@ jobs:
           name: debian-root
           path: out/root.ext4.xz
           if-no-files-found: error
+
+  release:
+    needs: [uboot, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: uboot
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: debian-root
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat > ../notes.md <<NOTES
+          Debian trixie for the WF2489T, with mainline U-Boot and the kernel from this repository.
+
+          - \`root.ext4.xz\`: root filesystem. Unpack it (\`xz -d root.ext4.xz\`), hold the power key at
+            power-on (LED ring blue, eMMC as USB disk on the PC), then as root:
+            \`tools/install-root.sh /dev/sdX root.ext4 KIOSK_URL=http://homeassistant.local:8123\`
+          - \`uboot-copy1.img\`: U-Boot + TF-A, only needed once (see README, Install step 1).
+
+          Login root / admin. Updates afterwards with \`apt update && apt upgrade\`.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file ../notes.md *
