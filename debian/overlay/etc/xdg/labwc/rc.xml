@@ -1,18 +1,16 @@
 <?xml version="1.0"?>
-<!-- Kiosk: the browser (any window) maximized without decorations. Maximized, not
-     fullscreen, so the on-screen keyboard (a layer-shell surface with an
-     exclusive zone) stays visible and the page shrinks while it is open. -->
+<!-- Kiosk: no window decorations. TouchKio switches between fullscreen and
+     maximized itself (maximized while the on-screen keyboard is shown). -->
 <labwc_config>
   <core>
     <decoration>server</decoration>
     <gap>0</gap>
   </core>
   <windowRules>
-    <!-- no title bar at all: labwc takes over the decorations (so the client
-         draws none, e.g. Chromium's own title bar) and then draws none -->
+    <!-- labwc takes over the decorations (so the client draws none) and then
+         draws none -->
     <windowRule identifier="*">
       <action name="SetDecorations" decorations="none" forceSSD="yes"/>
-      <action name="Maximize"/>
     </windowRule>
   </windowRules>
   <keyboard>

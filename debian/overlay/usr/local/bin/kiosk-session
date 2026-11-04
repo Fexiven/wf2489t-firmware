@@ -1,58 +1,22 @@
 #!/bin/sh
-# Started by labwc: on-screen keyboard (pops up in text fields) and the
-# kiosk browser, restarted if it exits. Settings in /etc/default/kiosk.
+# Started by labwc: the on-screen keyboard (pops up in text fields) and
+# TouchKio, restarted if it exits. Settings in /etc/default/kiosk.
 gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
 gsettings set org.gnome.desktop.interface color-scheme prefer-dark
-# German keyboard layout for the on-screen keyboard
 gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'de')]"
 GTK_THEME=Adwaita:dark squeekboard &
 
-# Chromium draws its own title bar on Wayland unless "Use system title bar
-# and borders" is set; with that, labwc's rule (rc.xml) removes all decorations
-prefs="$HOME/.config/chromium-kiosk/Default/Preferences"
-mkdir -p "${prefs%/*}"
-if [ ! -s "$prefs" ]; then
-	echo '{"browser":{"custom_chrome_frame":false}}' > "$prefs"
-elif ! grep -q '"custom_chrome_frame":false' "$prefs"; then
-	sed -i -e 's/"custom_chrome_frame":true/"custom_chrome_frame":false/;t' \
-		-e 's/"browser":{/"browser":{"custom_chrome_frame":false,/' "$prefs"
-fi
+# With KIOSK_MQTT_URL set, the tablet appears in Home Assistant (MQTT discovery)
+set --
+[ -n "$KIOSK_MQTT_URL" ] && set -- --mqtt-url="$KIOSK_MQTT_URL" \
+	--mqtt-user="$KIOSK_MQTT_USER" --mqtt-password="$KIOSK_MQTT_PASSWORD"
 
+# Fullscreen, maximized while the keyboard is shown (text-input-v3).
+# DISPLAY is only checked by TouchKio, it runs on Wayland.
 while :; do
-	case ${KIOSK_BROWSER:-touchkio} in
-	touchkio)
-		# Electron (Chromium) kiosk for Home Assistant: fullscreen, switches
-		# to maximized while the on-screen keyboard is shown. DISPLAY is only
-		# checked, it runs on Wayland; text-input-v3 for the keyboard.
-		# With KIOSK_MQTT_URL set, the tablet appears in Home Assistant (MQTT
-		# discovery): display power, brightness, volume, keyboard, sensors.
-		set --
-		[ -n "$KIOSK_MQTT_URL" ] && set -- --mqtt-url="$KIOSK_MQTT_URL" \
-			--mqtt-user="$KIOSK_MQTT_USER" --mqtt-password="$KIOSK_MQTT_PASSWORD"
-		DISPLAY=:0 ELECTRON_OZONE_PLATFORM_HINT=wayland /usr/bin/touchkio \
-			--web-url="$KIOSK_URL" --web-theme=dark --web-zoom=1.0 \
-			--app-kiosk=fullscreen --enable-wayland-ime \
-			--wayland-text-input-version=3 "$@" $KIOSK_BROWSER_OPTIONS
-		;;
-	cog)
-		# maximized (not fullscreen) so the keyboard is not covered; WPE
-		# has no system dark mode, set it in the web app instead
-		COG_PLATFORM_WL_VIEW_MAXIMIZE=1 /usr/bin/cog --bg-color=black \
-			$KIOSK_BROWSER_OPTIONS "$KIOSK_URL"
-		;;
-	*)
-		# app window maximized (not --kiosk/fullscreen, which would cover
-		# the keyboard), dark mode, text-input-v3 for the on-screen keyboard
-		/usr/bin/chromium --ozone-platform=wayland \
-			--enable-wayland-ime --wayland-text-input-version=3 \
-			--force-dark-mode --start-maximized --app="$KIOSK_URL" \
-			--user-data-dir="$HOME/.config/chromium-kiosk" \
-			--no-first-run --noerrdialogs --disable-infobars \
-			--password-store=basic --hide-crash-restore-bubble \
-			--disable-session-crashed-bubble --overscroll-history-navigation=0 \
-			--disable-features=Translate,MediaRouter \
-			$KIOSK_BROWSER_OPTIONS
-		;;
-	esac
+	DISPLAY=:0 ELECTRON_OZONE_PLATFORM_HINT=wayland /usr/bin/touchkio \
+		--web-url="$KIOSK_URL" --web-theme=dark --web-zoom=1.0 \
+		--app-kiosk=fullscreen --enable-wayland-ime \
+		--wayland-text-input-version=3 "$@"
 	sleep 3
 done

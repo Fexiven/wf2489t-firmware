@@ -5,7 +5,7 @@
 #   make image    out/wf2489t-debian.img, out/root.ext4 (needs /dev/kvm)
 #   make all      everything
 #
-# Sources are fetched into dl/ at the pinned versions in kernel/build.sh and
+# Sources are fetched into build/ at the pinned versions in kernel/build.sh and
 # uboot/build.sh; builds run in the container from ./Containerfile.
 
 IMAGE   := localhost/wf2489t-build
