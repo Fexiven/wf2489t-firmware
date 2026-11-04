@@ -1,0 +1,32 @@
+#!/bin/sh
+# Write U-Boot (uboot-copy1.img) to copy 1 of the "uboot" area (sector 16384,
+# 2 MiB). The loader falls back to copy 2 (sector 20480) when copy 1 fails its
+# hash check; copy 2 holds a known-good U-Boot and is only written with
+# --copy2. The loader at sector 64 and the vendor storage stay untouched.
+#   on the tablet:          wf2489t-write-uboot [--copy2] uboot-copy1.img
+#   on the PC (USB mode):   tools/write-uboot.sh [--copy2] uboot-copy1.img /dev/sdX
+set -eu
+
+offset=0
+[ "${1:-}" = --copy2 ] && { offset=4096; shift; }
+img=${1:?usage: wf2489t-write-uboot [--copy2] IMAGE [DEVICE]}
+dev=${2:-/dev/mmcblk0}
+part_start=16384
+start=$((part_start + offset))
+max=$((2 * 1024 * 1024))
+
+size=$(stat -c %s "$img")
+[ "$size" -le "$max" ] || { echo "$img: $size bytes, more than one copy (2 MiB)" >&2; exit 1; }
+[ "$(od -An -tx1 -N4 "$img" | tr -d ' ')" = d00dfeed ] || { echo "$img: not a FIT image" >&2; exit 1; }
+[ -b "$dev" ] || { echo "$dev: not a block device" >&2; exit 1; }
+part=$(lsblk -nro NAME,PARTLABEL "$dev" | awk '$2 == "uboot" {print $1}')
+[ -n "$part" ] && [ "$(cat "/sys/class/block/$part/start")" = $part_start ] ||
+	{ echo "$dev: no uboot partition at sector $part_start" >&2; exit 1; }
+
+dd if="$img" of="$dev" bs=512 seek=$start conv=fsync status=none
+sync
+want=$(sha256sum < "$img")
+got=$(dd if="$dev" bs=512 skip=$start count=$(((size + 511) / 512)) iflag=direct status=none |
+	head -c "$size" | sha256sum)
+[ "$got" = "$want" ] || { echo "verify FAILED: sector $start differs from $img" >&2; exit 1; }
+echo "U-Boot written to $dev sector $start and verified (${want%% *})"

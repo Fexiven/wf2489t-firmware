@@ -11,7 +11,7 @@ rm -rf $P && mkdir -p $P out/repo
 cp -a package/root/. $P/
 cp -a package/DEBIAN $P/
 sed -i "2i Version: $VERSION" $P/DEBIAN/control
-chmod 755 $P/DEBIAN/postinst $P/DEBIAN/prerm $P/DEBIAN/postrm $P/usr/libexec/wf2489t/*
+chmod 755 $P/DEBIAN/postinst $P/DEBIAN/prerm $P/DEBIAN/postrm $P/usr/libexec/wf2489t/* $P/usr/sbin/*
 chmod 440 $P/etc/sudoers.d/wf2489t
 export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- package)
 rm -f out/repo/wf2489t_*.deb

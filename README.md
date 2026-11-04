@@ -27,9 +27,15 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 Prebuilt images: [Releases](https://github.com/Fexiven/wf2489t-firmware/releases)
 (`root.ext4.xz`, `uboot-copy1.img`, `SHA256SUMS`). Or build them with `make`.
 
-1. U-Boot (once, or to update it): write `out/uboot-copy1.img` to sector 16384
-   (copy 1 of the `uboot` area) from maskrom (Ctrl+B on the debug UART at
-   power-on, then `tools/rk_maskrom_boot.py` with Rockchip's usbplug and
+1. U-Boot: write `out/uboot-copy1.img` to copy 1 of the `uboot` area
+   (sector 16384) and, once it has booted, as the known-good fallback to
+   copy 2 (sector 20480). With our U-Boot running: on the tablet
+   `wf2489t-write-uboot [--copy2] uboot-copy1.img`, or in USB mode (step 2)
+   on the PC `tools/write-uboot.sh [--copy2] out/uboot-copy1.img /dev/sdX`;
+   both check the image, write only that copy and read it back. The stock
+   U-Boot has the same USB mode (`ums 0 mmc 0` at its prompt). On a stock
+   tablet without USB mode: maskrom (Ctrl+B on the debug UART at power-on,
+   then `tools/rk_maskrom_boot.py` with Rockchip's usbplug and
    `rkdeveloptool wl 16384 out/uboot-copy1.img`).
 2. Debian: connect the tablet's USB port to the PC and hold the power key at
    power-on for about 3 s: the LED ring turns blue and the eMMC appears on the
@@ -85,7 +91,7 @@ for the kernel). Kiosk settings stay in `/etc/default/kiosk`.
 | --- | --- | --- |
 | DDR init + SPL (stock, Ctrl+B on the debug UART → maskrom) | sector 64 | stock, never written |
 | TF-A BL31 + U-Boot (FIT) | `uboot` partition, copy 1 (sector 16384) | `make uboot` |
-| fallback FIT | `uboot` partition, copy 2 | stock, never written |
+| fallback FIT (the stock SPL loads it when copy 1 fails its hash check) | `uboot` partition, copy 2 (sector 20480) | `make uboot`, known-good version (stock: `backup/uboot.img`, second half) |
 | kernel, initramfs, DTB via `extlinux.conf` | root filesystem, `/boot` | Debian + `make kernel` |
 
 U-Boot boots the first partition with the GPT "legacy BIOS bootable" flag that
@@ -102,7 +108,7 @@ date on kernel updates. The root filesystem is found by its label `root`.
 | `tf-a/` | TF-A patches |
 | `package/` | the `wf2489t` package: kiosk and board support files, maintainer scripts |
 | `debian/` | apt repository builder, debos recipe for the image |
-| `tools/` | installer (`install-root.sh`), maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
+| `tools/` | installer (`install-root.sh`), U-Boot writer (`write-uboot.sh`), maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
 | `docs/` | notes, e.g. the eMMC timing and kernel bug analysis (`docs/emmc.md`) |
 
 ## Upstream TF-A and the stock loader

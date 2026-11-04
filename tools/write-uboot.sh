@@ -1,0 +1,1 @@
+../package/root/usr/sbin/wf2489t-write-uboot
