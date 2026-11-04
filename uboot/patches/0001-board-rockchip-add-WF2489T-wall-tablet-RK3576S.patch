@@ -4,14 +4,16 @@ Wall tablet with the LAN MAC address in Rockchip vendor storage on the
 eMMC; read it into ethaddr so it reaches the OS device tree.
 
 Holding the power key at power-on (read from the RK806 PMIC) starts USB
-mass storage of the eMMC instead of booting, with the LED ring blue.
+mass storage of the eMMC instead of booting. The LED ring shows the
+state: green while booting, blue in USB mass storage, red if nothing
+could be booted.
 ---
- arch/arm/mach-rockchip/rk3576/Kconfig |   8 ++
+ arch/arm/mach-rockchip/rk3576/Kconfig |   8 +
  board/rockchip/wf2489t/Kconfig        |   9 ++
  board/rockchip/wf2489t/MAINTAINERS    |   6 +
  board/rockchip/wf2489t/Makefile       |   3 +
- board/rockchip/wf2489t/wf2489t.c      | 199 ++++++++++++++++++++++++++
- 5 files changed, 225 insertions(+)
+ board/rockchip/wf2489t/wf2489t.c      | 225 ++++++++++++++++++++++++++
+ 5 files changed, 251 insertions(+)
  create mode 100644 board/rockchip/wf2489t/Kconfig
  create mode 100644 board/rockchip/wf2489t/MAINTAINERS
  create mode 100644 board/rockchip/wf2489t/Makefile
@@ -81,10 +83,10 @@ index 00000000..20b8f8d3
 +obj-y += wf2489t.o
 diff --git a/board/rockchip/wf2489t/wf2489t.c b/board/rockchip/wf2489t/wf2489t.c
 new file mode 100644
-index 00000000..b031813e
+index 00000000..69d55b3b
 --- /dev/null
 +++ b/board/rockchip/wf2489t/wf2489t.c
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,225 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * WF2489T: 15.6" wall tablet with a Rockchip RK3576S (vendor board "R141 V10")
@@ -95,6 +97,9 @@ index 00000000..b031813e
 + *
 + * Holding the power key at power-on starts USB mass storage of the eMMC
 + * instead of booting, for installing and recovery without the debug UART.
++ * The LED ring shows the state: green while booting, blue in USB mass
++ * storage, red if nothing could be booted. Linux turns it off when it takes
++ * the pins over for PWM.
 + */
 +
 +#include <env.h>
@@ -246,8 +251,28 @@ index 00000000..b031813e
 +#define RK806_SYS_STS		0x5d
 +#define RK806_PWRKEY_RELEASED	BIT(7)
 +#define UMS_HOLD_MS		2000
-+/* blue channel of the LED ring, GPIO4_C5 */
++/* LED ring channels: red GPIO4_C4, green GPIO4_C6, blue GPIO4_C5 */
++#define LED_RING_RED		"E20"
++#define LED_RING_GREEN		"E22"
 +#define LED_RING_BLUE		"E21"
++
++static void led_ring_set(const char *on)
++{
++	static const char *const leds[] = {
++		LED_RING_RED, LED_RING_GREEN, LED_RING_BLUE
++	};
++	struct gpio_desc led;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(leds); i++) {
++		if (dm_gpio_lookup_name(leds[i], &led) ||
++		    dm_gpio_request(&led, "led-ring"))
++			continue;
++		dm_gpio_set_dir_flags(&led, GPIOD_IS_OUT |
++				      (!strcmp(leds[i], on) ? GPIOD_IS_OUT_ACTIVE : 0));
++		dm_gpio_free(led.dev, &led);
++	}
++}
 +
 +static bool pwrkey_held(void)
 +{
@@ -271,16 +296,19 @@ index 00000000..b031813e
 +
 +int rk_board_late_init(void)
 +{
-+	struct gpio_desc led;
++	char bootcmd[CONFIG_SYS_CBSIZE];
 +
-+	if (!pwrkey_held())
-+		return 0;
++	led_ring_set(LED_RING_GREEN);
 +
-+	printf("Power key held: USB mass storage of the eMMC (Ctrl+C or reset to leave)\n");
-+	if (!dm_gpio_lookup_name(LED_RING_BLUE, &led) &&
-+	    !dm_gpio_request(&led, "led-ring-blue"))
-+		dm_gpio_set_dir_flags(&led, GPIOD_IS_OUT | GPIOD_IS_OUT_ACTIVE);
++	if (pwrkey_held()) {
++		printf("Power key held: USB mass storage of the eMMC (Ctrl+C or reset to leave)\n");
++		led_ring_set(LED_RING_BLUE);
++		env_set("bootdelay", "0");
++		return env_set("bootcmd", "ums 0 mmc 0; reset");
++	}
 +
-+	env_set("bootdelay", "0");
-+	return env_set("bootcmd", "ums 0 mmc 0; reset");
++	/* the boot command only returns if nothing could be booted */
++	snprintf(bootcmd, sizeof(bootcmd), "%s; gpio clear %s; gpio set %s",
++		 env_get("bootcmd") ?: "", LED_RING_GREEN, LED_RING_RED);
++	return env_set("bootcmd", bootcmd);
 +}
