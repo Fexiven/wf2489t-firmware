@@ -43,6 +43,7 @@ actions:
       - labwc
       - squeekboard
       - dconf-gsettings-backend
+      - libglib2.0-bin
       - dbus-user-session
       - cog
       - libgl1-mesa-dri
