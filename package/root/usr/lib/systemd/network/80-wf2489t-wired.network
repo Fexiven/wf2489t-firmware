@@ -3,3 +3,8 @@ Type=ether
 
 [Network]
 DHCP=yes
+
+[DHCPv4]
+# identify by MAC address (from vendor storage), so the tablet keeps its
+# address when it is reinstalled (default: DUID from the machine ID)
+ClientIdentifier=mac

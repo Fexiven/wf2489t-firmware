@@ -5,9 +5,9 @@ getent passwd kiosk >/dev/null ||
 	useradd --system --create-home --groups video,render,input,audio kiosk
 # settings (URL, MQTT password): created once, never overwritten
 [ -e /etc/default/kiosk ] || install -m 600 /usr/share/wf2489t/kiosk.default /etc/default/kiosk
-# boot splash: Debian logo with a spinner (in the initramfs)
-if [ "$(plymouth-set-default-theme)" != spinner ]; then
-	plymouth-set-default-theme spinner
+# boot splash: Debian logo with fading stars (in the initramfs)
+if [ "$(plymouth-set-default-theme)" != fade-in ]; then
+	plymouth-set-default-theme fade-in
 	update-initramfs -u -k all
 fi
 # kernel command line from /usr/share/u-boot-menu/conf.d/wf2489t.conf
