@@ -46,6 +46,7 @@ actions:
       - wireplumber
       - pulseaudio-utils
       - mosquitto-clients
+      - wlopm
       - sudo
       - labwc
       - squeekboard
