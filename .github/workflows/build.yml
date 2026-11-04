@@ -1,5 +1,7 @@
 # Builds the firmware exactly like a local `make`: same pinned build container,
-# same pinned sources. The results are attached to each run as artifacts.
+# same pinned sources. The results are attached to each run as artifacts; on
+# master the apt repository is published on GitHub Pages (signed with the
+# WF2489T_SIGNING_KEY secret).
 name: build
 
 on:
@@ -31,9 +33,26 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # package versions come from the commit history
+      - name: Reuse the published kernel if kernel/ and dts/ are unchanged
+        id: reuse
+        run: |
+          v=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d.%H%M -- kernel dts)
+          url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          mkdir -p out/kernel
+          curl -sSf $url/Packages | awk -v v="$v" 'BEGIN { RS = "" }
+            /\nVersion: / && index($0, "\nVersion: " v "\n") && /^Package: (linux-image|aic8800-sdio-modules)/ {
+              match($0, /\nFilename: [^\n]*/); print substr($0, RSTART + 11, RLENGTH - 11) }' > files || true
+          if [ "$(wc -l < files)" = 3 ]; then
+            while read f; do curl -sSf -o out/kernel/${f#./} $url/${f#./}; done < files
+            echo reused=true >> $GITHUB_OUTPUT
+          fi
       - name: Free disk space
+        if: steps.reuse.outputs.reused != 'true'
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Build kernel packages
+        if: steps.reuse.outputs.reused != 'true'
         run: make kernel
       - uses: actions/upload-artifact@v4
         with:
@@ -41,16 +60,56 @@ jobs:
           path: out/kernel/*.deb
           if-no-files-found: error
 
-  image:
+  repo:
     needs: kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: out/kernel
+      - name: Build the apt repository
+        env:
+          WF2489T_SIGNING_KEY: ${{ secrets.WF2489T_SIGNING_KEY }}
+        run: make repo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo
+          path: out/repo
+          if-no-files-found: error
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/master'
+        with:
+          path: out/repo
+
+  pages:
+    needs: repo
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  image:
+    needs: repo
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: kernel
-          path: out/kernel
+          name: repo
+          path: out/repo
       - name: Allow KVM for debos
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules

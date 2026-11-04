@@ -8,7 +8,7 @@ RUN dpkg --add-architecture arm64 && apt-get update && apt-get install -y --no-i
         git ca-certificates curl python3 python3-dev python3-setuptools \
         python3-pyelftools python3-libfdt swig device-tree-compiler \
         libssl-dev libssl-dev:arm64 libgnutls28-dev uuid-dev libelf-dev libdw-dev \
-        dpkg-dev debhelper-compat apt-utils gpg \
+        dpkg-dev debhelper-compat apt-utils gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

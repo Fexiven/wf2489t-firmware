@@ -1,22 +1,28 @@
 #!/bin/sh
-# install-root.sh DEVICE [ROOT_IMAGE] [KIOSK_URL]
+# install-root.sh DEVICE [ROOT_IMAGE] [KIOSK_SETTING=value ...]
 #
 # Install Debian on the tablet's eMMC from the PC. Start the tablet into the
 # U-Boot prompt (debug UART) and run "ums 0 mmc 0": the eMMC shows up on the
 # PC as a USB disk ("UMS disk 0"). Then, as root:
 #
-#   tools/install-root.sh /dev/sdX out/root.ext4 [https://kiosk.page]
+#   tools/install-root.sh /dev/sdX out/root.ext4 KIOSK_URL=http://homeassistant.local:8123 \
+#           KIOSK_MQTT_URL=mqtt://broker.local:1883
 #
 # Writes a new GPT with only
 #   1 uboot  sectors 16384-24575 (4 MiB, content kept: our FIT + stock copy 2)
 #   2 root   sector 24576 to the end, "legacy BIOS bootable" for U-Boot
 # then the root filesystem (grown to the whole partition). The stock loader
 # (sector 64) and Rockchip vendor storage (sector 7168, MAC address) are
-# outside all partitions and are not touched.
+# outside all partitions and are not touched. KIOSK_* settings go into the
+# installed /etc/default/kiosk.
 set -eu
-dev=${1:?usage: install-root.sh DEVICE [ROOT_IMAGE] [KIOSK_URL]}
-img=${2:-out/root.ext4}
-url=${3:-}
+usage="usage: install-root.sh DEVICE [ROOT_IMAGE] [KIOSK_SETTING=value ...]"
+dev=${1:?$usage}; shift
+img=out/root.ext4
+case ${1:-} in ""|*=*) ;; *) img=$1; shift ;; esac
+for kv; do
+	case $kv in KIOSK_[A-Z_]*=*) ;; *) echo "not a kiosk setting: $kv" >&2; echo "$usage" >&2; exit 1 ;; esac
+done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 [ -b "$dev" ] && [ -f "$img" ] || { echo "no block device $dev or no image $img" >&2; exit 1; }
@@ -50,12 +56,18 @@ dd if="$img" of="$root" bs=4M conv=fsync status=progress
 e2fsck -f -y "$root" >/dev/null || [ $? -le 1 ]
 resize2fs "$root"
 
-if [ -n "$url" ]; then
+if [ $# -gt 0 ]; then
 	mnt=$(mktemp -d)
 	mount "$root" "$mnt"
-	sed -i "s|^KIOSK_URL=.*|KIOSK_URL=$url|" "$mnt/etc/default/kiosk"
+	conf=$mnt/etc/default/kiosk
+	for kv; do
+		key=${kv%%=*}
+		grep -v "^$key=" "$conf" > "$conf.new" || true
+		printf '%s\n' "$kv" >> "$conf.new"
+		cat "$conf.new" > "$conf"; rm "$conf.new"
+		echo "set $key"
+	done
 	umount "$mnt"; rmdir "$mnt"
-	echo "kiosk page: $url"
 fi
 sync
 sgdisk --print "$dev"

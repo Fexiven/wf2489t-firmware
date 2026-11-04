@@ -9,7 +9,8 @@ seller); its stock Android reports brand "Apolosign", manufacturer "Electron".
 
 ```sh
 make uboot     # out/uboot-copy1.img
-make kernel    # out/kernel/linux-image-*.deb, linux-headers-*.deb
+make kernel    # out/kernel/*.deb: kernel, Wi-Fi driver, linux-image-wf2489t
+make repo      # out/repo: apt repository (wf2489t package, kernel, firmware, TouchKio)
 make image     # out/wf2489t-debian.img and out/root.ext4 (needs /dev/kvm)
 make all
 ```
@@ -31,7 +32,8 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
    appears on the PC as a USB disk. Then as root on the PC:
 
    ```sh
-   tools/install-root.sh /dev/sdX out/root.ext4 [kiosk URL]
+   tools/install-root.sh /dev/sdX out/root.ext4 \
+       KIOSK_URL=http://homeassistant.local:8123 KIOSK_MQTT_URL=mqtt://broker.local:1883
    ```
 
    It writes a GPT with only `uboot` and `root` (loader at sector 64 and vendor
@@ -40,6 +42,22 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 
 The same `ums` path is the recovery for a broken root filesystem.
 
+## Updates
+
+Everything for the tablet is in Debian packages from this repository's apt
+repository (`make repo`; CI publishes it on GitHub Pages, signed):
+
+| Package | Contents |
+| --- | --- |
+| `wf2489t` | kiosk (labwc, TouchKio, squeekboard), MQTT service, udev and sudo rules, Bluetooth, network; depends on all of the below |
+| `linux-image-wf2489t` | the current kernel and its AIC8800 Wi-Fi driver |
+| `aic8800-firmware`, `touchkio` | Radxa's firmware and TouchKio, pinned versions |
+
+The image installs `wf2489t`, which also adds the repository, so the tablet
+updates with `apt update && apt upgrade`. A package's version is the date of
+the last commit that changed its sources (`package/`, or `kernel/` and `dts/`
+for the kernel). Kiosk settings stay in `/etc/default/kiosk`.
+
 ## What is pinned
 
 | Input | Version | Where |
@@ -47,7 +65,8 @@ The same `ums` path is the recovery for a broken root filesystem.
 | Linux | v7.4-rc1 (`6628e7d4c6b2`) + `kernel/patches/` | `kernel/build.sh` |
 | U-Boot | v2026.10 (`5508406582f6`) + `uboot/patches/` | `uboot/build.sh` |
 | TF-A (BL31) | master `ba48f2d3b4d2` + `tf-a/patches/` | `uboot/build.sh` |
-| Debian | trixie | `debian/wf2489t.yaml` |
+| Debian | trixie (current point release) | `debian/wf2489t.yaml` |
+| AIC8800 firmware, TouchKio | by SHA-256 | `debian/build-repo.sh` |
 | Build tools | Debian trixie by digest | `Containerfile` |
 
 ## Boot chain
@@ -71,8 +90,9 @@ date on kernel updates. The root filesystem is found by its label `root`.
 | `kernel/` | config fragment, patches, build script |
 | `uboot/` | defconfig, U-Boot DT additions, FIT generator, build script (U-Boot + TF-A) |
 | `tf-a/` | TF-A patches |
-| `debian/` | debos recipe, first-boot setup, config overlay |
-| `tools/` | maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
+| `package/` | the `wf2489t` package: kiosk and board support files, maintainer scripts |
+| `debian/` | apt repository builder, debos recipe for the image |
+| `tools/` | installer (`install-root.sh`), maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
 | `docs/` | notes, e.g. the eMMC timing and kernel bug analysis (`docs/emmc.md`) |
 
 ## Upstream TF-A and the stock loader
@@ -95,7 +115,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 
 - [x] Mainline U-Boot + upstream TF-A (no Rockchip binaries after the stock SPL, no OP-TEE), automatic extlinux boot
 - [x] Mainline kernel: display, touch, GPU, eMMC (HS400ES), Ethernet, PCIe, sensors, RTC, keys
-- [x] Debian trixie image (debos), kernel as a Debian package
+- [x] Debian trixie image (debos), everything else as Debian packages from our apt repository
 - [x] Ethernet MAC address from Rockchip vendor storage (U-Boot, passed to Linux in the device tree)
 - [x] LED ring red/green/blue (on/off), relays on I/O 3 and 4 (`gpioset -t 0 relay-1=1`)
 - [ ] Zigbee/Thread (EFR32 on `ttyS6`): not fitted on the test unit (no answer on UART6), untested
