@@ -24,10 +24,15 @@ while :; do
 		# Electron (Chromium) kiosk for Home Assistant: fullscreen, switches
 		# to maximized while the on-screen keyboard is shown. DISPLAY is only
 		# checked, it runs on Wayland; text-input-v3 for the keyboard.
+		# With KIOSK_MQTT_URL set, the tablet appears in Home Assistant (MQTT
+		# discovery): display power, brightness, volume, keyboard, sensors.
+		set --
+		[ -n "$KIOSK_MQTT_URL" ] && set -- --mqtt-url="$KIOSK_MQTT_URL" \
+			--mqtt-user="$KIOSK_MQTT_USER" --mqtt-password="$KIOSK_MQTT_PASSWORD"
 		DISPLAY=:0 ELECTRON_OZONE_PLATFORM_HINT=wayland /usr/bin/touchkio \
 			--web-url="$KIOSK_URL" --web-theme=dark --web-zoom=1.0 \
 			--app-kiosk=fullscreen --enable-wayland-ime \
-			--wayland-text-input-version=3 $KIOSK_BROWSER_OPTIONS
+			--wayland-text-input-version=3 "$@" $KIOSK_BROWSER_OPTIONS
 		;;
 	cog)
 		# maximized (not fullscreen) so the keyboard is not covered; WPE

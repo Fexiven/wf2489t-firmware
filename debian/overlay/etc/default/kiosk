@@ -4,3 +4,8 @@ KIOSK_URL=http://homeassistant.local:8123
 # lighter, no system dark mode)
 KIOSK_BROWSER=touchkio
 KIOSK_BROWSER_OPTIONS=
+# MQTT broker for TouchKio's Home Assistant integration (optional), e.g.
+# mqtt://broker.local:1883; keep this file readable by root only (chmod 600)
+KIOSK_MQTT_URL=
+KIOSK_MQTT_USER=
+KIOSK_MQTT_PASSWORD=
