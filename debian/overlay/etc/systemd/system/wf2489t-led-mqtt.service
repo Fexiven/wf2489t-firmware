@@ -1,0 +1,12 @@
+[Unit]
+Description=RGB LED ring as a Home Assistant light (MQTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wf2489t-led-mqtt
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

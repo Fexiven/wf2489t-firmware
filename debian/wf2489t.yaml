@@ -45,6 +45,7 @@ actions:
       - pipewire-alsa
       - wireplumber
       - pulseaudio-utils
+      - mosquitto-clients
       - labwc
       - squeekboard
       - dconf-gsettings-backend

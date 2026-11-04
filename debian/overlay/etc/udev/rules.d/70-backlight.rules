@@ -1,0 +1,5 @@
+# Backlight brightness and power writable by group video (kiosk user), so
+# TouchKio can switch and dim the display without root
+ACTION=="add", SUBSYSTEM=="backlight", \
+  RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness /sys/class/backlight/%k/bl_power", \
+  RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness /sys/class/backlight/%k/bl_power"

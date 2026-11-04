@@ -1,0 +1,15 @@
+#!/bin/sh
+# wlopm replacement for TouchKio: switch the display with the backlight
+# (bl_power) instead of powering the output down. Powering eDP-1 down made
+# labwc re-layout the kiosk window (no longer fullscreen after switching on);
+# with only the backlight off the output and the window stay as they are.
+#   wlopm              print "eDP-1 on|off"
+#   wlopm --on|--off * switch the backlight on/off
+bl=$(ls -d /sys/class/backlight/* 2>/dev/null | head -1)
+[ -n "$bl" ] || { echo "no backlight" >&2; exit 1; }
+case $1 in
+--on)  echo 0 > "$bl/bl_power" ;;
+--off) echo 4 > "$bl/bl_power" ;;
+"")    [ "$(cat "$bl/bl_power")" = 0 ] && echo "eDP-1 on" || echo "eDP-1 off" ;;
+*)     echo "usage: wlopm [--on|--off OUTPUT]" >&2; exit 1 ;;
+esac

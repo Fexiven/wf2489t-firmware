@@ -1,0 +1,60 @@
+#!/bin/sh
+# The RGB LED ring as a Home Assistant light (MQTT discovery, template
+# schema), attached to TouchKio's device. Broker settings from
+# /etc/default/kiosk (KIOSK_MQTT_URL, KIOSK_MQTT_USER, KIOSK_MQTT_PASSWORD).
+set -u
+. /etc/default/kiosk
+[ -n "${KIOSK_MQTT_URL:-}" ] || { echo "no KIOSK_MQTT_URL, nothing to do"; exec sleep infinity; }
+
+hostport=${KIOSK_MQTT_URL#*://}
+host=${hostport%%:*}; port=${hostport##*:}; [ "$port" = "$hostport" ] && port=1883
+set -- -h "$host" -p "$port"
+[ -n "${KIOSK_MQTT_USER:-}" ] && set -- "$@" -u "$KIOSK_MQTT_USER" -P "${KIOSK_MQTT_PASSWORD:-}"
+
+# same device id as TouchKio: last 6 characters of the serial number
+serial=$(tr -d '\0' < /sys/firmware/devicetree/base/serial-number)
+id=rpi_$(printf %s "$serial" | tail -c 6 | tr a-z A-Z | tr -cd A-Z0-9)
+base=touchkio/$id/led_ring
+led=/sys/class/leds/rgb:status
+store=/var/lib/wf2489t-led/state            # on|off,brightness,red,green,blue
+mkdir -p "${store%/*}"
+[ -s "$store" ] || echo "off,255,255,255,255" > "$store"
+
+apply() {  # set the LEDs from $store and report the state
+	IFS=, read -r s b r g bl < "$store"
+	echo "$r $g $bl" > "$led/multi_intensity"
+	if [ "$s" = on ]; then echo "$b" > "$led/brightness"; else echo 0 > "$led/brightness"; fi
+	mosquitto_pub "$@" -r -t "$base/state" -f "$store"
+}
+
+mosquitto_pub "$@" -r -t "homeassistant/light/$id/led_ring/config" -m "$(cat <<EOF
+{"name":"LED Ring","unique_id":"${id}_led_ring","object_id":"${id}_led_ring",
+ "schema":"template","icon":"mdi:led-strip-variant",
+ "command_topic":"$base/set","state_topic":"$base/state",
+ "command_on_template":"on,{{ brightness|d }},{{ red|d }},{{ green|d }},{{ blue|d }}",
+ "command_off_template":"off",
+ "state_template":"{{ value.split(',')[0] }}",
+ "brightness_template":"{{ value.split(',')[1]|int }}",
+ "red_template":"{{ value.split(',')[2]|int }}",
+ "green_template":"{{ value.split(',')[3]|int }}",
+ "blue_template":"{{ value.split(',')[4]|int }}",
+ "device":{"identifiers":["$id"]}}
+EOF
+)"
+apply "$@"
+
+# commands: "off" or "on,brightness,red,green,blue" (empty = unchanged)
+mosquitto_sub "$@" -t "$base/set" | while read -r cmd; do
+	IFS=, read -r s b r g bl < "$store"
+	if [ "$cmd" = off ]; then
+		s=off
+	else
+		old=$IFS; IFS=,; set -f; set -- $cmd; set +f; IFS=$old
+		s=on; b=${2:-$b}; r=${3:-$r}; g=${4:-$g}; bl=${5:-$bl}
+		# restore the broker arguments for apply()
+		set -- -h "$host" -p "$port"
+		[ -n "${KIOSK_MQTT_USER:-}" ] && set -- "$@" -u "$KIOSK_MQTT_USER" -P "${KIOSK_MQTT_PASSWORD:-}"
+	fi
+	echo "$s,$b,$r,$g,$bl" > "$store"
+	apply "$@"
+done
