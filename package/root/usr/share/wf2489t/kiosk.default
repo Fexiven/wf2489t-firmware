@@ -7,3 +7,9 @@ KIOSK_MQTT_USER=
 KIOSK_MQTT_PASSWORD=
 # display brightness from the ambient light sensor (yes or no)
 KIOSK_AUTO_BRIGHTNESS=yes
+# motion sensor from the front camera in Home Assistant (yes or no); relative
+# change per cell (48x48 pixels), changed cells for motion, seconds "on" after it
+KIOSK_MOTION=yes
+KIOSK_MOTION_THRESHOLD=0.15
+KIOSK_MOTION_CELLS=3
+KIOSK_MOTION_HOLD=30

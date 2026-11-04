@@ -1,5 +1,5 @@
 #!/bin/sh
 set -e
 [ "$1" = remove ] || exit 0
-units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service aic8800-bluetooth.service"
+units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service wf2489t-motion.service aic8800-bluetooth.service"
 [ -d /run/systemd/system ] && systemctl stop $units || true

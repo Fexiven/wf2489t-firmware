@@ -1,0 +1,15 @@
+[Unit]
+Description=Motion sensor from the front camera in Home Assistant (MQTT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/kiosk
+ExecStart=/usr/libexec/wf2489t/motion
+DynamicUser=yes
+SupplementaryGroups=video
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
