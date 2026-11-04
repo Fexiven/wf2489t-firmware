@@ -48,6 +48,7 @@ actions:
       - librsvg2-common
       - dbus-user-session
       - cog
+      - chromium
       - libgl1-mesa-dri
       - libpam-systemd
       - fonts-dejavu-core

@@ -5,7 +5,7 @@ echo wf2489t > /etc/hostname
 echo "127.0.1.1	wf2489t" >> /etc/hosts
 echo root:admin | chpasswd
 # kernel: postinst hooks build the initramfs and u-boot-menu writes extlinux.conf
-dpkg -i /var/tmp/kernel/*.deb   # kernel, AIC8800 firmware + Wi-Fi driver
+apt-get install -y --no-install-recommends /var/tmp/kernel/*.deb   # kernel, AIC8800 firmware + Wi-Fi driver, TouchKio (+ its dependencies)
 rm -rf /var/tmp/kernel
 systemctl enable systemd-networkd systemd-resolved systemd-timesyncd
 # kiosk: browser on the display (URL in /etc/default/kiosk)

@@ -1,3 +1,6 @@
-# Page shown full screen on the tablet by kiosk.service (labwc + cog)
+# Kiosk (kiosk.service: labwc + browser + on-screen keyboard)
 KIOSK_URL=http://homeassistant.local:8123
-KIOSK_COG_OPTIONS=
+# touchkio (default, Home Assistant kiosk app), chromium, or cog (WPE WebKit,
+# lighter, no system dark mode)
+KIOSK_BROWSER=touchkio
+KIOSK_BROWSER_OPTIONS=

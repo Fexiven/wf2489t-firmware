@@ -19,6 +19,13 @@ mkdir -p build/dl
 echo "$AIC_FW_SHA256  build/dl/$AIC_FW" | sha256sum -c --quiet
 cp build/dl/$AIC_FW debian/kdeb/
 
+# TouchKio: Home Assistant kiosk app (Electron), default kiosk browser
+TK_VERSION=1.6.0
+TK_DEB=touchkio_${TK_VERSION}_arm64.deb
+[ -f build/dl/$TK_DEB ] || curl -sSfL -o build/dl/$TK_DEB \
+	https://github.com/leukipp/touchkio/releases/download/v$TK_VERSION/$TK_DEB
+cp build/dl/$TK_DEB debian/kdeb/
+
 podman run --rm --device /dev/kvm --group-add keep-groups --userns keep-id \
 	--security-opt label=disable --tmpfs /scratch:exec,size=8g \
 	-v "$PWD:/work" -w /work ghcr.io/go-debos/debos:latest \

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- Kiosk: the browser maximized without decorations. Maximized, not
+<!-- Kiosk: the browser (any window) maximized without decorations. Maximized, not
      fullscreen, so the on-screen keyboard (a layer-shell surface with an
      exclusive zone) stays visible and the page shrinks while it is open. -->
 <labwc_config>
@@ -8,7 +8,10 @@
     <gap>0</gap>
   </core>
   <windowRules>
-    <windowRule identifier="com.igalia.Cog" serverDecoration="no">
+    <!-- no title bar at all: labwc takes over the decorations (so the client
+         draws none, e.g. Chromium's own title bar) and then draws none -->
+    <windowRule identifier="*">
+      <action name="SetDecorations" decorations="none" forceSSD="yes"/>
       <action name="Maximize"/>
     </windowRule>
   </windowRules>
