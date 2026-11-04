@@ -40,6 +40,11 @@ actions:
       - i2c-tools
       - gpiod
       - alsa-utils
+      - pipewire
+      - pipewire-pulse
+      - pipewire-alsa
+      - wireplumber
+      - pulseaudio-utils
       - labwc
       - squeekboard
       - dconf-gsettings-backend
