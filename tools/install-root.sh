@@ -25,6 +25,9 @@ for kv; do
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+for t in sgdisk e2fsck resize2fs lsblk blockdev; do
+	command -v $t >/dev/null || { echo "$t not found (packages gdisk, e2fsprogs, util-linux)" >&2; exit 1; }
+done
 [ -b "$dev" ] && [ -f "$img" ] || { echo "no block device $dev or no image $img" >&2; exit 1; }
 
 # only the tablet's eMMC exported by U-Boot ums
