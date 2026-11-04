@@ -1,6 +1,8 @@
 #!/bin/sh
-# The RGB LED ring as a Home Assistant light (MQTT discovery, template
-# schema), attached to TouchKio's device. Broker settings from
+# Home Assistant entities for what TouchKio does not cover, attached to
+# TouchKio's device (MQTT discovery): the RGB LED ring as a light (template
+# schema) and the ambient light sensor (STK3311; TouchKio only reads an IIO
+# device named "als"). Broker settings from
 # /etc/default/kiosk (KIOSK_MQTT_URL, KIOSK_MQTT_USER, KIOSK_MQTT_PASSWORD).
 set -u
 . /etc/default/kiosk
@@ -42,6 +44,26 @@ mosquitto_pub "$@" -r -t "homeassistant/light/$id/led_ring/config" -m "$(cat <<E
 EOF
 )"
 apply "$@"
+
+# ambient light sensor: lux = raw * scale, published when it changes
+als=$(grep -l -x stk3310 /sys/bus/iio/devices/*/name 2>/dev/null | head -1)
+if [ -n "$als" ]; then
+	als=${als%/name}
+	cfg='{"name":"Ambient Light","unique_id":"ID_ambient_light","object_id":"ID_ambient_light",'
+	cfg=$cfg'"device_class":"illuminance","unit_of_measurement":"lx","state_class":"measurement",'
+	cfg=$cfg'"state_topic":"touchkio/ID/ambient_light/state","device":{"identifiers":["ID"]}}'
+	mosquitto_pub "$@" -r -t "homeassistant/sensor/$id/ambient_light/config" \
+		-m "$(printf %s "$cfg" | sed "s/ID/$id/g")"
+	(last=
+	while :; do
+		lux=$(awk -v r="$(cat "$als/in_illuminance_raw")" -v s="$(cat "$als/in_illuminance_scale")" \
+			'BEGIN { printf "%.1f", r * s }')
+		if [ "$lux" != "$last" ]; then
+			mosquitto_pub "$@" -r -t "touchkio/$id/ambient_light/state" -m "$lux" && last=$lux
+		fi
+		sleep 10
+	done) &
+fi
 
 # commands: "off" or "on,brightness,red,green,blue" (empty = unchanged)
 mosquitto_sub "$@" -t "$base/set" | while read -r cmd; do

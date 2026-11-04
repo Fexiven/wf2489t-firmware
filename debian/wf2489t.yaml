@@ -46,6 +46,7 @@ actions:
       - wireplumber
       - pulseaudio-utils
       - mosquitto-clients
+      - sudo
       - labwc
       - squeekboard
       - dconf-gsettings-backend

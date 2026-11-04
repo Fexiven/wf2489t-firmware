@@ -1,0 +1,3 @@
+# TouchKio (user kiosk) may reboot and shut down the tablet from Home
+# Assistant, nothing else
+kiosk ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/sbin/shutdown

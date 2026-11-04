@@ -105,7 +105,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); Chromium or cog selectable; URL and browser in `/etc/default/kiosk`
-- [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (backlight, `wlopm` replacement), volume, keyboard, sensors; the RGB LED ring as a light (`wf2489t-led-mqtt.service`)
+- [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (backlight, `wlopm` replacement), volume, keyboard, sensors; the RGB LED ring as a light and the ambient light sensor (`wf2489t-mqtt.service`); reboot/shutdown via a sudo rule
 - [x] Kiosk GPU acceleration (WPE's web process uses the Panfrost render node)
 - [x] U-Boot USB mass storage: `ums 0 mmc 0` at the U-Boot prompt shows the whole eMMC on the PC (uboot/patches 0002, 0003)
 - [x] Final partition table: `uboot` + one `root` partition (installed on the test tablet with U-Boot `gpt write` + `gzwrite`, or `tools/install-root.sh` via `ums`)

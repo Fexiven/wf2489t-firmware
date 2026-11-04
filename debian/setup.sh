@@ -14,8 +14,9 @@ chmod 755 /usr/local/bin/kiosk-session
 chmod 600 /etc/default/kiosk   # may hold the MQTT password
 systemctl enable kiosk.service
 systemctl enable aic8800-bluetooth.service
-chmod 755 /usr/local/bin/wlopm /usr/local/bin/wf2489t-led-mqtt
-systemctl enable wf2489t-led-mqtt.service
+chmod 755 /usr/local/bin/wlopm /usr/local/bin/wf2489t-mqtt
+systemctl enable wf2489t-mqtt.service
+chmod 440 /etc/sudoers.d/kiosk-power
 systemctl set-default graphical.target
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 apt-get clean
