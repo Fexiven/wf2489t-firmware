@@ -56,6 +56,8 @@ root=$(lsblk -lnpo NAME "$dev" | sed -n 3p)
 
 echo "writing $img to $root"
 dd if="$img" of="$root" bs=4M conv=fsync status=progress
+# a desktop may auto-mount the new filesystem right away
+udevadm settle; umount "$root" 2>/dev/null || true
 e2fsck -f -y "$root" >/dev/null || [ $? -le 1 ]
 resize2fs "$root"
 
