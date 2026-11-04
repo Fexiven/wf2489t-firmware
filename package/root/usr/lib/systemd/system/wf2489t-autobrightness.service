@@ -1,0 +1,10 @@
+[Unit]
+Description=Display brightness from the ambient light sensor
+
+[Service]
+ExecStart=/usr/libexec/wf2489t/autobrightness
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

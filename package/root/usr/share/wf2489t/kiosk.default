@@ -5,3 +5,5 @@ KIOSK_URL=http://homeassistant.local:8123
 KIOSK_MQTT_URL=
 KIOSK_MQTT_USER=
 KIOSK_MQTT_PASSWORD=
+# display brightness from the ambient light sensor (yes or no)
+KIOSK_AUTO_BRIGHTNESS=yes

@@ -12,13 +12,27 @@ if [ "$(plymouth-set-default-theme)" != fade-in ]; then
 fi
 # kernel command line from /usr/share/u-boot-menu/conf.d/wf2489t.conf
 u-boot-update
-units="kiosk.service wf2489t-mqtt.service aic8800-bluetooth.service"
+units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service aic8800-bluetooth.service"
+# enable each unit once (also units added by an upgrade); a unit disabled
+# later by hand stays disabled
+for u in $units; do
+	deb-systemd-helper unmask $u >/dev/null || true   # masked by postrm on removal
+	if deb-systemd-helper --quiet was-enabled $u; then
+		deb-systemd-helper enable $u
+	else
+		deb-systemd-helper update-state $u
+	fi
+done
 if [ -z "$2" ]; then
 	# first install
-	systemctl enable $units systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
+	systemctl enable systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
 elif [ -d /run/systemd/system ]; then
 	# upgrade on the running tablet
 	systemctl daemon-reload
 	udevadm control --reload || true
 	systemctl try-restart $units
+	# a service new in this version is enabled above but not running yet
+	for u in $units; do
+		systemctl is-enabled --quiet $u && systemctl start $u
+	done
 fi

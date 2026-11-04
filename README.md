@@ -135,6 +135,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); URL and MQTT broker in `/etc/default/kiosk`
+- [x] Automatic display brightness from the ambient light sensor (`wf2489t-autobrightness.service`, off with `KIOSK_AUTO_BRIGHTNESS=no` in `/etc/default/kiosk`)
 - [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (`wlopm`, backlight), volume, keyboard, sensors; the RGB LED ring as a light and the ambient light sensor (`wf2489t-mqtt.service`); reboot/shutdown via a sudo rule
 - [x] Kiosk GPU acceleration (Electron's GPU process uses Panfrost)
 - [x] U-Boot USB mass storage: power key held at power-on (or `ums 0 mmc 0` at the prompt) shows the whole eMMC on the PC (uboot/patches 0001-0003)

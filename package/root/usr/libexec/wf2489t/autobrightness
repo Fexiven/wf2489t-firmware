@@ -1,0 +1,36 @@
+#!/bin/sh
+# Display brightness from the ambient light sensor (STK3311): logarithmic in
+# lux, from MIN at 0 lx to 255 at FULL_LUX and above. The light level is
+# averaged and the brightness moves in small steps, so passing shadows do not
+# make the display flicker. Off with KIOSK_AUTO_BRIGHTNESS=no in
+# /etc/default/kiosk.
+set -u
+. /etc/default/kiosk
+[ "${KIOSK_AUTO_BRIGHTNESS:-yes}" = yes ] || { echo "KIOSK_AUTO_BRIGHTNESS=no, nothing to do"; exec sleep infinity; }
+
+MIN=20 FULL_LUX=400 STEP=8 INTERVAL=2
+bl=/sys/class/backlight/backlight
+als=$(grep -l -x stk3310 /sys/bus/iio/devices/*/name 2>/dev/null | head -1)
+[ -n "$als" ] || { echo "no light sensor"; exec sleep infinity; }
+als=${als%/name}
+max=$(cat $bl/max_brightness)
+
+lux=
+while :; do
+	raw=$(cat $als/in_illuminance_raw) scale=$(cat $als/in_illuminance_scale)
+	cur=$(cat $bl/brightness)
+	# new average lux and the brightness to set (empty: leave it)
+	set -- $(awk -v r="$raw" -v s="$scale" -v avg="$lux" -v cur="$cur" -v max="$max" \
+		-v min=$MIN -v full=$FULL_LUX -v step=$STEP 'BEGIN {
+		l = r * s
+		if (avg != "") l = avg + 0.3 * (l - avg)
+		f = log(1 + l) / log(1 + full); if (f > 1) f = 1
+		t = int(min + (max - min) * f + 0.5)
+		d = t - cur
+		if (d > step) d = step; if (d < -step) d = -step
+		printf "%.2f %s\n", l, (d >= 3 || d <= -3 || (t == max && cur != max)) ? cur + d : ""
+	}')
+	lux=$1
+	[ -n "${2:-}" ] && echo "$2" > $bl/brightness
+	sleep $INTERVAL
+done

@@ -1,5 +1,5 @@
 #!/bin/sh
 set -e
 [ "$1" = remove ] || exit 0
-systemctl disable kiosk.service wf2489t-mqtt.service aic8800-bluetooth.service || true
-[ -d /run/systemd/system ] && systemctl stop kiosk.service wf2489t-mqtt.service || true
+units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service aic8800-bluetooth.service"
+[ -d /run/systemd/system ] && systemctl stop $units || true
