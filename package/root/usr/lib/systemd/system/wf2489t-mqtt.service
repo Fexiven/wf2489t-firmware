@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/wf2489t-mqtt
+ExecStart=/usr/libexec/wf2489t/mqtt
 Restart=always
 RestartSec=10
 

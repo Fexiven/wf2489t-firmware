@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+if [ "$1" = purge ]; then
+	rm -f /etc/default/kiosk
+	rm -rf /var/lib/wf2489t-led
+fi

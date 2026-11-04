@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+[ "$1" = configure ] || exit 0
+getent passwd kiosk >/dev/null ||
+	useradd --system --create-home --groups video,render,input,audio kiosk
+# settings (URL, MQTT password): created once, never overwritten
+[ -e /etc/default/kiosk ] || install -m 600 /usr/share/wf2489t/kiosk.default /etc/default/kiosk
+units="kiosk.service wf2489t-mqtt.service aic8800-bluetooth.service"
+if [ -z "$2" ]; then
+	# first install
+	systemctl enable $units systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
+elif [ -d /run/systemd/system ]; then
+	# upgrade on the running tablet
+	systemctl daemon-reload
+	udevadm control --reload || true
+	systemctl try-restart $units
+fi

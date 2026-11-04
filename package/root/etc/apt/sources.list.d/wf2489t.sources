@@ -1,0 +1,6 @@
+# Kernel, board support and kiosk packages for the WF2489T
+# (built by github.com/Fexiven/wf2489t-firmware)
+Types: deb
+URIs: https://fexiven.github.io/wf2489t-firmware/
+Suites: ./
+Signed-By: /usr/share/keyrings/wf2489t.gpg

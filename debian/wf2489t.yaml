@@ -1,6 +1,6 @@
 # Debian trixie (arm64) for the WF2489T wall tablet, built with debos.
 # Boot: mainline U-Boot -> extlinux.conf (written by u-boot-menu) -> kernel deb.
-# Built by debian/build-image.sh (stages the kernel package from out/kernel in kdeb/).
+# Built by debian/build-image.sh (stages the apt repository from out/repo in repo/).
 # Output: wf2489t-debian.img, a disk image with one ext4 partition "root".
 {{- $suite := or .suite "trixie" -}}
 {{- $image := or .image "wf2489t-debian.img" }}
@@ -19,45 +19,17 @@ actions:
     recommends: false
     packages:
       - systemd-sysv
-      - systemd-resolved
-      - systemd-timesyncd
       - udev
       - dbus
       - kmod
       - initramfs-tools
       - u-boot-menu
       - openssh-server
-      - firmware-realtek
       - ca-certificates
       - iproute2
       - iputils-ping
-      - iw
-      - wpasupplicant
-      - wireless-regdb
-      - bluez
       - less
       - nano
-      - i2c-tools
-      - gpiod
-      - alsa-utils
-      - pipewire
-      - pipewire-pulse
-      - pipewire-alsa
-      - wireplumber
-      - pulseaudio-utils
-      - mosquitto-clients
-      - wlopm
-      - sudo
-      - labwc
-      - squeekboard
-      - dconf-gsettings-backend
-      - libglib2.0-bin
-      - adwaita-icon-theme
-      - librsvg2-common
-      - dbus-user-session
-      - libgl1-mesa-dri
-      - libpam-systemd
-      - fonts-dejavu-core
       - e2fsprogs
       - gdisk
 
@@ -65,12 +37,12 @@ actions:
     source: overlay
 
   - action: overlay
-    description: kernel packages
-    source: kdeb
-    destination: /var/tmp/kernel
+    description: apt repository (out/repo)
+    source: repo
+    destination: /var/tmp/repo
 
   - action: run
-    description: kernel, root password, services
+    description: wf2489t package, root password
     chroot: true
     script: setup.sh
 

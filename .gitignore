@@ -1,5 +1,5 @@
 /build/
 /out/
 /build-*.log
-/debian/kdeb/
+/debian/repo/
 /fake-scratch.img.*

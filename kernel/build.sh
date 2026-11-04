@@ -1,7 +1,9 @@
 #!/bin/sh
 # Mainline kernel for the WF2489T as Debian packages (runs in the build container).
 # arm64 defconfig + kernel/config.fragment, board DTS from dts/, kernel/patches/*.
-# Output: out/kernel/linux-image-*.deb, linux-headers-*.deb
+# Output: out/kernel/linux-image-*.deb, linux-headers-*.deb, the Wi-Fi driver
+# and linux-image-wf2489t (depends on both, so apt upgrade gets new kernels).
+# Version: date of the last commit that changed kernel/ or dts/.
 set -eu
 REPO=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 TAG=v7.4-rc1
@@ -22,8 +24,9 @@ for p in kernel/patches/*.patch; do [ -e "$p" ] || continue; git -C $SRC apply "
 cp dts/rk3576s-wf2489t.dtsi dts/rk3576s-wf2489t.dts $SRC/arch/arm64/boot/dts/rockchip/
 echo 'dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576s-wf2489t.dtb' >> $SRC/arch/arm64/boot/dts/rockchip/Makefile
 
-# reproducible: build date = date of the last commit of this repo
-export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+# reproducible: build date and package version from the last kernel commit
+export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- kernel dts)
+VERSION=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d.%H%M -- kernel dts)
 # no "-dirty" from the patched git tree in the kernel release (scripts/setlocalversion)
 export GIT_DIR=/nonexistent
 export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_BUILD_USER=wf2489t KBUILD_BUILD_HOST=build \
@@ -33,10 +36,10 @@ make -s -C $SRC O=$PWD/$OBJ defconfig
 $SRC/scripts/kconfig/merge_config.sh -m -O $OBJ $OBJ/.config kernel/config.fragment >/dev/null
 make -s -C $SRC O=$PWD/$OBJ olddefconfig
 rm -f build/*.deb build/*.buildinfo build/*.changes
-make -s -C $SRC O=$PWD/$OBJ -j$(nproc) LOCALVERSION=-wf2489t KDEB_PKGVERSION=1 bindeb-pkg
+make -s -C $SRC O=$PWD/$OBJ -j$(nproc) LOCALVERSION=-wf2489t KDEB_PKGVERSION=$VERSION bindeb-pkg
 
 mkdir -p out/kernel && rm -f out/kernel/*.deb
-cp build/linux-image-*-wf2489t_1_arm64.deb build/linux-headers-*_arm64.deb out/kernel/
+cp build/linux-image-*-wf2489t_${VERSION}_arm64.deb build/linux-headers-*_${VERSION}_arm64.deb out/kernel/
 
 # Wi-Fi/BT: AIC8800D80 SDIO driver (out of tree) from Radxa's DKMS package,
 # built against this kernel and packaged for it; firmware: debian/build-image.sh
@@ -58,7 +61,7 @@ rm -f $AIC/pkg/lib/modules/$KREL/modules.*
 mkdir -p $AIC/pkg/DEBIAN
 cat > $AIC/pkg/DEBIAN/control <<CONTROL
 Package: aic8800-sdio-modules-$KREL
-Version: $AIC_VERSION
+Version: $VERSION
 Architecture: arm64
 Maintainer: wf2489t-firmware
 Depends: linux-image-$KREL, aic8800-firmware (= $AIC_VERSION)
@@ -71,5 +74,21 @@ CONTROL
 printf '#!/bin/sh\nset -e\ndepmod -a %s\n' $KREL > $AIC/pkg/DEBIAN/postinst
 cp $AIC/pkg/DEBIAN/postinst $AIC/pkg/DEBIAN/postrm
 chmod 755 $AIC/pkg/DEBIAN/postinst $AIC/pkg/DEBIAN/postrm
-dpkg-deb --root-owner-group -Zxz --build $AIC/pkg out/kernel/aic8800-sdio-modules-${KREL}_${AIC_VERSION}_arm64.deb >/dev/null
+dpkg-deb --root-owner-group -Zxz --build $AIC/pkg out/kernel/aic8800-sdio-modules-${KREL}_${VERSION}_arm64.deb >/dev/null
+
+# linux-image-wf2489t: always the current kernel and its Wi-Fi driver
+M=build/linux-meta
+rm -rf $M && mkdir -p $M/DEBIAN
+cat > $M/DEBIAN/control <<CONTROL
+Package: linux-image-wf2489t
+Version: $VERSION
+Architecture: arm64
+Maintainer: wf2489t-firmware
+Depends: linux-image-$KREL (= $VERSION), aic8800-sdio-modules-$KREL (= $VERSION)
+Section: kernel
+Priority: optional
+Description: Linux kernel for the WF2489T (meta package)
+ Depends on the current mainline kernel for the WF2489T and its Wi-Fi driver.
+CONTROL
+dpkg-deb --root-owner-group -Zxz --build $M out/kernel/linux-image-wf2489t_${VERSION}_arm64.deb >/dev/null
 ls -l out/kernel
