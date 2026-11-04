@@ -28,17 +28,19 @@ for p in tf-a/patches/*.patch; do [ -e "$p" ] || continue; git -C $TFA apply "$P
 cp dts/rk3576s-wf2489t.dtsi uboot/rk3576s-wf2489t.dts uboot/rk3576s-wf2489t-u-boot.dtsi $SRC/arch/arm/dts/
 cp uboot/wf2489t-rk3576_defconfig $SRC/configs/
 
-export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+# reproducible: build date from the last commit that changed U-Boot, TF-A or
+# the DTS; no "-dirty" from the patched source trees in the version strings
+export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct -- uboot tf-a dts)
 export CROSS_COMPILE=aarch64-linux-gnu-
 
 # TF-A BL31 (no BL32/OP-TEE)
-make -s -C $TFA PLAT=rk3576 BUILD_BASE=$PWD/build/tf-a-obj -j$(nproc) bl31
+make -s -C $TFA PLAT=rk3576 BUILD_BASE=$PWD/build/tf-a-obj BUILD_STRING=$(echo $TFA_COMMIT | cut -c1-7) -j$(nproc) bl31
 BL31=$PWD/build/tf-a-obj/rk3576/release/bl31/bl31.elf
 
 # U-Boot; u-boot-rockchip.bin (would need Rockchip's DDR blob) is not used
 mkdir -p $OBJ
 make -s -C $SRC O=$PWD/$OBJ wf2489t-rk3576_defconfig
-make -s -C $SRC O=$PWD/$OBJ -j$(nproc) BL31=$BL31 BINMAN_ALLOW_MISSING=1 2>&1 \
+GIT_DIR=/nonexistent make -s -C $SRC O=$PWD/$OBJ -j$(nproc) BL31=$BL31 BINMAN_ALLOW_MISSING=1 2>&1 \
 	| grep -v -E "WARNING: Missing|missing (optional|external)|rockchip-tpl|tee-os|See the documentation|Trusted Execution|Some images are invalid|external TPL|binary and build with ROCKCHIP_TPL|for the external TPL binary|^\s*$" || true
 [ -f $OBJ/u-boot-nodtb.bin ] || { echo "U-Boot build failed"; exit 1; }
 
