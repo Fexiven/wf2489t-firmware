@@ -4,16 +4,13 @@
 # the green pixels of each frame into a coarse grid of cells and compares it
 # with a slowly adapting background; enough changed cells = motion. Simple
 # auto exposure keeps the image at a fixed brightness. No model, no numpy.
-# The proximity sensor (STK3311, IR) counts as motion too: a hand in front of
-# the tablet wakes it in the dark. Optionally switches TouchKio's display off
-# after a time without motion and on again with the next motion
-# (KIOSK_MOTION_SCREEN_OFF, seconds).
+# Optionally switches TouchKio's display off after a time without motion and
+# on again with the next motion (KIOSK_MOTION_SCREEN_OFF, seconds).
 # Settings from /etc/default/kiosk (KIOSK_MQTT_*, KIOSK_MOTION_*).
 import glob
 import os
 import subprocess
 import sys
-import threading
 import time
 
 W, H = 1296, 972                    # raw SRGGB10, 16 bit per pixel, black level 64
@@ -26,7 +23,6 @@ THRESHOLD = float(os.environ.get("KIOSK_MOTION_THRESHOLD") or 0.15)   # relative
 CELLS = int(os.environ.get("KIOSK_MOTION_CELLS") or 5)                # changed cells for motion
 HOLD = float(os.environ.get("KIOSK_MOTION_HOLD") or 30)              # seconds "on" after motion
 SCREEN_OFF = float(os.environ.get("KIOSK_MOTION_SCREEN_OFF") or 300)  # display off after (0 = never)
-PROXIMITY = float(os.environ.get("KIOSK_MOTION_PROXIMITY") or 40)     # raw above rest = near (0 = off)
 
 
 def sh(*args):
@@ -94,30 +90,6 @@ def cells(frame):
     return out, sum(out) / len(out)
 
 
-class Proximity:
-    """Polls the proximity channel at 5 Hz; `seen` = time of the last near reading.
-    Raw at rest ~60 (noise +-3), a hand at 10 cm ~100, close ~1800."""
-
-    def __init__(self):
-        self.seen = 0.0
-        for name in glob.glob("/sys/bus/iio/devices/*/name"):
-            if open(name).read().strip() == "stk3310" and PROXIMITY:
-                self.raw = os.path.join(os.path.dirname(name), "in_proximity_raw")
-                threading.Thread(target=self._poll, daemon=True).start()
-                break
-
-    def _poll(self):
-        rest = None
-        while True:
-            v = int(open(self.raw).read())
-            rest = v if rest is None else rest
-            if v > rest + PROXIMITY:
-                self.seen = time.monotonic()
-            else:
-                rest += (v - rest) * 0.02      # follows slow drift, not a hand
-            time.sleep(0.2)
-
-
 class Mqtt:
     def __init__(self):
         url = os.environ.get("KIOSK_MQTT_URL", "")
@@ -158,7 +130,6 @@ def main():
     if os.environ.get("KIOSK_MOTION", "yes") != "yes":
         return
     mqtt = Mqtt()
-    prox = Proximity()
     cam = Sensor()
     stream = subprocess.Popen(["v4l2-ctl", "-d", "/dev/video0", "--stream-mmap", "--stream-count=0",
                                "--stream-to=-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -169,26 +140,24 @@ def main():
         if stream.stdout.readinto(frame) != FRAME:     # buffered: reads one whole frame
             sys.exit("camera stream ended")
         cur, mean = cells(frame)
-        # cells relative to the frame mean, so that light switched on or off does not count;
-        # cells darker than 0.3 of the mean need the change of a cell at 0.3
-        cur = [a / max(mean, 0.005) for a in cur]
-        changed = 0
         if cam.adjust(mean):
             settle = 2                                 # the next frame still has the old exposure
         if settle:
             settle -= 1
             bg = None
-        elif bg is None:
-            bg = cur
-        else:
-            changed = sum(abs(a - b) > THRESHOLD * max(b, 0.3) for a, b in zip(cur, bg))
-            bg = [b * 0.9 + a * 0.1 for a, b in zip(cur, bg)]
+            continue
+        if bg is None:
+            bg = [a / max(mean, 0.005) for a in cur]
+            continue
+        # cells relative to the frame mean, so that light switched on or off does not count;
+        # cells darker than 0.3 of the mean need the change of a cell at 0.3
+        cur = [a / max(mean, 0.005) for a in cur]
+        changed = sum(abs(a - b) > THRESHOLD * max(b, 0.3) for a, b in zip(cur, bg))
+        bg = [b * 0.9 + a * 0.1 for a, b in zip(cur, bg)]
         now = time.monotonic()
-        near = prox.seen > last
         if os.environ.get("KIOSK_MOTION_DEBUG"):
-            print(f"mean {mean:.3f} exp {cam.exposure} gain {cam.gain} changed {changed} near {near}",
-                  flush=True)
-        if changed >= CELLS or near:
+            print(f"mean {mean:.3f} exp {cam.exposure} gain {cam.gain} changed {changed}", flush=True)
+        if changed >= CELLS:
             last = now
             if not motion:
                 motion = True
