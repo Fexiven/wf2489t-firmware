@@ -269,7 +269,7 @@
 		pinctrl-0 = <&mipidcphy0_pwr>;
 	};
 
-	/* held as on the stock firmware, so the camera stays powered down */
+	/* camera module control line, held high as on the stock firmware (the camera works with it) */
 	camera_pwdn: regulator-camera-pwdn {
 		compatible = "regulator-fixed";
 		regulator-name = "camera_pwdn";

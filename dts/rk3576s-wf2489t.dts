@@ -7,6 +7,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/media/video-interfaces.h>
 #include "rk3576s-wf2489t.dtsi"
 
 &edp {
@@ -131,5 +132,88 @@
 
 &pwm2_8ch_6 {
 	pinctrl-0 = <&pwm2m1_ch6>;
+	status = "okay";
+};
+
+/* front camera: GalaxyCore GC5035 (5 MP raw Bayer, 2-lane MIPI CSI-2 on the DC-PHY) */
+&i2c4 {
+	camera@37 {
+		compatible = "galaxycore,gc5035";
+		reg = <0x37>;
+		clocks = <&cru CLK_MIPI_CAMERAOUT_M0>;
+		clock-names = "mclk";
+		clock-frequency = <24000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0m0_clk0>;
+		resetb-gpios = <&gpio3 RK_PD5 GPIO_ACTIVE_LOW>;
+		avdd28-supply = <&vcc_mipidcphy0>;
+
+		port {
+			gc5035_out: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <438000000>;
+				remote-endpoint = <&csi0_input>;
+			};
+		};
+	};
+};
+
+/ {
+	/*
+	 * MIPI CSI-2 receiver 0, fed by the MIPI DC-PHY (not in rk3576.dtsi:
+	 * the DC-PHY needs the receive mode from kernel/patches)
+	 */
+	csi0: csi@27c80000 {
+		compatible = "rockchip,rk3576-mipi-csi2", "rockchip,rk3568-mipi-csi2";
+		reg = <0x0 0x27c80000 0x0 0x10000>;
+		interrupts = <GIC_SPI 312 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 313 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "err1", "err2";
+		clocks = <&cru PCLK_CSI_HOST_0>, <&cru ICLK_CSIHOST0>;
+		clock-names = "per", "pixel";
+		phys = <&mipidcphy PHY_TYPE_DPHY>;
+		power-domains = <&power RK3576_PD_VI>;
+		resets = <&cru SRST_P_CSI_HOST_0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				csi0_input: endpoint {
+					bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+					data-lanes = <1 2>;
+					remote-endpoint = <&gc5035_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				csi0_output: endpoint {
+					remote-endpoint = <&vicap_mipi0_input>;
+				};
+			};
+		};
+	};
+};
+
+&mipidcphy {
+	status = "okay";
+};
+
+&vicap {
+	status = "okay";
+};
+
+&vicap_mipi0 {
+	vicap_mipi0_input: endpoint {
+		remote-endpoint = <&csi0_output>;
+	};
+};
+
+&vicap_mmu {
 	status = "okay";
 };

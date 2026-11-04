@@ -1,0 +1,19 @@
+media: synopsys: dw-mipi-csi2rx: use the PHY in receive mode
+
+Combined transmit/receive PHYs such as the RK3576 MIPI DC-PHY need to
+know the direction; a receiver-only PHY ignores the submode.
+
+diff --git a/drivers/media/platform/synopsys/dw-mipi-csi2rx.c b/drivers/media/platform/synopsys/dw-mipi-csi2rx.c
+index b7247d597..433b156f8 100644
+--- a/drivers/media/platform/synopsys/dw-mipi-csi2rx.c
++++ b/drivers/media/platform/synopsys/dw-mipi-csi2rx.c
+@@ -387,7 +387,8 @@ static int dw_mipi_csi2rx_start(struct dw_mipi_csi2rx_device *csi2)
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = phy_set_mode(csi2->phy, PHY_MODE_MIPI_DPHY);
++		ret = phy_set_mode_ext(csi2->phy, PHY_MODE_MIPI_DPHY,
++				       PHY_MIPI_DPHY_SUBMODE_RX);
+ 		if (ret)
+ 			return ret;
+ 

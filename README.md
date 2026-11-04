@@ -118,6 +118,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 | Patch | Status |
 | --- | --- |
 | `0001` RK3576 eMMC HS400 timing from Rockchip's BSP kernel | local |
+| `0009`-`0011` front camera: GC5035 driver (ChromeOS, ported), MIPI DC-PHY receive mode, CSI-2 receiver in receive mode | local |
 | `0003`-`0007` RK3576 PWMv4 (Collabora, v5, not merged yet), `0008` its 7.4 adaptation | local |
 | `0002` mmc core: single-block recovery flag never cleared | [sent upstream](https://lore.kernel.org/linux-mmc/?q=s%3A%22clear+MQRQ_XFER_SINGLE_BLOCK+for+new+requests%22) |
 
@@ -132,6 +133,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
 - [x] Bluetooth (AIC8800D80 on `ttyS4`, H4 at 1.5 Mbaud): `aic8800-bluetooth.service` attaches it with btattach; BR/EDR + LE scan tested
+- [x] Front camera (GC5035 on the MIPI DC-PHY, kernel/patches 0009-0011): raw Bayer capture via VICAP (`/dev/video0`, 1296x972); no ISP, so exposure and colours are set in software
 - [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); URL and MQTT broker in `/etc/default/kiosk`

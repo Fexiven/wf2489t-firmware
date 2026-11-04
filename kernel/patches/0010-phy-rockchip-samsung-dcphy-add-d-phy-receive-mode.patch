@@ -1,0 +1,250 @@
+phy: rockchip: samsung-dcphy: add the D-PHY receive mode
+
+The MIPI DC-PHY of the RK3576 also receives (CSI-2 cameras), but the
+driver only transmits (DSI). A new PHY_MIPI_DPHY_SUBMODE_RX submode of
+PHY_MODE_MIPI_DPHY selects the receiver; its setup (bias, analog lane
+config, THS-SETTLE from the data rate, lane enable) follows Rockchip's
+BSP kernel. No PLL in receive mode: the clock comes from the sensor.
+
+diff --git a/drivers/phy/rockchip/phy-rockchip-samsung-dcphy.c b/drivers/phy/rockchip/phy-rockchip-samsung-dcphy.c
+index 7382043e1..4b14a4c2d 100644
+--- a/drivers/phy/rockchip/phy-rockchip-samsung-dcphy.c
++++ b/drivers/phy/rockchip/phy-rockchip-samsung-dcphy.c
+@@ -155,6 +155,21 @@
+ #define DPHY_MC_GNR_CON0	0x0300
+ #define PHY_READY		BIT(1)
+ #define PHY_ENABLE		BIT(0)
++
++/* D-PHY receiver: clock lane at 0x0b00, data lane n at 0x0c00 + n * 0x100 */
++#define RX_CLK_LANE(off)	(0x0b00 + (off))
++#define RX_DATA_LANE(n, off)	(0x0c00 + (n) * 0x100 + (off))
++#define RX_ENABLE		0x00
++#define RX_GNR_CON1		0x04
++#define RX_ANA_CON1		0x0c
++#define RX_ANA_CON2		0x10
++#define RX_ANA_CON3		0x14
++#define RX_ANA_CON7		0x24
++#define RX_THS_SETTLE		0x30
++#define RX_ERR_SOT_SYNC		0x34
++#define RX_DESKEW_CON0		0x40
++#define RX_DESKEW_CON2		0x48
++#define RX_DESKEW_CON4		0x50
+ #define DPHY_MC_GNR_CON1	0x0304
+ #define T_PHY_READY(x)		FIELD_PREP(GENMASK(15, 0), x)
+ #define DPHY_MC_ANA_CON0	0x0308
+@@ -293,6 +308,8 @@ struct samsung_mipi_dcphy {
+ 	unsigned int lanes;
+ 	struct phy *phy;
+ 	u8 type;
++	bool rx;
++	unsigned int rx_mbps;
+ 
+ 	const struct samsung_mipi_dcphy_plat_data *pdata;
+ 	struct {
+@@ -1358,6 +1375,126 @@ static int samsung_mipi_dphy_power_on(struct samsung_mipi_dcphy *samsung)
+ 	return 0;
+ }
+ 
++/* data rate per lane (Mbps, upper bound) -> THS-SETTLE of the data lanes */
++static const struct {
++	u16 mbps;
++	u16 settle;
++} samsung_mipi_dphy_rx_settle[] = {
++	{ 80,  0x105}, { 100, 0x106}, { 120, 0x107}, { 140, 0x108},
++	{ 160, 0x109}, { 180, 0x10a}, { 200, 0x10b}, { 220, 0x10c},
++	{ 240, 0x10d}, { 270, 0x10e}, { 290, 0x10f}, { 310, 0x110},
++	{ 330, 0x111}, { 350, 0x112}, { 370, 0x113}, { 390, 0x114},
++	{ 410, 0x115}, { 430, 0x116}, { 450, 0x117}, { 470, 0x118},
++	{ 490, 0x119}, { 510, 0x11a}, { 540, 0x11b}, { 560, 0x11c},
++	{ 580, 0x11d}, { 600, 0x11e}, { 620, 0x11f}, { 640, 0x120},
++	{ 660, 0x121}, { 680, 0x122}, { 700, 0x123}, { 720, 0x124},
++	{ 740, 0x125}, { 760, 0x126}, { 790, 0x127}, { 810, 0x128},
++	{ 830, 0x129}, { 850, 0x12a}, { 870, 0x12b}, { 890, 0x12c},
++	{ 910, 0x12d}, { 930, 0x12e}, { 950, 0x12f}, { 970, 0x130},
++	{ 990, 0x131}, {1010, 0x132}, {1030, 0x133}, {1060, 0x134},
++	{1080, 0x135}, {1100, 0x136}, {1120, 0x137}, {1140, 0x138},
++	{1160, 0x139}, {1180, 0x13a}, {1200, 0x13b}, {1220, 0x13c},
++	{1240, 0x13d}, {1260, 0x13e}, {1280, 0x13f}, {1310, 0x140},
++	{1330, 0x141}, {1350, 0x142}, {1370, 0x143}, {1390, 0x144},
++	{1410, 0x145}, {1430, 0x146}, {1450, 0x147}, {1470, 0x148},
++	{1490, 0x149}, {1580, 0x007}, {1740, 0x008}, {1910, 0x009},
++	{2070, 0x00a}, {2240, 0x00b}, {2410, 0x00c}, {2570, 0x00d},
++	{2740, 0x00e}, {2910, 0x00f}, {3070, 0x010}, {3240, 0x011},
++	{3410, 0x012}, {3570, 0x013}, {3740, 0x014}, {3890, 0x015},
++	{4070, 0x016}, {4240, 0x017}, {4400, 0x018}, {4500, 0x019},
++};
++
++static void samsung_mipi_dphy_rx_config(struct samsung_mipi_dcphy *samsung)
++{
++	/* LP-RX hysteresis, LP escape clock polarity and skew calibration fine delay */
++	static const u8 lp_hys_sw[4] = { 3, 0, 0, 0 };
++	static const u8 lp_escclk_pol[4] = { 1, 0, 0, 0 };
++	static const u8 skew_cal[4] = { 0, 3, 3, 3 };
++	const u32 hs_term = 2;	/* HS-RX termination impedance */
++	unsigned int mbps = samsung->rx_mbps;
++	u32 dlysel, settle;
++	int i;
++
++	if (mbps < 1500)
++		dlysel = 0;
++	else if (mbps < 2000)
++		dlysel = 3 << 8;
++	else if (mbps < 3000)
++		dlysel = 2 << 8;
++	else if (mbps < 4000)
++		dlysel = 1 << 8;
++	else
++		dlysel = 0;
++
++	for (i = 0; i < ARRAY_SIZE(samsung_mipi_dphy_rx_settle) - 1; i++)
++		if (samsung_mipi_dphy_rx_settle[i].mbps >= mbps)
++			break;
++	settle = samsung_mipi_dphy_rx_settle[i].settle;
++
++	regmap_write(samsung->regmap, RX_CLK_LANE(RX_GNR_CON1), 0x1450);
++	regmap_write(samsung->regmap, RX_CLK_LANE(RX_ANA_CON1), 0x8000);
++	regmap_write(samsung->regmap, RX_CLK_LANE(RX_ANA_CON2), hs_term);
++	regmap_write(samsung->regmap, RX_CLK_LANE(RX_ANA_CON3), 0x0600);
++	regmap_write(samsung->regmap, RX_CLK_LANE(RX_THS_SETTLE), 0x301);
++
++	for (i = 0; i < samsung->lanes; i++) {
++		regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_GNR_CON1), 0x1450);
++		regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_ANA_CON1), 0x8000);
++		regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_ANA_CON2), dlysel | hs_term);
++		regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_ANA_CON3),
++			     0x0600 | lp_hys_sw[i] << 4 | lp_escclk_pol[i] << 11);
++		if (i < 3)	/* lane 3 is not a combo lane */
++			regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_ANA_CON7), 0x40);
++		regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_DESKEW_CON2), skew_cal[i]);
++		if (mbps >= 1500) {
++			regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_DESKEW_CON0), BIT(0));
++			regmap_write(samsung->regmap, RX_DATA_LANE(i, RX_DESKEW_CON4), 0x81a);
++		}
++		regmap_update_bits(samsung->regmap, RX_DATA_LANE(i, RX_THS_SETTLE), 0x1ff, settle);
++		regmap_update_bits(samsung->regmap, RX_DATA_LANE(i, RX_ERR_SOT_SYNC), 0xff, 0x03);
++	}
++}
++
++static int samsung_mipi_dphy_rx_power_on(struct samsung_mipi_dcphy *samsung)
++{
++	u32 sts;
++	int i;
++
++	reset_control_assert(samsung->s_phy_rst);
++
++	samsung_mipi_dcphy_bias_block_enable(samsung);
++	samsung_mipi_dphy_rx_config(samsung);
++
++	regmap_update_bits(samsung->regmap, RX_CLK_LANE(RX_ENABLE), PHY_ENABLE, PHY_ENABLE);
++	for (i = 0; i < samsung->lanes; i++)
++		regmap_update_bits(samsung->regmap, RX_DATA_LANE(i, RX_ENABLE),
++				   PHY_ENABLE, PHY_ENABLE);
++
++	/* the lanes only get ready once the transmitter drives them */
++	if (regmap_read_poll_timeout(samsung->regmap, RX_CLK_LANE(RX_ENABLE),
++				     sts, sts & PHY_READY, 200, 4000))
++		dev_dbg(samsung->dev, "rx clock lane not ready yet\n");
++	for (i = 0; i < samsung->lanes; i++)
++		if (regmap_read_poll_timeout(samsung->regmap, RX_DATA_LANE(i, RX_ENABLE),
++					     sts, sts & PHY_READY, 200, 2000))
++			dev_dbg(samsung->dev, "rx data lane %d not ready yet\n", i);
++
++	reset_control_deassert(samsung->s_phy_rst);
++
++	return 0;
++}
++
++static void samsung_mipi_dphy_rx_power_off(struct samsung_mipi_dcphy *samsung)
++{
++	int i;
++
++	reset_control_assert(samsung->s_phy_rst);
++	regmap_update_bits(samsung->regmap, RX_CLK_LANE(RX_ENABLE), PHY_ENABLE, 0);
++	for (i = 0; i < samsung->lanes; i++)
++		regmap_update_bits(samsung->regmap, RX_DATA_LANE(i, RX_ENABLE), PHY_ENABLE, 0);
++	reset_control_deassert(samsung->s_phy_rst);
++}
++
+ static int samsung_mipi_dcphy_power_on(struct phy *phy)
+ {
+ 	struct samsung_mipi_dcphy *samsung = phy_get_drvdata(phy);
+@@ -1368,6 +1505,8 @@ static int samsung_mipi_dcphy_power_on(struct phy *phy)
+ 
+ 	switch (samsung->type) {
+ 	case PHY_TYPE_DPHY:
++		if (samsung->rx)
++			return samsung_mipi_dphy_rx_power_on(samsung);
+ 		return samsung_mipi_dphy_power_on(samsung);
+ 	default:
+ 		/* CPHY part to be implemented later */
+@@ -1383,6 +1522,10 @@ static int samsung_mipi_dcphy_power_off(struct phy *phy)
+ 
+ 	switch (samsung->type) {
+ 	case PHY_TYPE_DPHY:
++		if (samsung->rx) {
++			samsung_mipi_dphy_rx_power_off(samsung);
++			return 0;
++		}
+ 		samsung_mipi_dphy_lane_disable(samsung);
+ 		break;
+ 	default:
+@@ -1490,12 +1633,29 @@ static int samsung_mipi_dcphy_configure(struct phy *phy,
+ 
+ 	samsung->lanes = opts->mipi_dphy.lanes > 4 ? 4 : opts->mipi_dphy.lanes;
+ 
++	/* receiver: the clock comes from the transmitter, no PLL */
++	if (samsung->rx) {
++		samsung->rx_mbps = div_u64(target_rate, 1000000);
++		return 0;
++	}
++
+ 	samsung_mipi_dcphy_pll_calc_rate(samsung, target_rate);
+ 	opts->mipi_dphy.hs_clk_rate = samsung->pll.rate;
+ 
+ 	return 0;
+ }
+ 
++static int samsung_mipi_dcphy_set_mode(struct phy *phy, enum phy_mode mode,
++				       int submode)
++{
++	struct samsung_mipi_dcphy *samsung = phy_get_drvdata(phy);
++
++	if (mode == PHY_MODE_MIPI_DPHY)
++		samsung->rx = submode == PHY_MIPI_DPHY_SUBMODE_RX;
++
++	return 0;
++}
++
+ static int samsung_mipi_dcphy_init(struct phy *phy)
+ {
+ 	struct samsung_mipi_dcphy *samsung = phy_get_drvdata(phy);
+@@ -1514,6 +1674,7 @@ static int samsung_mipi_dcphy_exit(struct phy *phy)
+ 
+ static const struct phy_ops samsung_mipi_dcphy_ops = {
+ 	.configure = samsung_mipi_dcphy_configure,
++	.set_mode  = samsung_mipi_dcphy_set_mode,
+ 	.power_on  = samsung_mipi_dcphy_power_on,
+ 	.power_off = samsung_mipi_dcphy_power_off,
+ 	.init = samsung_mipi_dcphy_init,
+diff --git a/include/linux/phy/phy-mipi-dphy.h b/include/linux/phy/phy-mipi-dphy.h
+index 1ac128d78..47895b3e9 100644
+--- a/include/linux/phy/phy-mipi-dphy.h
++++ b/include/linux/phy/phy-mipi-dphy.h
+@@ -6,6 +6,17 @@
+ #ifndef __PHY_MIPI_DPHY_H_
+ #define __PHY_MIPI_DPHY_H_
+ 
++/**
++ * enum phy_mipi_dphy_submode - MIPI D-PHY direction, the submode of
++ * PHY_MODE_MIPI_DPHY for PHYs that can both transmit and receive
++ * @PHY_MIPI_DPHY_SUBMODE_TX: transmitter (default)
++ * @PHY_MIPI_DPHY_SUBMODE_RX: receiver
++ */
++enum phy_mipi_dphy_submode {
++	PHY_MIPI_DPHY_SUBMODE_TX = 0,
++	PHY_MIPI_DPHY_SUBMODE_RX,
++};
++
+ /**
+  * struct phy_configure_opts_mipi_dphy - MIPI D-PHY configuration set
+  *
