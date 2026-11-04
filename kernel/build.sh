@@ -36,7 +36,8 @@ make -s -C $SRC O=$PWD/$OBJ defconfig
 $SRC/scripts/kconfig/merge_config.sh -m -O $OBJ $OBJ/.config kernel/config.fragment >/dev/null
 make -s -C $SRC O=$PWD/$OBJ olddefconfig
 rm -f build/*.deb build/*.buildinfo build/*.changes
-make -s -C $SRC O=$PWD/$OBJ -j$(nproc) LOCALVERSION=-wf2489t KDEB_PKGVERSION=$VERSION bindeb-pkg
+# not -s: one line per built file, so the CI log shows progress
+make -C $SRC O=$PWD/$OBJ -j$(nproc) LOCALVERSION=-wf2489t KDEB_PKGVERSION=$VERSION bindeb-pkg
 
 mkdir -p out/kernel && rm -f out/kernel/*.deb
 cp build/linux-image-*-wf2489t_${VERSION}_arm64.deb build/linux-headers-*_${VERSION}_arm64.deb out/kernel/
