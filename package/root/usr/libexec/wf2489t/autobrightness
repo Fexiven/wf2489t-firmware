@@ -1,36 +1,43 @@
 #!/bin/sh
-# Display brightness from the ambient light sensor (STK3311): logarithmic in
-# lux, from MIN at 0 lx to 255 at FULL_LUX and above. The light level is
-# averaged and the brightness moves in small steps, so passing shadows do not
-# make the display flicker. Off with KIOSK_AUTO_BRIGHTNESS=no in
-# /etc/default/kiosk.
+# Display brightness from the ambient light sensor (STK3311), as on a phone:
+# logarithmic in lux, from MIN at 0 lx to full at FULL_LUX and above. The
+# light is measured 5 times a second (brighter at once, darker after about
+# half a second for passing shadows); changes fade at 50 Hz in about half a
+# second. Off with KIOSK_AUTO_BRIGHTNESS=no in /etc/default/kiosk.
 set -u
 . /etc/default/kiosk
 [ "${KIOSK_AUTO_BRIGHTNESS:-yes}" = yes ] || { echo "KIOSK_AUTO_BRIGHTNESS=no, nothing to do"; exec sleep infinity; }
 
-MIN=20 FULL_LUX=400 STEP=8 INTERVAL=2
 bl=/sys/class/backlight/backlight
 als=$(grep -l -x stk3310 /sys/bus/iio/devices/*/name 2>/dev/null | head -1)
 [ -n "$als" ] || { echo "no light sensor"; exec sleep infinity; }
 als=${als%/name}
-max=$(cat $bl/max_brightness)
 
-lux=
-while :; do
-	raw=$(cat $als/in_illuminance_raw) scale=$(cat $als/in_illuminance_scale)
-	cur=$(cat $bl/brightness)
-	# new average lux and the brightness to set (empty: leave it)
-	set -- $(awk -v r="$raw" -v s="$scale" -v avg="$lux" -v cur="$cur" -v max="$max" \
-		-v min=$MIN -v full=$FULL_LUX -v step=$STEP 'BEGIN {
-		l = r * s
-		if (avg != "") l = avg + 0.3 * (l - avg)
-		f = log(1 + l) / log(1 + full); if (f > 1) f = 1
-		t = int(min + (max - min) * f + 0.5)
-		d = t - cur
-		if (d > step) d = step; if (d < -step) d = -step
-		printf "%.2f %s\n", l, (d >= 3 || d <= -3 || (t == max && cur != max)) ? cur + d : ""
-	}')
-	lux=$1
-	[ -n "${2:-}" ] && echo "$2" > $bl/brightness
-	sleep $INTERVAL
-done
+# one long-running awk: no processes per measurement except sleep
+exec awk -v als="$als" -v bl="$bl" -v min=10 -v full=400 '
+function readnum(f,   v) { v = ""; getline v < f; close(f); return v + 0 }
+BEGIN {
+	max = readnum(bl "/max_brightness")
+	scale = readnum(als "/in_illuminance_scale")
+	b = readnum(bl "/brightness")      # current brightness (fractional)
+	set = int(b); avg = -1; tgt = -100; next_read = 0; now = 0
+	for (;;) {
+		if (now >= next_read) {    # measure every 200 ms
+			lux = readnum(als "/in_illuminance_raw") * scale
+			if (avg < 0) avg = lux
+			else avg += (lux > avg ? 0.6 : 0.25) * (lux - avg)
+			f = log(1 + avg) / log(1 + full); if (f > 1) f = 1
+			t = min + (max - min) * f
+			if (t - tgt >= 2 || tgt - t >= 2) tgt = t   # dead band against noise
+			next_read = now + 0.2
+		}
+		# fade: 50 Hz while moving, idle otherwise
+		moving = (tgt - b > 0.5 || b - tgt > 0.5)
+		if (moving) b += 0.12 * (tgt - b)
+		else b = tgt
+		out = int(b + 0.5)
+		if (out != set) { print out > (bl "/brightness"); close(bl "/brightness"); set = out }
+		dt = moving ? 0.02 : 0.2
+		system("sleep " dt); now += dt
+	}
+}'
