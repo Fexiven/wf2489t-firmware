@@ -19,10 +19,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build TF-A + U-Boot
         run: make uboot
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: uboot
           path: out/uboot-copy1.img
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # package versions come from the commit history
       - name: Reuse the published kernel if kernel/ and dts/ are unchanged
@@ -54,7 +54,7 @@ jobs:
       - name: Build kernel packages
         if: steps.reuse.outputs.reused != 'true'
         run: make kernel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kernel
           path: out/kernel/*.deb
@@ -65,10 +65,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: kernel
           path: out/kernel
@@ -76,12 +76,12 @@ jobs:
         env:
           WF2489T_SIGNING_KEY: ${{ secrets.WF2489T_SIGNING_KEY }}
         run: make repo
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: repo
           path: out/repo
           if-no-files-found: error
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         if: github.ref == 'refs/heads/master'
         with:
           path: out/repo
@@ -98,15 +98,15 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   image:
     needs: repo
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: repo
           path: out/repo
@@ -119,7 +119,7 @@ jobs:
         run: make image
       - name: Compress
         run: xz -T0 -6 out/root.ext4
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: debian-root
           path: out/root.ext4.xz

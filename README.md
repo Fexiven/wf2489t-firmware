@@ -28,8 +28,10 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
    (copy 1 of the `uboot` area) from maskrom (Ctrl+B on the debug UART at
    power-on, then `tools/rk_maskrom_boot.py` with Rockchip's usbplug and
    `rkdeveloptool wl 16384 out/uboot-copy1.img`).
-2. Debian: stop U-Boot at its prompt (debug UART), run `ums 0 mmc 0`; the eMMC
-   appears on the PC as a USB disk. Then as root on the PC:
+2. Debian: connect the tablet's USB port to the PC and hold the power key at
+   power-on for about 3 s: the LED ring turns blue and the eMMC appears on the
+   PC as a USB disk ("UMS disk 0"; also `ums 0 mmc 0` at the U-Boot prompt).
+   Then as root on the PC (needs `sgdisk`, `e2fsck`, `resize2fs`):
 
    ```sh
    tools/install-root.sh /dev/sdX out/root.ext4 \
@@ -38,9 +40,14 @@ Login: `root` / `admin` (console, serial, SSH). Network: Ethernet, DHCP.
 
    It writes a GPT with only `uboot` and `root` (loader at sector 64 and vendor
    storage at sector 7168 stay untouched), installs the root filesystem and
-   grows it. Ctrl+C at the U-Boot prompt ends `ums`; `boot` starts Debian.
+   grows it. Ctrl+C on the debug UART or the reset pinhole ends USB mode, and
+   the tablet boots Debian.
 
-The same `ums` path is the recovery for a broken root filesystem.
+The same USB mode is the recovery for a broken root filesystem.
+
+The LED ring shows the U-Boot state: green while booting (Linux turns it off),
+blue in USB mode, red if nothing could be booted. Debian shows a boot splash
+(Plymouth, Debian logo); kernel and systemd messages go to the debug UART.
 
 ## Updates
 
@@ -127,5 +134,6 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); URL and MQTT broker in `/etc/default/kiosk`
 - [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (`wlopm`, backlight), volume, keyboard, sensors; the RGB LED ring as a light and the ambient light sensor (`wf2489t-mqtt.service`); reboot/shutdown via a sudo rule
 - [x] Kiosk GPU acceleration (Electron's GPU process uses Panfrost)
-- [x] U-Boot USB mass storage: `ums 0 mmc 0` at the U-Boot prompt shows the whole eMMC on the PC (uboot/patches 0002, 0003)
+- [x] U-Boot USB mass storage: power key held at power-on (or `ums 0 mmc 0` at the prompt) shows the whole eMMC on the PC (uboot/patches 0001-0003)
+- [x] U-Boot status on the LED ring (green booting, blue USB mode, red boot failure); Debian boot splash
 - [x] Final partition table: `uboot` + one `root` partition (installed on the test tablet with U-Boot `gpt write` + `gzwrite`, or `tools/install-root.sh` via `ums`)
