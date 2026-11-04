@@ -1,8 +1,8 @@
 #!/bin/sh
 # Home Assistant entities for what TouchKio does not cover, attached to
 # TouchKio's device (MQTT discovery): the RGB LED ring as a light (template
-# schema) and the ambient light sensor (STK3311; TouchKio only reads an IIO
-# device named "als"). Broker settings from
+# schema), the ambient light sensor (STK3311; TouchKio only reads an IIO
+# device named "als") and the processor temperature. Broker settings from
 # /etc/default/kiosk (KIOSK_MQTT_URL, KIOSK_MQTT_USER, KIOSK_MQTT_PASSWORD).
 set -u
 . /etc/default/kiosk
@@ -62,6 +62,26 @@ if [ -n "$als" ]; then
 			mosquitto_pub "$@" -r -t "touchkio/$id/ambient_light/state" -m "$lux" && last=$lux
 		fi
 		sleep 10
+	done) &
+fi
+
+# processor temperature (TouchKio only knows other thermal zone names, its own
+# sensor is disabled in kiosk-session): package-thermal, published on change
+tz=$(grep -l -x package-thermal /sys/class/thermal/thermal_zone*/type 2>/dev/null | head -1)
+if [ -n "$tz" ]; then
+	tz=${tz%/type}
+	cfg='{"name":"Processor Temperature","unique_id":"ID_soc_temperature","object_id":"ID_processor_temperature",'
+	cfg=$cfg'"device_class":"temperature","unit_of_measurement":"°C","state_class":"measurement",'
+	cfg=$cfg'"icon":"mdi:radiator","state_topic":"touchkio/ID/soc_temperature/state","device":{"identifiers":["ID"]}}'
+	mosquitto_pub "$@" -r -t "homeassistant/sensor/$id/soc_temperature/config" \
+		-m "$(printf %s "$cfg" | sed "s/ID/$id/g")"
+	(last=
+	while :; do
+		t=$(($(cat "$tz/temp") / 1000))
+		if [ "$t" != "$last" ]; then
+			mosquitto_pub "$@" -r -t "touchkio/$id/soc_temperature/state" -m "$t" && last=$t
+		fi
+		sleep 30
 	done) &
 fi
 

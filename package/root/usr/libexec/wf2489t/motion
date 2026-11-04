@@ -4,6 +4,8 @@
 # the green pixels of each frame into a coarse grid of cells and compares it
 # with a slowly adapting background; enough changed cells = motion. Simple
 # auto exposure keeps the image at a fixed brightness. No model, no numpy.
+# Optionally switches TouchKio's display off after a time without motion and
+# on again with the next motion (KIOSK_MOTION_SCREEN_OFF, seconds).
 # Settings from /etc/default/kiosk (KIOSK_MQTT_*, KIOSK_MOTION_*).
 import glob
 import os
@@ -18,8 +20,9 @@ CELL = 6                            # samples per cell side -> 48x48 pixel cells
 COLS, ROWS = W // STEP // CELL, H // STEP // CELL
 TARGET = 0.3                        # auto exposure: mean brightness of the full scale
 THRESHOLD = float(os.environ.get("KIOSK_MOTION_THRESHOLD") or 0.15)   # relative change per cell
-CELLS = int(os.environ.get("KIOSK_MOTION_CELLS") or 3)                # changed cells for motion
+CELLS = int(os.environ.get("KIOSK_MOTION_CELLS") or 5)                # changed cells for motion
 HOLD = float(os.environ.get("KIOSK_MOTION_HOLD") or 30)              # seconds "on" after motion
+SCREEN_OFF = float(os.environ.get("KIOSK_MOTION_SCREEN_OFF") or 300)  # display off after (0 = never)
 
 
 def sh(*args):
@@ -116,6 +119,12 @@ class Mqtt:
         if self.args:
             self.pub(self.topic, "ON" if on else "OFF")
 
+    def display(self, on):
+        """TouchKio's display light (wlopm), so that Home Assistant sees the change too."""
+        if self.args:
+            subprocess.run(["mosquitto_pub", *self.args, "-t", f"touchkio/{self.id}/display/power/set",
+                            "-m", "ON" if on else "OFF"], check=False)
+
 
 def main():
     if os.environ.get("KIOSK_MOTION", "yes") != "yes":
@@ -125,7 +134,7 @@ def main():
     stream = subprocess.Popen(["v4l2-ctl", "-d", "/dev/video0", "--stream-mmap", "--stream-count=0",
                                "--stream-to=-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     frame, bg, settle = bytearray(FRAME), None, 2
-    motion, last = False, 0.0
+    motion, last, screen_off = False, time.monotonic(), False
     mqtt.state(False)
     while True:
         if stream.stdout.readinto(frame) != FRAME:     # buffered: reads one whole frame
@@ -153,9 +162,17 @@ def main():
             if not motion:
                 motion = True
                 mqtt.state(True)
+            if screen_off:                             # only undo our own switch-off
+                screen_off = False
+                mqtt.display(True)
+                settle = 10                            # the display lights the room: new background
         elif motion and now - last > HOLD:
             motion = False
             mqtt.state(False)
+        if SCREEN_OFF and not screen_off and now - last > SCREEN_OFF:
+            screen_off = True
+            mqtt.display(False)
+            settle = 10
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ while :; do
 	DISPLAY=:0 ELECTRON_OZONE_PLATFORM_HINT=wayland /usr/bin/touchkio \
 		--web-url="$KIOSK_URL" --web-theme=dark --web-zoom=1.0 \
 		--app-kiosk=fullscreen --enable-wayland-ime \
-		--wayland-text-input-version=3 "$@"
+		--wayland-text-input-version=3 \
+		--app-disable=mqtt_processor_temperature "$@"
 	sleep 3
 done
