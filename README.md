@@ -119,6 +119,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 | --- | --- |
 | `0001` RK3576 eMMC HS400 timing from Rockchip's BSP kernel | local |
 | `0009`-`0011` front camera: GC5035 driver (ChromeOS, ported), MIPI DC-PHY receive mode, CSI-2 receiver in receive mode | local |
+| `0012`-`0013` VICAP (rkcif): stop the DMA before the source, no reset in runtime suspend (both hung the bus on stream stop) | local |
 | `0003`-`0007` RK3576 PWMv4 (Collabora, v5, not merged yet), `0008` its 7.4 adaptation | local |
 | `0002` mmc core: single-block recovery flag never cleared | [sent upstream](https://lore.kernel.org/linux-mmc/?q=s%3A%22clear+MQRQ_XFER_SINGLE_BLOCK+for+new+requests%22) |
 

@@ -1,0 +1,27 @@
+media: rockchip: rkcif: no reset in runtime suspend
+
+The CIF reset also resets the IOMMU, which is a device of its own and is
+suspended after the CIF; on the RK3576 its suspend then hangs the bus.
+The resume path works without it (tested with 48 power-domain cycles).
+
+diff --git a/drivers/media/platform/rockchip/rkcif/rkcif-dev.c b/drivers/media/platform/rockchip/rkcif/rkcif-dev.c
+index 2a5758776..6281945bd 100644
+--- a/drivers/media/platform/rockchip/rkcif/rkcif-dev.c
++++ b/drivers/media/platform/rockchip/rkcif/rkcif-dev.c
+@@ -295,14 +295,9 @@ static int rkcif_runtime_suspend(struct device *dev)
+ 	struct rkcif_device *rkcif = dev_get_drvdata(dev);
+ 
+ 	/*
+-	 * Reset CIF (CRU, DMA, FIFOs) to allow a clean resume.
+-	 * Since this resets the IOMMU too, we cannot issue this reset when
+-	 * resuming.
++	 * No reset here: it also resets the IOMMU, a device of its own that
++	 * is suspended after this one and then hangs the bus on the RK3576.
+ 	 */
+-	reset_control_assert(rkcif->reset);
+-	udelay(5);
+-	reset_control_deassert(rkcif->reset);
+-
+ 	clk_bulk_disable_unprepare(rkcif->clks_num, rkcif->clks);
+ 
+ 	return 0;
