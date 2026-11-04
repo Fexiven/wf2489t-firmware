@@ -17,6 +17,9 @@ TTYReset=yes
 TTYVHangup=yes
 EnvironmentFile=/etc/default/kiosk
 ExecStart=/usr/bin/dbus-run-session -- /usr/bin/labwc -C /etc/xdg/labwc -s /usr/local/bin/kiosk-session
+# PAMName puts the session in its own scope: end it, or a restart leaves
+# the old compositor and browser running
+ExecStopPost=-/usr/bin/loginctl terminate-user kiosk
 Restart=always
 RestartSec=3
 
