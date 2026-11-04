@@ -5,6 +5,13 @@ getent passwd kiosk >/dev/null ||
 	useradd --system --create-home --groups video,render,input,audio kiosk
 # settings (URL, MQTT password): created once, never overwritten
 [ -e /etc/default/kiosk ] || install -m 600 /usr/share/wf2489t/kiosk.default /etc/default/kiosk
+# boot splash: Debian logo with a spinner (in the initramfs)
+if [ "$(plymouth-set-default-theme)" != spinner ]; then
+	plymouth-set-default-theme spinner
+	update-initramfs -u -k all
+fi
+# kernel command line from /usr/share/u-boot-menu/conf.d/wf2489t.conf
+u-boot-update
 units="kiosk.service wf2489t-mqtt.service aic8800-bluetooth.service"
 if [ -z "$2" ]; then
 	# first install

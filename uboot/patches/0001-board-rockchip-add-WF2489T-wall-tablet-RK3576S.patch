@@ -3,7 +3,20 @@ Subject: [PATCH] board: rockchip: add WF2489T wall tablet (RK3576S)
 Wall tablet with the LAN MAC address in Rockchip vendor storage on the
 eMMC; read it into ethaddr so it reaches the OS device tree.
 
+Holding the power key at power-on (read from the RK806 PMIC) starts USB
+mass storage of the eMMC instead of booting, with the LED ring blue.
 ---
+ arch/arm/mach-rockchip/rk3576/Kconfig |   8 ++
+ board/rockchip/wf2489t/Kconfig        |   9 ++
+ board/rockchip/wf2489t/MAINTAINERS    |   6 +
+ board/rockchip/wf2489t/Makefile       |   3 +
+ board/rockchip/wf2489t/wf2489t.c      | 199 ++++++++++++++++++++++++++
+ 5 files changed, 225 insertions(+)
+ create mode 100644 board/rockchip/wf2489t/Kconfig
+ create mode 100644 board/rockchip/wf2489t/MAINTAINERS
+ create mode 100644 board/rockchip/wf2489t/Makefile
+ create mode 100644 board/rockchip/wf2489t/wf2489t.c
+
 diff --git a/arch/arm/mach-rockchip/rk3576/Kconfig b/arch/arm/mach-rockchip/rk3576/Kconfig
 index f347caf8..5fca8d4f 100644
 --- a/arch/arm/mach-rockchip/rk3576/Kconfig
@@ -68,10 +81,10 @@ index 00000000..20b8f8d3
 +obj-y += wf2489t.o
 diff --git a/board/rockchip/wf2489t/wf2489t.c b/board/rockchip/wf2489t/wf2489t.c
 new file mode 100644
-index 00000000..eae7191d
+index 00000000..b031813e
 --- /dev/null
 +++ b/board/rockchip/wf2489t/wf2489t.c
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,199 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * WF2489T: 15.6" wall tablet with a Rockchip RK3576S (vendor board "R141 V10")
@@ -79,16 +92,24 @@ index 00000000..eae7191d
 + * The LAN MAC address is stored per device in Rockchip "vendor storage" on
 + * the eMMC. It is put into "ethaddr", from where fdt_fixup_ethernet() passes
 + * it to the OS device tree (alias ethernet0, the RTL8168 on PCIe).
++ *
++ * Holding the power key at power-on starts USB mass storage of the eMMC
++ * instead of booting, for installing and recovery without the debug UART.
 + */
 +
 +#include <env.h>
++#include <i2c.h>
 +#include <log.h>
 +#include <malloc.h>
 +#include <mmc.h>
 +#include <net-common.h>
 +#include <linux/sizes.h>
 +#include <linux/types.h>
++#include <time.h>
++#include <asm/gpio.h>
 +#include <asm/unaligned.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
 +
 +/*
 + * Vendor storage: 4 copies of 64 KiB from eMMC sector 7168, outside any
@@ -213,4 +234,53 @@ index 00000000..eae7191d
 +	}
 +
 +	return eth_env_set_enetaddr("ethaddr", mac);
++}
++
++/*
++ * Power key: the RK806 PMIC (I2C1, 0x23) shows its level in SYS_STS bit 7
++ * (1: released). Read directly; the PMIC driver would also set the reset
++ * mode, which is left to the loader here.
++ */
++#define RK806_I2C_BUS		1
++#define RK806_I2C_ADDR		0x23
++#define RK806_SYS_STS		0x5d
++#define RK806_PWRKEY_RELEASED	BIT(7)
++#define UMS_HOLD_MS		2000
++/* blue channel of the LED ring, GPIO4_C5 */
++#define LED_RING_BLUE		"E21"
++
++static bool pwrkey_held(void)
++{
++	struct udevice *pmic;
++	ulong start;
++	int val;
++
++	if (i2c_get_chip_for_busnum(RK806_I2C_BUS, RK806_I2C_ADDR, 1, &pmic))
++		return false;
++
++	start = get_timer(0);
++	do {
++		val = dm_i2c_reg_read(pmic, RK806_SYS_STS);
++		if (val < 0 || (val & RK806_PWRKEY_RELEASED))
++			return false;
++		mdelay(50);
++	} while (get_timer(start) < UMS_HOLD_MS);
++
++	return true;
++}
++
++int rk_board_late_init(void)
++{
++	struct gpio_desc led;
++
++	if (!pwrkey_held())
++		return 0;
++
++	printf("Power key held: USB mass storage of the eMMC (Ctrl+C or reset to leave)\n");
++	if (!dm_gpio_lookup_name(LED_RING_BLUE, &led) &&
++	    !dm_gpio_request(&led, "led-ring-blue"))
++		dm_gpio_set_dir_flags(&led, GPIOD_IS_OUT | GPIOD_IS_OUT_ACTIVE);
++
++	env_set("bootdelay", "0");
++	return env_set("bootcmd", "ums 0 mmc 0; reset");
 +}

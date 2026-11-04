@@ -1,4 +1,0 @@
-# u-boot-menu: generates /boot/extlinux/extlinux.conf on kernel install
-U_BOOT_ROOT="root=LABEL=root"
-U_BOOT_PARAMETERS="console=tty1 console=ttyS0,1500000n8 earlycon=uart8250,mmio32,0x2ad40000 rootwait rw"
-U_BOOT_TIMEOUT="10"

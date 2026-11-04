@@ -3,6 +3,9 @@ Description=Home Assistant kiosk (labwc + TouchKio, on-screen keyboard) on the d
 After=systemd-user-sessions.service network-online.target
 Wants=network-online.target
 Conflicts=getty@tty1.service
+# take the display over from the boot splash, which stays until labwc draws
+Conflicts=plymouth-quit.service
+After=plymouth-quit.service plymouth-start.service
 
 [Service]
 User=kiosk
@@ -16,6 +19,8 @@ StandardError=journal
 TTYReset=yes
 TTYVHangup=yes
 EnvironmentFile=/etc/default/kiosk
+# as root (+): plymouth only takes commands from root
+ExecStartPre=-+/usr/bin/plymouth quit --retain-splash
 ExecStart=/usr/bin/dbus-run-session -- /usr/bin/labwc -C /usr/share/wf2489t/labwc -s /usr/libexec/wf2489t/kiosk-session
 # PAMName puts the session in its own scope: end it, or a restart leaves
 # the old compositor and browser running
