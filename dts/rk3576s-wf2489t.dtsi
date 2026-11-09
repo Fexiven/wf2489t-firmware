@@ -834,14 +834,15 @@
 /*
  * eMMC. The command queue engine (CQE) times out with this eMMC
  * ("cqhci: timeout for tag 0", I/O stalls), so it is switched off.
+ * HS200 instead of HS400ES (the stock mode): HS400 writes see ~1 data CRC error
+ * per 16 MB (retried, so 49 MB/s), HS200 none at 141 MB/s (docs/emmc.md).
  */
 &sdhci {
 	/delete-property/ supports-cqe;
 	bus-width = <8>;
 	full-pwr-cycle-in-suspend;
 	max-frequency = <200000000>;
-	mmc-hs400-1_8v;
-	mmc-hs400-enhanced-strobe;
+	mmc-hs200-1_8v;
 	no-sd;
 	no-sdio;
 	non-removable;

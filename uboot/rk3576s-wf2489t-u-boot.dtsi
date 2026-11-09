@@ -6,10 +6,9 @@
 &sdhci {
 	/*
 	 * 52 MHz: mainline U-Boot's RK3576 HS200/HS400 is unreliable with this
-	 * eMMC (see docs/emmc.md). Linux runs HS400ES; boot costs ~1-2 s more.
+	 * eMMC (see docs/emmc.md). Linux runs HS200; boot costs ~1-2 s more.
 	 */
-	/delete-property/ mmc-hs400-1_8v;
-	/delete-property/ mmc-hs400-enhanced-strobe;
+	/delete-property/ mmc-hs200-1_8v;
 	cap-mmc-highspeed;
 	max-frequency = <52000000>;
 };

@@ -1,4 +1,4 @@
-# eMMC on the WF2489T (RK3576): HS400ES in Linux and U-Boot
+# eMMC on the WF2489T (RK3576): HS200 in Linux, 52 MHz in U-Boot
 
 eMMC: manfid 0x32, oemid 0x0101, name `MMC64G`, prv 0x51, fw 0x06, made
 11/2025, eMMC 5.1, 58.5 GiB, 1.6 MB write cache. No-name chip (marking only
@@ -44,7 +44,27 @@ verification, 4 jobs, iodepth 16 (read 3686 IOPS, write 2790 IOPS, err=0).
 `err_stats` after 18 GiB written: 1123 data CRC errors (~1 per 16 MB),
 everything else 0; nothing in dmesg (the retries are silent). So the
 remaining write CRC errors are unchanged, and still without data loss.
-Not yet compared: HS200, and stock Android on the same unit.
+
+**HS200 instead (2026-11-09, now the default in `dts/`).** Same test with only
+`mmc-hs400-1_8v`/`mmc-hs400-enhanced-strobe` replaced by `mmc-hs200-1_8v`
+(198 MHz SDR, tuned): 17 GiB written, `err_stats` all 0, 0 mismatches, fio
+err=0.
+
+| | HS400ES | HS200 |
+| --- | --- | --- |
+| data CRC errors | 1123 / 18 GiB | 0 / 17 GiB |
+| sequential write | ~49 MB/s | 141 MB/s |
+| sequential read | 298 MB/s | 166 MB/s |
+| 4k random read / write | 3686 / 2790 IOPS | 3945 / 3029 IOPS |
+
+HS400 reads use the card's data strobe and are clean; the errors are on
+writes, where the card samples on the host clock at double data rate. The
+pin configuration (pull-up, drive level 2; strobe no pull) and the DLL taps
+are the same as on stock Android, and the TX tap sweep had no effect, so the
+margin on this board/chip is likely electrical. Whether stock Android sees the
+same silent retries was not measured (not needed: HS200 is faster for writes
+and random I/O). Patch 0001 stays (HS200 tuning on RK3576 uses the same DLL
+setup).
 
 Runtime tuning tool: a tiny static `/dev/mem` reader/writer (`rr ADDR...`,
 `rr -w ADDR VALUE`), built from scratch (no libc); DLL registers at
