@@ -854,6 +854,7 @@
  * CRC error" per 16 MB written, retried silently, writes at ~50 MB/s. With the
  * pull-down (the pad reset value, kept by the stock firmware; rk3588 uses it
  * too, rk3576.dtsi has pull-none): 0 errors, ~180 MB/s (docs/emmc.md).
+ * Sent upstream 2026-11-09; drop this once rk3576-pinctrl.dtsi has it.
  */
 &emmc_strb {
 	rockchip,pins = <1 RK_PB2 1 &pcfg_pull_down>;

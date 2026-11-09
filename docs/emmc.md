@@ -134,5 +134,11 @@ Fix: `&emmc_strb { rockchip,pins = <1 RK_PB2 1 &pcfg_pull_down>; };` in
 pins: 0 errors over 15 GiB written (`err_stats` all 0), 176 MB/s write,
 290 MB/s read. The HS200 interim setting is no longer needed.
 
+Sent upstream on 2026-11-09 as "[PATCH] arm64: dts: rockchip: Pull down the
+eMMC data strobe on RK3576" (to Heiko Stuebner, Cc linux-rockchip, stable):
+https://lore.kernel.org/linux-rockchip/?q=s%3A%22Pull+down+the+eMMC+data+strobe%22
+Once it is merged, the `&emmc_strb` override in `dts/rk3576s-wf2489t.dtsi`
+can go.
+
 Never set a pull-up on GPIO1_B2 (strobe) or B3 (RSTN) at runtime: a pull-up on
 the strobe caused real I/O errors and a read-only remount during these tests.
