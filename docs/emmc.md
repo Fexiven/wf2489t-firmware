@@ -67,10 +67,13 @@ afterwards (below): it runs HS400ES without errors, so the board can do it.
 **Stock Android, same unit (2026-11-09).** Android 14 userdebug, vendor
 kernel 6.1.75, eMMC = `mmc1`: HS400 enhanced strobe, 200.0 MHz, CQE enabled.
 8 GB written to /data with sync: 151 MB/s, 0 mismatches, `err_stats` data CRC
-0 over 10.4 GiB written. Visible difference: the card clock comes from CPLL
-(1000 MHz / 5 = 200.0 MHz); mainline picks GPLL (1188 MHz / 6 = 198 MHz). Pin
-configuration and DLL taps are the same as ours. Next test: HS400ES with
-`assigned-clock-parents` CPLL for CCLK_SRC_EMMC (and then CQE). Raw data:
+0 over 10.4 GiB written. The clocks are the same as in mainline: card clock
+`cclk_src_emmc` from CPLL at 200 MHz, bclk/hclk 198 MHz, aclk 297 MHz (the
+"actual clock 198 MHz" in mainline's `ios` is only sdhci's calculated value).
+Pin configuration and DLL taps are the same as ours too. Remaining
+differences: CQE (on in Android, times out in mainline) and the vendor
+driver's internals (rockchip-linux develop-6.1 `sdhci-of-dwcmshc.c`), not yet
+compared line by line. Raw data:
 `info/android-emmc-2026-11-09.txt` (outside the repo). Patch 0001 stays (HS200 tuning on RK3576 uses the same DLL
 setup).
 
