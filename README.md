@@ -136,12 +136,12 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 - [x] Debian trixie image (debos), everything else as Debian packages from our apt repository
 - [x] Ethernet MAC address from Rockchip vendor storage (U-Boot, passed to Linux in the device tree)
 - [x] LED ring red/green/blue (on/off), relays on I/O 3 and 4 (`gpioset -t 0 relay-1=1`)
-- [ ] Zigbee/Thread (EFR32 on `ttyS6`): not fitted on the test unit (no answer on UART6), untested
+- [ ] Zigbee/Thread (EFR32 on `ttyS6`): not fitted on the test unit; stock Android's own tool (`lmiot-efr32`) gets no answer either (`ezspForceReset 0x21`)
 - [x] Wi-Fi (AIC8800D80 on SDIO, 2.4 + 5 GHz): Radxa's driver built with the kernel (`kernel/aic8800/`), firmware package pinned
 - [x] Sound: speaker playback via ES8388 on SAI1 (48 and 44.1 kHz)
 - [x] Bluetooth (AIC8800D80 on `ttyS4`, H4 at 1.5 Mbaud): `aic8800-bluetooth.service` attaches it with btattach; BR/EDR + LE scan tested
 - [x] Front camera (GC5035 on the MIPI DC-PHY, kernel/patches 0009-0011): raw Bayer capture via VICAP (`/dev/video0`, 1296x972); no ISP, so exposure and colours are set in software
-- [ ] Built-in microphone (ES7202 PDM ADC, no mainline driver)
+- [ ] Built-in microphone: 4 PDM microphones on PDM1 (SDI0-3; stock uses `simple-audio-card` with a dummy codec, 16 kHz, gain 87; pins pdm1m0 clk0/sdi0 + pdm1m1 clk1/sdi1/sdi2). Mainline `rockchip_pdm` has no RK3576 entry and `rk3576.dtsi` no PDM node yet
 - [x] PWM (Collabora PWMv4 series, kernel/patches 0003-0008): backlight dimming (`/sys/class/backlight/backlight`), RGB LED ring with colour mixing and dimming (`/sys/class/leds/rgb:status`, `multi_intensity`)
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); URL and MQTT broker in `/etc/default/kiosk`
 - [x] Hardware watchdog (systemd, 44 s: a hung system resets itself; tested with a kernel crash), journal limited to 50 MB, Debian security and point-release updates installed automatically (unattended-upgrades)

@@ -61,9 +61,17 @@ HS400 reads use the card's data strobe and are clean; the errors are on
 writes, where the card samples on the host clock at double data rate. The
 pin configuration (pull-up, drive level 2; strobe no pull) and the DLL taps
 are the same as on stock Android, and the TX tap sweep had no effect, so the
-margin on this board/chip is likely electrical. Whether stock Android sees the
-same silent retries was not measured (not needed: HS200 is faster for writes
-and random I/O). Patch 0001 stays (HS200 tuning on RK3576 uses the same DLL
+margin on this board/chip is likely electrical. Stock Android was measured
+afterwards (below): it runs HS400ES without errors, so the board can do it.
+
+**Stock Android, same unit (2026-11-09).** Android 14 userdebug, vendor
+kernel 6.1.75, eMMC = `mmc1`: HS400 enhanced strobe, 200.0 MHz, CQE enabled.
+8 GB written to /data with sync: 151 MB/s, 0 mismatches, `err_stats` data CRC
+0 over 10.4 GiB written. Visible difference: the card clock comes from CPLL
+(1000 MHz / 5 = 200.0 MHz); mainline picks GPLL (1188 MHz / 6 = 198 MHz). Pin
+configuration and DLL taps are the same as ours. Next test: HS400ES with
+`assigned-clock-parents` CPLL for CCLK_SRC_EMMC (and then CQE). Raw data:
+`info/android-emmc-2026-11-09.txt` (outside the repo). Patch 0001 stays (HS200 tuning on RK3576 uses the same DLL
 setup).
 
 Runtime tuning tool: a tiny static `/dev/mem` reader/writer (`rr ADDR...`,
