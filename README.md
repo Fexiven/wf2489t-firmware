@@ -132,7 +132,7 @@ OP-TEE are no longer needed (and the 16 MiB OP-TEE reservation is gone).
 ## Status
 
 - [x] Mainline U-Boot + upstream TF-A (no Rockchip binaries after the stock SPL, no OP-TEE), automatic extlinux boot
-- [x] Mainline kernel: display, touch, GPU, eMMC (HS400ES), Ethernet, PCIe, sensors, RTC, keys
+- [x] Mainline kernel: display, touch, GPU, eMMC (HS400ES; ~1 retried write CRC error per 16 MB, no data loss, see `docs/emmc.md`), Ethernet, PCIe, sensors, RTC, keys
 - [x] Debian trixie image (debos), everything else as Debian packages from our apt repository
 - [x] Ethernet MAC address from Rockchip vendor storage (U-Boot, passed to Linux in the device tree)
 - [x] LED ring red/green/blue (on/off), relays on I/O 3 and 4 (`gpioset -t 0 relay-1=1`)

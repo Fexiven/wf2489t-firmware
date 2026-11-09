@@ -37,6 +37,15 @@ no effect at all (13–27 errors per 256 MB for every value), so it is not a
 delay-line timing issue; the BSP values stay. Reads are error free at every
 strobe tap tested.
 
+Measured again 2026-11-09 (Debian image, kernel 20261104.1210, HS400ES at
+198 MHz): 14 GB sequential write (~49 MB/s) and read-back (298 MB/s) with 0
+checksum mismatches, then 2 min fio 4k random read/write with crc32c
+verification, 4 jobs, iodepth 16 (read 3686 IOPS, write 2790 IOPS, err=0).
+`err_stats` after 18 GiB written: 1123 data CRC errors (~1 per 16 MB),
+everything else 0; nothing in dmesg (the retries are silent). So the
+remaining write CRC errors are unchanged, and still without data loss.
+Not yet compared: HS200, and stock Android on the same unit.
+
 Runtime tuning tool: a tiny static `/dev/mem` reader/writer (`rr ADDR...`,
 `rr -w ADDR VALUE`), built from scratch (no libc); DLL registers at
 0x2a330804 (RXCLK), 0x808 (TXCLK), 0x80c (STRBIN), 0x810 (CMDOUT),
