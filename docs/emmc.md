@@ -1,4 +1,4 @@
-# eMMC on the WF2489T (RK3576): HS200 in Linux, 52 MHz in U-Boot
+# eMMC on the WF2489T (RK3576): HS400ES in Linux, 52 MHz in U-Boot
 
 eMMC: manfid 0x32, oemid 0x0101, name `MMC64G`, prv 0x51, fw 0x06, made
 11/2025, eMMC 5.1, 58.5 GiB, 1.6 MB write cache. No-name chip (marking only
@@ -105,3 +105,34 @@ Register dump at 0x2a330000, HS400ES @ 200 MHz:
 | DLL_CMDOUT 0x810  | 0x59000007 | 0x39000008      | 0x5b006207         |
 | MISC_CON 0x81c    | 0x1        | 0x3             | 0x3                |
 | HOST_CTRL3 0x508  | 0x000f0000 | 0x000f0010      | 0x000f0010         |
+
+
+## Cause found: the data strobe needs a pull-down (2026-11-09)
+
+The remaining HS400 "write CRC errors" were not a write problem. In HS400 the
+card drives the data strobe (DS), and the host also samples the CRC status
+token after every written block with it. Between transfers the card releases
+DS. Mainline `rk3576.dtsi` configures `emmc_strb` with `pcfg_pull_none`, so the
+line floats and the CRC status is misread; the block is retried and the data
+is intact, but writes drop to ~50 MB/s. The pad reset value is pull-down,
+stock Android keeps it (its sdhci node has no `pinctrl-0` at all), and
+`rk3588-base-pinctrl.dtsi` uses `pcfg_pull_down` for the same pin.
+
+Found by leaving the eMMC pads at their reset values (no pinctrl in U-Boot and
+Linux): 0 errors. Then each value was put back to mainline's at runtime
+(VCCIO_IOC 0x26046114, write-mask register, 2 bits per pin):
+
+| change from the reset values | data CRC errors per GiB | write |
+| --- | --- | --- |
+| none | 0 | 179 MB/s |
+| strobe pull-down -> none (mainline) | 65 | 75 MB/s |
+| CLK pull-down -> up (mainline) | 0 | 176 MB/s |
+| drive strength level 3 -> 2 (mainline) | 0 | 178 MB/s |
+
+Fix: `&emmc_strb { rockchip,pins = <1 RK_PB2 1 &pcfg_pull_down>; };` in
+`dts/rk3576s-wf2489t.dtsi`, back to HS400ES. Result with otherwise mainline
+pins: 0 errors over 15 GiB written (`err_stats` all 0), 176 MB/s write,
+290 MB/s read. The HS200 interim setting is no longer needed.
+
+Never set a pull-up on GPIO1_B2 (strobe) or B3 (RSTN) at runtime: a pull-up on
+the strobe caused real I/O errors and a read-only remount during these tests.

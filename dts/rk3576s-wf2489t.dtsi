@@ -834,19 +834,29 @@
 /*
  * eMMC. The command queue engine (CQE) times out with this eMMC
  * ("cqhci: timeout for tag 0", I/O stalls), so it is switched off.
- * HS200 instead of HS400ES (the stock mode): HS400 writes see ~1 data CRC error
- * per 16 MB (retried, so 49 MB/s), HS200 none at 141 MB/s (docs/emmc.md).
  */
 &sdhci {
 	/delete-property/ supports-cqe;
 	bus-width = <8>;
 	full-pwr-cycle-in-suspend;
 	max-frequency = <200000000>;
-	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	mmc-hs400-enhanced-strobe;
 	no-sd;
 	no-sdio;
 	non-removable;
 	status = "okay";
+};
+
+/*
+ * The eMMC releases the data strobe between transfers. Without a pull-down
+ * the HS400 CRC status token after each written block is misread: ~1 "data
+ * CRC error" per 16 MB written, retried silently, writes at ~50 MB/s. With the
+ * pull-down (the pad reset value, kept by the stock firmware; rk3588 uses it
+ * too, rk3576.dtsi has pull-none): 0 errors, ~180 MB/s (docs/emmc.md).
+ */
+&emmc_strb {
+	rockchip,pins = <1 RK_PB2 1 &pcfg_pull_down>;
 };
 
 /* Wi-Fi: AIC8800D80 on SDIO (out-of-tree driver) */
