@@ -217,3 +217,87 @@
 &vicap_mmu {
 	status = "okay";
 };
+
+/*
+ * NPU (rocket, kernel/patches/npu): both cores with clock and voltage scaling
+ * (devfreq). The OPP table is the stock Android npu-opp-table with its default
+ * voltages; the clock "pvtpll" is the firmware's PVTPLL (SCMI clock 238).
+ * Without an OPP table the cores run from the CRU clock at the assigned rate.
+ * Upstream, the table and the clock belong in rk3576.dtsi.
+ */
+/ {
+	npu_opp_table: opp-table-npu {
+		compatible = "operating-points-v2";
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <725000 725000 875000>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <725000 725000 875000>;
+		};
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <725000 725000 875000>;
+		};
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <725000 725000 875000>;
+		};
+		opp-700000000 {
+			opp-hz = /bits/ 64 <700000000>;
+			opp-microvolt = <725000 725000 875000>;
+		};
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <800000 800000 875000>;
+		};
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <850000 850000 875000>;
+		};
+		opp-950000000 {
+			opp-hz = /bits/ 64 <950000000>;
+			opp-microvolt = <875000 875000 875000>;
+		};
+	};
+};
+
+&pd_npu {
+	domain-supply = <&vdd_npu_s0>;
+};
+
+&rknn_core_0 {
+	clocks = <&cru ACLK_RKNN0>, <&cru HCLK_RKNN_ROOT>,
+		 <&cru CLK_RKNN_DSU0>, <&cru PCLK_NPUTOP_ROOT>,
+		 <&cru ACLK_RKNN_CBUF>, <&cru HCLK_RKNN_CBUF>,
+		 <&scmi_clk 238>;
+	clock-names = "aclk", "hclk", "npu", "pclk",
+		      "aclk_cbuf", "hclk_cbuf", "pvtpll";
+	assigned-clock-rates = <702000000>;
+	npu-supply = <&vdd_npu_s0>;
+	operating-points-v2 = <&npu_opp_table>;
+	status = "okay";
+};
+
+&rknn_core_1 {
+	clocks = <&cru ACLK_RKNN1>, <&cru HCLK_RKNN_ROOT>,
+		 <&cru CLK_RKNN_DSU0>, <&cru PCLK_NPUTOP_ROOT>,
+		 <&cru ACLK_RKNN_CBUF>, <&cru HCLK_RKNN_CBUF>,
+		 <&scmi_clk 238>;
+	clock-names = "aclk", "hclk", "npu", "pclk",
+		      "aclk_cbuf", "hclk_cbuf", "pvtpll";
+	assigned-clock-rates = <702000000>;
+	npu-supply = <&vdd_npu_s0>;
+	operating-points-v2 = <&npu_opp_table>;
+	status = "okay";
+};
+
+&rknn_mmu_0 {
+	status = "okay";
+};
+
+&rknn_mmu_1 {
+	status = "okay";
+};
