@@ -4,6 +4,10 @@ The driver from the ChromeOS 5.10 kernel (submitted to linux-media as
 v4 in 2020 by Hao He, Xingyu Wu and Tomasz Figa, not merged), ported to
 Linux 7.4: subdev state, init_state, set_fmt client info, i2c probe.
 Front camera of the WF2489T (2592x1944, 1296x972, 1280x720 raw Bayer).
+Measured on it: analogue gain steps 0..20 work (about 1x..11.7x; 8..11
+are weaker than 7), 21..31 fall back to about 1x with dark row bands, so
+the control ends at 20; the digital gain starts at 64 (1x) instead of
+1023 (about 8x, only every 8th raw level).
 
 diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
 index 11c302525..e3f7b5ed2 100644
@@ -42,7 +46,7 @@ new file mode 100644
 index 000000000..517a702cc
 --- /dev/null
 +++ b/drivers/media/i2c/gc5035.c
-@@ -0,0 +1,1972 @@
+@@ -0,0 +1,1974 @@
 +// SPDX-License-Identifier: GPL-2.0
 +// Copyright (c) 2020 Bitland Inc.
 +// Copyright 2020 Google LLC.
@@ -93,7 +97,8 @@ index 000000000..517a702cc
 +/* Analog gain control */
 +#define GC5035_REG_ANALOG_GAIN				0xb6
 +#define GC5035_ANALOG_GAIN_MIN				0
-+#define GC5035_ANALOG_GAIN_MAX				31
++/* steps 21..31 act as about 1x and leave dark row bands in the image */
++#define GC5035_ANALOG_GAIN_MAX				20
 +#define GC5035_ANALOG_GAIN_STEP				1
 +#define GC5035_ANALOG_GAIN_DEFAULT			GC5035_ANALOG_GAIN_MIN
 +
@@ -106,7 +111,8 @@ index 000000000..517a702cc
 +#define GC5035_DIGI_GAIN_MIN				0
 +#define GC5035_DIGI_GAIN_MAX				1023
 +#define GC5035_DIGI_GAIN_STEP				1
-+#define GC5035_DIGI_GAIN_DEFAULT			GC5035_DIGI_GAIN_MAX
++/* 64 is 1x; the maximum (about 8x) leaves only every 8th raw level */
++#define GC5035_DIGI_GAIN_DEFAULT			64
 +
 +/* Vblank control */
 +#define GC5035_REG_VTS_H				0x41
