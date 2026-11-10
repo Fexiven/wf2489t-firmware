@@ -7,11 +7,14 @@ KIOSK_MQTT_USER=
 KIOSK_MQTT_PASSWORD=
 # display brightness from the ambient light sensor (yes or no)
 KIOSK_AUTO_BRIGHTNESS=yes
-# motion sensor from the front camera in Home Assistant (yes or no); relative
-# change per cell (48x48 pixels), changed cells for motion, seconds "on" after it,
-# seconds without motion until the display turns off (0 = never)
-KIOSK_MOTION=yes
-KIOSK_MOTION_THRESHOLD=0.15
-KIOSK_MOTION_CELLS=5
-KIOSK_MOTION_HOLD=30
-KIOSK_MOTION_SCREEN_OFF=300
+# person sensor from the front camera (on the NPU) in Home Assistant (yes or no);
+# person score, box height as a fraction of the image for "near", seconds
+# "in room" after the last person, seconds without a person until the display
+# turns off (0 = never), display on with a person in the room or only near
+# (person or near)
+KIOSK_PERSON=yes
+KIOSK_PERSON_THRESHOLD=0.5
+KIOSK_PERSON_NEAR=0.40
+KIOSK_PERSON_HOLD=120
+KIOSK_PERSON_SCREEN_OFF=300
+KIOSK_PERSON_WAKE=person

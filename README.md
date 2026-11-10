@@ -68,12 +68,14 @@ repository (`make repo`; CI publishes it on GitHub Pages, signed):
 | `wf2489t` | kiosk (labwc, TouchKio, squeekboard), MQTT service, udev and sudo rules, Bluetooth, network; depends on all of the below |
 | `linux-image-wf2489t` | the current kernel and its AIC8800 Wi-Fi driver |
 | `aic8800-firmware`, `touchkio` | Radxa's firmware and TouchKio, pinned versions |
-| `mesa-teflon-rk3576` | optional, not pulled in by `wf2489t`: the TensorFlow Lite delegate for the NPU (see [NPU](#npu)) |
+| `mesa-teflon-rk3576` | the TensorFlow Lite delegate for the NPU (see [NPU](#npu)) |
+| `wf2489t-person-runtime` | LiteRT interpreter (from Google's wheel) and the EfficientDet-Lite0 model for the person sensor |
 
 The image installs `wf2489t`, which also adds the repository, so the tablet
 updates with `apt update && apt upgrade`. A package's version is the date of
 the last commit that changed its sources (`package/`; `kernel/` and `dts/` for
-the kernel; `teflon/` for `mesa-teflon-rk3576`). Kiosk settings stay in
+the kernel; `teflon/` for `mesa-teflon-rk3576`; `person/` for
+`wf2489t-person-runtime`). Kiosk settings stay in
 `/etc/default/kiosk`.
 
 ## What is pinned
@@ -86,6 +88,7 @@ the kernel; `teflon/` for `mesa-teflon-rk3576`). Kiosk settings stay in
 | TF-A (BL31) | master `ba48f2d3b4d2` + `tf-a/patches/` | `uboot/build.sh` |
 | Debian | trixie (current point release) | `debian/wf2489t.yaml` |
 | AIC8800 firmware, TouchKio | by SHA-256 | `debian/build-repo.sh` |
+| LiteRT 2.3.0 wheel, EfficientDet-Lite0 (Mesa 26.2.6 tests) | by SHA-256 | `person/build.sh` |
 | Build tools | Debian trixie by digest | `Containerfile` |
 
 ## Boot chain
@@ -110,6 +113,7 @@ date on kernel updates. The root filesystem is found by its label `root`.
 | `uboot/` | defconfig, U-Boot DT additions, FIT generator, build script (U-Boot + TF-A) |
 | `tf-a/` | TF-A patches |
 | `teflon/` | the `mesa-teflon-rk3576` package: Mesa patches for the NPU, build script |
+| `person/` | the `wf2489t-person-runtime` package: build script (pinned LiteRT wheel and model) |
 | `package/` | the `wf2489t` package: kiosk and board support files, maintainer scripts |
 | `debian/` | apt repository builder, debos recipe for the image |
 | `tools/` | installer (`install-root.sh`), U-Boot writer (`write-uboot.sh`), maskrom loader (`rk_maskrom_boot.py`), `/dev/mem` register tool (`rr.c`) |
@@ -145,8 +149,8 @@ enables both cores with the stock OPP table: devfreq scales the NPU between
 300 and 950 MHz and parks it at 200 MHz with the rail off when idle. Both
 parts are temporary until they are upstream.
 
-`apt install mesa-teflon-rk3576`, then in TensorFlow Lite / LiteRT, e.g. with
-`ai-edge-litert` from PyPI:
+The person sensor uses it (`wf2489t-person.service`). Own models in TensorFlow
+Lite / LiteRT, e.g. with `ai-edge-litert` from PyPI:
 
 ```python
 from ai_edge_litert import interpreter as tfl
@@ -171,7 +175,7 @@ it = tfl.Interpreter(model_path="model.tflite", experimental_delegates=[npu])
 - [x] Kiosk: `kiosk.service` runs labwc + [TouchKio](https://github.com/leukipp/touchkio) (Electron, fullscreen, dark, maximized while the on-screen keyboard squeekboard is shown); URL and MQTT broker in `/etc/default/kiosk`
 - [x] Hardware watchdog (systemd, 44 s: a hung system resets itself; tested with a kernel crash), journal limited to 50 MB, Debian security and point-release updates installed automatically (unattended-upgrades)
 - [x] Automatic display brightness from the ambient light sensor (`wf2489t-autobrightness.service`, off with `KIOSK_AUTO_BRIGHTNESS=no` in `/etc/default/kiosk`)
-- [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (`wlopm`, backlight), volume, keyboard, sensors; the RGB LED ring as a light and the ambient light sensor (`wf2489t-mqtt.service`); a motion sensor from the front camera (`wf2489t-motion.service`: ~3.7 fps, frame differencing on a 27x20 grid with software auto exposure, no model; switches the display off after 5 min without motion and on with the next; `KIOSK_MOTION*` in `/etc/default/kiosk`); the processor temperature (TouchKio does not know the RK3576 thermal zone names); reboot/shutdown via a sudo rule
+- [x] Home Assistant via MQTT (with `KIOSK_MQTT_URL`): TouchKio's display power/brightness (`wlopm`, backlight), volume, keyboard, sensors; the RGB LED ring as a light and the ambient light sensor (`wf2489t-mqtt.service`); a person sensor from the front camera (`wf2489t-person.service`: EfficientDet-Lite0 on the NPU, one check per second, nothing on the CPU; Person in room / near / count / score; switches the display off after 5 min without a person and on when someone is in the room; software auto exposure with only the sensor's working gain steps and 1x digital gain; `KIOSK_PERSON*` in `/etc/default/kiosk`); the processor temperature (TouchKio does not know the RK3576 thermal zone names); reboot/shutdown via a sudo rule
 - [x] Kiosk GPU acceleration (Electron's GPU process uses Panfrost)
 - [x] NPU: both cores with clock scaling, TensorFlow Lite via Mesa Teflon (`mesa-teflon-rk3576`, see [NPU](#npu))
 - [x] U-Boot USB mass storage: power key held at power-on (or `ums 0 mmc 0` at the prompt) shows the whole eMMC on the PC (uboot/patches 0001-0003)

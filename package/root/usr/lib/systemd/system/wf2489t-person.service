@@ -1,0 +1,18 @@
+[Unit]
+Description=Person sensor from the front camera in Home Assistant (MQTT, NPU)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/kiosk
+Environment=PYTHONPATH=/usr/lib/wf2489t/python
+ExecStart=/usr/libexec/wf2489t/person
+DynamicUser=yes
+SupplementaryGroups=video render
+# the Cortex-A72 cores
+CPUAffinity=4-7
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

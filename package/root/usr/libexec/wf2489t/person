@@ -1,0 +1,323 @@
+#!/usr/bin/python3
+# Person sensor from the front camera (GC5035) for Home Assistant, attached to
+# TouchKio's device (MQTT discovery). EfficientDet-Lite0 (COCO, int8) on the NPU
+# through Mesa's Teflon delegate (mesa-teflon-rk3576) checks a frame every
+# second, every 0.5 s for 10 s after a person was seen. Nothing runs on the CPU:
+# without the NPU, delegate or model the service logs one line, marks the
+# entities unavailable and exits. Images are never stored or sent.
+#
+# Publishes: Person in room (any person >= KIOSK_PERSON_THRESHOLD, two checks in
+# a row, on until KIOSK_PERSON_HOLD s without one), Person near (a person box at
+# least KIOSK_PERSON_NEAR of the frame height), Person count, Person score.
+# Display: off after KIOSK_PERSON_SCREEN_OFF s without a person, on again with
+# KIOSK_PERSON_WAKE = person (a person in the room) | near.
+# Settings from /etc/default/kiosk (KIOSK_MQTT_*, KIOSK_PERSON_*; the older
+# KIOSK_MOTION and KIOSK_MOTION_SCREEN_OFF are used when the new ones are unset).
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+W, H = 1296, 972                    # raw SRGGB10, 16 bit per pixel, black level 64
+FRAME = W * H * 2
+TARGET = 0.3                        # auto exposure: mean brightness of the full scale
+# Analogue gain: register step and measured factor. Only steps 0..20 work (21..31
+# fall back to about 1x and show dark bands), and 8..11 are weaker than 7.
+GAINS = ((0, 1.0), (2, 1.13), (3, 1.32), (4, 1.43), (5, 1.63), (6, 2.03), (7, 2.35), (12, 2.75),
+         (13, 3.30), (14, 3.93), (15, 5.05), (16, 5.95), (17, 7.14), (18, 7.91), (19, 9.72), (20, 11.7))
+TEFLON = "/usr/lib/teflon-rk3576/libteflon.so"
+MODEL = "/usr/share/wf2489t/efficientdet_lite0_int8.tflite"
+env = os.environ.get
+PERSON = env("KIOSK_PERSON") or env("KIOSK_MOTION") or "yes"
+THRESHOLD = float(env("KIOSK_PERSON_THRESHOLD") or 0.5)   # person score
+NEAR = float(env("KIOSK_PERSON_NEAR") or 0.40)             # box height / frame height for "near"
+P_HOLD = float(env("KIOSK_PERSON_HOLD") or 120)            # seconds "in room" after the last person
+NEAR_HOLD = 10                                             # seconds "near" after the last near person
+CONFIRM = 2                                                # checks in a row for "on"
+INTERVAL = 1.0                                             # seconds between checks
+FAST, FAST_FOR = 0.5, 10                                   # seconds between checks for 10 s after a person
+SCREEN_OFF = float(env("KIOSK_PERSON_SCREEN_OFF") or env("KIOSK_MOTION_SCREEN_OFF") or 300)
+                                                           # display off without a person (0 = never)
+WAKE = env("KIOSK_PERSON_WAKE") or "person"                # display on with: person (in room), near
+
+
+def sh(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+
+def find_subdev(prefix):
+    for name in glob.glob("/sys/class/video4linux/v4l-subdev*/name"):
+        if open(name).read().startswith(prefix):
+            return "/dev/" + name.split("/")[-2]
+    sys.exit(f"no {prefix} sensor")
+
+
+class Sensor:
+    def __init__(self):
+        self.dev = find_subdev("gc5035")
+        fmt = f"SRGGB10_1X10/{W}x{H} field:none"
+        for pad in ('"gc5035 4-0037":0', '"dw-mipi-csi2rx 27c80000.csi":0',
+                    '"dw-mipi-csi2rx 27c80000.csi":1', '"rkcif-mipi0":0', '"rkcif-mipi0":1'):
+            sh("media-ctl", "-d", "/dev/media0", "-V", f"{pad} [fmt:{fmt}]")
+        sh("v4l2-ctl", "-d", "/dev/video0", f"--set-fmt-video=width={W},height={H},pixelformat=RG10")
+        self.set(vertical_blanking=self.range("vertical_blanking")[1])    # lowest frame rate
+        self.emin, self.emax = self.range("exposure")
+        self.exposure, self.gain = self.emax // 2, 0          # gain: index in GAINS
+        # digital gain 64 = 1x (the default 1023 is about 8x and leaves only every
+        # 8th raw level); the software stretch in rgb8() does that without loss
+        self.set(exposure=self.exposure, analogue_gain=GAINS[0][0], digital_gain=64)
+
+    def range(self, ctl):
+        for line in sh("v4l2-ctl", "-d", self.dev, "-l").splitlines():
+            f = line.split()
+            if f and f[0] == ctl:
+                kv = dict(p.split("=") for p in f if p.count("=") == 1)
+                return int(kv["min"]), int(kv["max"])
+        raise KeyError(ctl)
+
+    def set(self, **ctls):
+        sh("v4l2-ctl", "-d", self.dev, *[a for k, v in ctls.items() for a in ("-c", f"{k}={v}")])
+
+    def adjust(self, mean):
+        """Exposure first, then gain; returns True when something changed."""
+        err = TARGET / max(mean, 0.005)
+        if 0.7 < err < 1.4:
+            return False
+        total = self.exposure * GAINS[self.gain][1] * min(max(err, 0.5), 2.0)
+        exp = int(min(max(total, self.emin), self.emax)) // 4 * 4
+        need = total / max(exp, 1)
+        gain = max([i for i, (_, f) in enumerate(GAINS) if f <= need * 1.05], default=0)
+        if (exp, gain) == (self.exposure, self.gain):
+            return False
+        self.exposure, self.gain = exp, gain
+        self.set(exposure=exp, analogue_gain=GAINS[gain][0])
+        return True
+
+
+def brightness(raw):
+    """Mean of every 8th green pixel, 0..1 above the black level."""
+    return max(float(raw[0::8, 1::8].mean()) - 64, 0) / 959.0
+
+
+def rgb8(raw, ix):
+    """Raw frame -> RGB uint8 with one pixel per RGGB quad at the flat indices ix
+    (a nearest resize to the model input, no full debayer). Gray-world white
+    balance, 99.5 % percentile to white, gamma 1/2, via lookup tables."""
+    flat = raw.ravel()
+    r, b = flat[ix[0]], flat[ix[3]]
+    g = (flat[ix[1]] + flat[ix[2]]) >> 1
+    n = max(r.shape[0] // 120, 1)          # statistics from about 120 rows
+    s = [np.maximum(c[::n, ::n].astype(np.float32) - 64, 0) for c in (r, g, b)]
+    gm = max(float(s[1].mean()), 1e-3)
+    k = [gm / max(float(c.mean()), 1e-3) for c in s]
+    hi = max(float(np.percentile(np.concatenate([c.ravel() * kc for c, kc in zip(s, k)]), 99.5)), 4.0)
+    v = np.maximum(np.arange(1024, dtype=np.float32) - 64, 0)
+    luts = [(np.sqrt(np.minimum(v * kc / hi, 1.0)) * 255 + 0.5).astype(np.uint8) for kc in k]
+    return np.stack([luts[0][r], luts[1][g], luts[2][b]], -1)
+
+
+class Detector:
+    """SSD-style TFLite model with TFLite_Detection_PostProcess on the NPU.
+    run() returns persons as (score, x0, y0, x1, y1) in 0..1 of the frame."""
+
+    def __init__(self, path, delegate):
+        from ai_edge_litert import interpreter as tfl
+        self.it = tfl.Interpreter(model_path=path, experimental_delegates=[tfl.load_delegate(delegate)],
+                                  num_threads=1)
+        self.it.allocate_tensors()
+        self.inp = self.it.get_input_details()[0]
+        self.out = self.it.get_output_details()
+        _, self.h, self.w, _ = self.inp["shape"]
+        fh, fw = H // 2, W // 2             # one RGB pixel per RGGB quad; stretched as in training
+        self.ys = ((np.arange(self.h) + 0.5) * fh / self.h).astype(np.intp)
+        self.xs = ((np.arange(self.w) + 0.5) * fw / self.w).astype(np.intp)
+        base = (2 * self.ys)[:, None] * W + 2 * self.xs[None, :]
+        self.ix = [base + o for o in (0, 1, W, W + 1)]
+
+    def small(self, raw):
+        return rgb8(raw, self.ix)
+
+    def run(self, x, min_score):
+        self.it.set_tensor(self.inp["index"], x[None])
+        self.it.invoke()
+        o = {len(d["shape"]) * 10 + d["shape"][-1]: self.it.get_tensor(d["index"])[0] for d in self.out}
+        boxes, n = o[34], int(o[11])
+        a, b = [self.it.get_tensor(d["index"])[0] for d in self.out if len(d["shape"]) == 2]
+        classes, scores = (a, b) if np.all(a == np.round(a)) else (b, a)
+        return [(float(scores[i]), *map(float, np.clip(boxes[i][[1, 0, 3, 2]], 0, 1)))
+                for i in range(n) if classes[i] == 0 and scores[i] >= min_score]
+
+
+class Presence:
+    """Decision logic from the detections of one check. room: any person >= threshold
+    (CONFIRM checks in a row, then on until P_HOLD s without one); near: a person box
+    >= NEAR of the frame height (CONFIRM in a row, off after NEAR_HOLD s without)."""
+
+    def __init__(self, threshold, near=NEAR, hold=P_HOLD, near_hold=NEAR_HOLD, confirm=CONFIRM):
+        self.threshold, self.near_frac, self.hold, self.near_hold, self.confirm = \
+            threshold, near, hold, near_hold, confirm
+        self.room = self.near = False
+        self.room_streak = self.near_streak = 0
+        self.last_seen = self.last_near = -1e9
+        self.count, self.best = 0, 0.0
+
+    def update(self, now, dets):
+        """Returns True when "near" was confirmed at this check (wake source)."""
+        hits = [d for d in dets if d[0] >= self.threshold]
+        near = [d for d in hits if d[4] - d[2] >= self.near_frac]
+        self.count, self.best = len(hits), max([d[0] for d in dets], default=0.0)
+        self.room_streak = self.room_streak + 1 if hits else 0
+        self.near_streak = self.near_streak + 1 if near else 0
+        if hits:
+            self.last_seen = now
+        if self.room_streak >= self.confirm or (self.room and hits):
+            self.room = True
+        elif self.room and now - self.last_seen > self.hold:
+            self.room = False
+        seen_near = self.near_streak >= self.confirm or (self.near and bool(near))
+        if seen_near:
+            self.last_near = now
+            self.near = True
+        elif self.near and now - self.last_near > self.near_hold:
+            self.near = False
+        return seen_near
+
+
+class Mqtt:
+    def __init__(self):
+        url = env("KIOSK_MQTT_URL", "")
+        self.args, self.id = None, ""
+        if not url:
+            return
+        host, _, port = url.split("://", 1)[-1].partition(":")
+        args = ["-h", host, "-p", port or "1883"]
+        if env("KIOSK_MQTT_USER"):
+            args += ["-u", env("KIOSK_MQTT_USER"), "-P", env("KIOSK_MQTT_PASSWORD", "")]
+        # same device id as TouchKio: last 6 characters of the serial number
+        serial = open("/sys/firmware/devicetree/base/serial-number").read().strip("\0")
+        self.id = "rpi_" + "".join(ch for ch in serial[-6:].upper() if ch.isalnum())
+        self.args = args
+
+    def discovery(self):
+        i = self.id
+        dev = f'"device":{{"identifiers":["{i}"]}}'
+        avail = f'"availability_topic":"touchkio/{i}/person/availability"'
+        self.pub(f"homeassistant/binary_sensor/{i}/motion/config", "")    # Motion entity, removed
+        self.pub(f"touchkio/{i}/motion/state", "")
+        for key, name, cls in (("person_room", "Person in room", "occupancy"),
+                               ("person_near", "Person near", "presence")):
+            self.pub(f"homeassistant/binary_sensor/{i}/{key}/config",
+                     f'{{"name":"{name}","unique_id":"{i}_{key}","object_id":"{i}_{key}",'
+                     f'"device_class":"{cls}","state_topic":"touchkio/{i}/{key}/state",{avail},{dev}}}')
+        for key, name, unit in (("count", "Person count", ""), ("score", "Person score", "%")):
+            self.pub(f"homeassistant/sensor/{i}/person_{key}/config",
+                     f'{{"name":"{name}","unique_id":"{i}_person_{key}","object_id":"{i}_person_{key}",'
+                     f'"state_class":"measurement","state_topic":"touchkio/{i}/person/info",'
+                     f'"value_template":"{{{{ value_json.{key} }}}}",'
+                     + (f'"unit_of_measurement":"{unit}",' if unit else "") + f'{avail},{dev}}}')
+
+    def pub(self, topic, msg, retain=True):
+        if self.args:
+            subprocess.run(["mosquitto_pub", *self.args, *(["-r"] if retain else []), "-t", topic, "-m", msg],
+                           check=False)
+
+    def state(self, what, on):
+        self.pub(f"touchkio/{self.id}/{what}/state", "ON" if on else "OFF")
+
+    def available(self, on):
+        self.pub(f"touchkio/{self.id}/person/availability", "online" if on else "offline")
+
+    def info(self, count, score):
+        self.pub(f"touchkio/{self.id}/person/info", f'{{"count":{count},"score":{round(score * 100)}}}')
+
+    def display(self, on):
+        """TouchKio's display light (wlopm), so that Home Assistant sees the change too."""
+        self.pub(f"touchkio/{self.id}/display/power/set", "ON" if on else "OFF", retain=False)
+
+
+def load_detector():
+    """The person detector, or None with one log line saying why."""
+    if PERSON != "yes":
+        print("person sensor off (KIOSK_PERSON=no)", flush=True)
+        return None
+    try:
+        for f in (TEFLON, MODEL):
+            if not os.path.exists(f):
+                raise RuntimeError(f"{f} missing")
+        det = Detector(MODEL, TEFLON)
+    except Exception as e:                  # no NPU/delegate/model: nothing (never on the CPU)
+        print(f"person sensor off: {e}", flush=True)
+        return None
+    print(f"person sensor on the NPU: threshold {THRESHOLD}, near {NEAR}, wake {WAKE}, "
+          f"display off after {SCREEN_OFF:g} s", flush=True)
+    return det
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    mqtt = Mqtt()
+    det = load_detector()
+    mqtt.discovery()
+    mqtt.available(det is not None)
+    if not det:
+        return
+    try:
+        run(mqtt, det)
+    finally:
+        mqtt.available(False)
+
+
+def run(mqtt, det):
+    cam = Sensor()
+    stream = subprocess.Popen(["v4l2-ctl", "-d", "/dev/video0", "--stream-mmap", "--stream-count=0",
+                               "--stream-to=-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    frame, settle = bytearray(FRAME), 2
+    p = Presence(THRESHOLD)
+    screen_off = False
+    last_check = last_info = 0.0
+    info = (-1, -1)
+    mqtt.state("person_room", False)
+    mqtt.state("person_near", False)
+    mqtt.info(0, 0.0)
+    while True:
+        if stream.stdout.readinto(frame) != FRAME:     # buffered: reads one whole frame
+            sys.exit("camera stream ended")
+        now = time.monotonic()
+        if settle:                                     # frames with the old exposure
+            settle -= 1
+            continue
+        if now - last_check < (FAST if now - p.last_seen < FAST_FOR else INTERVAL):
+            continue
+        raw = np.frombuffer(frame, "<u2").reshape(H, W)
+        mean = brightness(raw)
+        if cam.adjust(mean):                           # auto exposure at the check rate
+            settle = 2
+            continue
+        last_check = now
+        dets = det.run(det.small(raw), min(THRESHOLD, 0.2))
+        room, near = p.room, p.near
+        seen_near = p.update(now, dets)
+        if p.room != room:
+            mqtt.state("person_room", p.room)
+        if p.near != near:
+            mqtt.state("person_near", p.near)
+        new = (p.count, round(p.best * 20) / 20)       # publish on count change, score in 5 % steps
+        if new[0] != info[0] or (new != info and now - last_info > 5):
+            info, last_info = new, now
+            mqtt.info(p.count, p.best)
+        if screen_off and ((WAKE == "near" and seen_near) or (WAKE == "person" and p.room and p.count > 0)):
+            screen_off = False                         # only undo our own switch-off
+            mqtt.display(True)
+            settle = 10                                # the display lights the room: new exposure
+        if SCREEN_OFF and not screen_off and now - p.last_seen > SCREEN_OFF:
+            screen_off = True
+            mqtt.display(False)
+            settle = 10
+
+
+if __name__ == "__main__":
+    main()

@@ -12,7 +12,10 @@ if [ "$(plymouth-set-default-theme)" != fade-in ]; then
 fi
 # kernel command line from /usr/share/u-boot-menu/conf.d/wf2489t.conf
 u-boot-update
-units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service wf2489t-motion.service aic8800-bluetooth.service"
+# wf2489t-motion.service was replaced by wf2489t-person.service (20261110)
+deb-systemd-helper purge wf2489t-motion.service >/dev/null || true
+[ -d /run/systemd/system ] && systemctl stop wf2489t-motion.service 2>/dev/null || true
+units="kiosk.service wf2489t-mqtt.service wf2489t-autobrightness.service wf2489t-person.service aic8800-bluetooth.service"
 # enable each unit once (also units added by an upgrade); a unit disabled
 # later by hand stays disabled
 for u in $units; do
