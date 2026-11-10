@@ -1,0 +1,204 @@
+From dac4cb8ddd495d51123df3b28861cc0d04de7bb6 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:01:14 +0100
+Subject: [PATCH 04/11] accel/rocket: start the next task from the hard
+ interrupt handler
+
+A job is a list of tasks, and the core raises an interrupt at the end of
+each one. The hard handler only masks the interrupt and wakes the IRQ
+thread, which stops the block, kicks the next task, or signals the job's
+fence when it was the last one. On RK3576 a task often runs only 20-50
+us on the NPU, and a job trace showed the round trip through the IRQ
+thread costing about 6 us on top of every task, during which the NPU is
+idle.
+
+Nothing in that path sleeps any more since the IOMMU domain is no longer
+detached at the end of a job: it is register writes, a fence signal and
+a runtime PM put. Do it all in the hard handler and drop the IRQ thread.
+job_lock becomes a spinlock; it only covers in_flight_job and the PC
+register writes, and is taken with interrupts disabled outside the
+handler. Stopping the block stays under the lock, so that it cannot land
+after the OPERATION_ENABLE write of a task that has just been kicked.
+
+Signalling the fence from the hard handler also lets the scheduler queue
+its work for the next job without first waking the IRQ thread.
+
+Tested on RK3576S with Mesa batching the tasks of consecutive layers
+into one job: the job trace shows 2-3 us from the interrupt to the kick
+of the next task. The 10 test models give byte-identical results.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_core.h |  7 ++-
+ drivers/accel/rocket/rocket_job.c  | 70 +++++++++++++-----------------
+ 2 files changed, 35 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index fd93dfac1..ad6c37c8e 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -9,6 +9,7 @@
+ #include <linux/io.h>
+ #include <linux/mutex_types.h>
+ #include <linux/reset.h>
++#include <linux/spinlock.h>
+ 
+ struct rocket_iommu_domain;
+ 
+@@ -51,7 +52,11 @@ struct rocket_core {
+ 
+ 	struct iommu_group *iommu_group;
+ 
+-	struct mutex job_lock;
++	/*
++	 * Protects in_flight_job and the PC registers; taken from the hard
++	 * IRQ handler, which kicks the next task of a job itself.
++	 */
++	spinlock_t job_lock;
+ 	struct rocket_job *in_flight_job;
+ 
+ 	/*
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 9a35bf3b5..8b1c9aeda 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -381,7 +381,7 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 	if (ret < 0)
+ 		goto err_put_pm;
+ 
+-	scoped_guard(mutex, &core->job_lock) {
++	scoped_guard(spinlock_irqsave, &core->job_lock) {
+ 		core->in_flight_job = job;
+ 		rocket_job_hw_submit(core, job);
+ 	}
+@@ -397,38 +397,31 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 	return ERR_PTR(ret);
+ }
+ 
++/*
++ * Called from the hard IRQ handler with the job lock held: stop the block,
++ * then kick the next task of the job right away, or complete the job.
++ */
+ static void rocket_job_next_locked(struct rocket_core *core)
+ {
++	struct rocket_job *job = core->in_flight_job;
++
+ 	lockdep_assert_held(&core->job_lock);
+ 
+-	if (!core->in_flight_job)
++	rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
++	rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
++
++	if (!job)
+ 		return;
+ 
+-	if (core->in_flight_job->next_task_idx < core->in_flight_job->task_count) {
+-		rocket_job_hw_submit(core, core->in_flight_job);
++	if (job->next_task_idx < job->task_count) {
++		rocket_job_hw_submit(core, job);
+ 		return;
+ 	}
+ 
+-	dma_fence_signal(core->in_flight_job->done_fence);
+-	pm_runtime_put_autosuspend(core->dev);
+ 	core->in_flight_job = NULL;
+-}
+-
+-static void rocket_job_handle_irq(struct rocket_core *core)
+-{
++	dma_fence_signal(job->done_fence);
+ 	pm_runtime_mark_last_busy(core->dev);
+-
+-	scoped_guard(mutex, &core->job_lock) {
+-		/*
+-		 * Stopping the block belongs under the lock. hw_submit() writes
+-		 * OPERATION_ENABLE too, and outside the lock this zero can land
+-		 * after that one and stop a task that has only just started.
+-		 */
+-		rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
+-		rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
+-
+-		rocket_job_next_locked(core);
+-	}
++	pm_runtime_put_autosuspend(core->dev);
+ }
+ 
+ /* The RK3576 PC has its task status at 0x48 instead of 0x3c. */
+@@ -480,7 +473,7 @@ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ 	 */
+ 	disable_irq(core->irq);
+ 
+-	scoped_guard(mutex, &core->job_lock) {
++	scoped_guard(spinlock_irqsave, &core->job_lock) {
+ 		if (powered) {
+ 			rocket_job_dump_state(core);
+ 			rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
+@@ -574,15 +567,6 @@ static const struct drm_sched_backend_ops rocket_sched_ops = {
+ 	.free_job = rocket_job_free
+ };
+ 
+-static irqreturn_t rocket_job_irq_handler_thread(int irq, void *data)
+-{
+-	struct rocket_core *core = data;
+-
+-	rocket_job_handle_irq(core);
+-
+-	return IRQ_HANDLED;
+-}
+-
+ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ {
+ 	struct rocket_core *core = data;
+@@ -605,9 +589,16 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ 	      raw_status & PC_INTERRUPT_RAW_STATUS_DPU_1))
+ 		return IRQ_NONE;
+ 
+-	rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
++	/*
++	 * Everything here is register writes and a fence signal, so it is
++	 * done in the hard handler: the next task of a job starts without
++	 * the round trip through the IRQ thread (about 7 us a task on
++	 * RK3576), and so does the scheduler's work for the next job.
++	 */
++	scoped_guard(spinlock, &core->job_lock)
++		rocket_job_next_locked(core);
+ 
+-	return IRQ_WAKE_THREAD;
++	return IRQ_HANDLED;
+ }
+ 
+ int rocket_job_init(struct rocket_core *core)
+@@ -624,18 +615,15 @@ int rocket_job_init(struct rocket_core *core)
+ 
+ 	INIT_WORK(&core->reset.work, rocket_reset_work);
+ 	spin_lock_init(&core->fence_lock);
+-	mutex_init(&core->job_lock);
++	spin_lock_init(&core->job_lock);
+ 	mutex_init(&core->attach_lock);
+ 
+ 	core->irq = platform_get_irq(to_platform_device(core->dev), 0);
+ 	if (core->irq < 0)
+ 		return core->irq;
+ 
+-	ret = devm_request_threaded_irq(core->dev, core->irq,
+-					rocket_job_irq_handler,
+-					rocket_job_irq_handler_thread,
+-					IRQF_SHARED, dev_name(core->dev),
+-					core);
++	ret = devm_request_irq(core->dev, core->irq, rocket_job_irq_handler,
++			       IRQF_SHARED, dev_name(core->dev), core);
+ 	if (ret) {
+ 		dev_err(core->dev, "failed to request job irq");
+ 		return ret;
+@@ -748,7 +736,7 @@ void rocket_job_close(struct rocket_file_priv *rocket_priv)
+ 		guard(mutex)(&rcore->attach_lock);
+ 		if (rcore->attached != rocket_priv->domain)
+ 			continue;
+-		scoped_guard(mutex, &rcore->job_lock)
++		scoped_guard(spinlock_irqsave, &rcore->job_lock)
+ 			busy = rcore->in_flight_job &&
+ 			       rcore->in_flight_job->domain == rocket_priv->domain;
+ 		if (!busy)
+-- 
+2.55.0
+

@@ -1,0 +1,513 @@
+From 1727d68bff0a4d49999f32c7ec45a49069b869b5 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:55:08 +0100
+Subject: [PATCH 10/11] accel/rocket: scale the NPU clock and supply with
+ devfreq
+
+The RK3576 NPU has an OPP table in the vendor device tree, from 300 MHz
+at 725 mV to 950 MHz at 875 mV, with the clock from the firmware's
+PVTPLL (SCMI). Without it the cores run from the CRU clock at one fixed
+rate.
+
+When a core has "operating-points-v2", the first such core gets the
+table, with the optional "pvtpll" clock as the OPP clock and "npu-supply"
+as the OPP supply, and a devfreq device with the simple_ondemand
+governor. The cores share the clock and the supply, so the device stands
+for both: it counts the NPU as busy while any core runs a job, and
+powering up and down follows the first and the last core.
+
+The PVTPLL does not survive the NPU power domain powering off: the bus
+hangs when the domain comes back with it selected. So before the last
+core powers down, devfreq is suspended and the clock is parked at
+200 MHz, a rate the firmware takes from the CRU, then the OPP supply is
+released. When the first core powers up, the OPP devfreq chose last is
+set again (the OPP core raises the voltage before the clock) and devfreq
+resumes. While the cores are off, a new rate is only recorded.
+
+The NPU is busy for 15-55 % of an inference for most models, as the CPU
+runs part of the model and prepares the jobs, and the cores power down
+50 ms after the last job. With the governor's defaults (upthreshold 45,
+50 ms) detection models stayed at 300-600 MHz; upthreshold 20,
+downdifferential 10 and a 100 ms interval give the latency of a fixed
+950 MHz.
+
+Without an OPP table, or without a usable supply, the NPU runs from its
+CRU clock as before.
+
+The device tree properties are described by the previous patch,
+"dt-bindings: npu: rockchip,rknn: add RK3576 PVTPLL clock and OPP
+table": the optional seventh clock "pvtpll" and "operating-points-v2"
+for rockchip,rk3576-rknn-core; "npu-supply" exists already.
+
+Tested on RK3576S: under load the NPU runs at up to 950 MHz / 875 mV,
+when idle the clock is parked at 200 MHz with the supply off, and all
+test models give bit-identical results at every OPP.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/Kconfig          |   2 +
+ drivers/accel/rocket/Makefile         |   1 +
+ drivers/accel/rocket/rocket_core.c    |   5 +
+ drivers/accel/rocket/rocket_devfreq.c | 252 ++++++++++++++++++++++++++
+ drivers/accel/rocket/rocket_devfreq.h |  47 +++++
+ drivers/accel/rocket/rocket_device.c  |   9 +
+ drivers/accel/rocket/rocket_device.h  |   3 +
+ drivers/accel/rocket/rocket_drv.c     |   3 +
+ drivers/accel/rocket/rocket_job.c     |   4 +
+ 9 files changed, 326 insertions(+)
+ create mode 100644 drivers/accel/rocket/rocket_devfreq.c
+ create mode 100644 drivers/accel/rocket/rocket_devfreq.h
+
+diff --git a/drivers/accel/rocket/Kconfig b/drivers/accel/rocket/Kconfig
+index 16465abe0..00ee845c8 100644
+--- a/drivers/accel/rocket/Kconfig
++++ b/drivers/accel/rocket/Kconfig
+@@ -8,6 +8,8 @@ config DRM_ACCEL_ROCKET
+ 	depends on MMU
+ 	select DRM_SCHED
+ 	select DRM_GEM_SHMEM_HELPER
++	select PM_DEVFREQ
++	select DEVFREQ_GOV_SIMPLE_ONDEMAND
+ 	help
+ 	  Choose this option if you have a Rockchip SoC that contains a
+ 	  compatible Neural Processing Unit (NPU), such as the RK3588. Called by
+diff --git a/drivers/accel/rocket/Makefile b/drivers/accel/rocket/Makefile
+index 3713dfe22..d3f3ce70e 100644
+--- a/drivers/accel/rocket/Makefile
++++ b/drivers/accel/rocket/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_DRM_ACCEL_ROCKET) := rocket.o
+ 
+ rocket-y := \
+ 	rocket_core.o \
++	rocket_devfreq.o \
+ 	rocket_device.o \
+ 	rocket_drv.o \
+ 	rocket_gem.o \
+diff --git a/drivers/accel/rocket/rocket_core.c b/drivers/accel/rocket/rocket_core.c
+index ef2ed0fda..ffcf95743 100644
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -12,6 +12,7 @@
+ #include <linux/reset.h>
+ 
+ #include "rocket_core.h"
++#include "rocket_devfreq.h"
+ #include "rocket_job.h"
+ 
+ int rocket_core_init(struct rocket_core *core)
+@@ -38,6 +39,10 @@ int rocket_core_init(struct rocket_core *core)
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get clocks for core %d\n", core->index);
+ 
++	err = rocket_devfreq_init(core);
++	if (err)
++		return err;
++
+ 	core->pc_iomem = devm_platform_ioremap_resource_byname(pdev, "pc");
+ 	if (IS_ERR(core->pc_iomem)) {
+ 		dev_err(dev, "couldn't find PC registers %ld\n", PTR_ERR(core->pc_iomem));
+diff --git a/drivers/accel/rocket/rocket_devfreq.c b/drivers/accel/rocket/rocket_devfreq.c
+new file mode 100644
+index 000000000..40d9c72ae
+--- /dev/null
++++ b/drivers/accel/rocket/rocket_devfreq.c
+@@ -0,0 +1,252 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NPU clock and voltage scaling.
++ *
++ * The cores of the NPU share their clock and supply, so the first core with
++ * an OPP table owns the table and the devfreq device, and the work and power
++ * state of all cores is accounted to it.
++ *
++ * On RK3576 the clock is the firmware's (SCMI) NPU clock, which runs from the
++ * PVTPLL above the rates of the CRU's PLLs. The PVTPLL does not survive the
++ * NPU power domain powering off: the bus hangs when the domain comes back
++ * with it selected. So before the last core powers down, the clock is parked
++ * at a rate the firmware takes from the CRU, and the OPP is set again when
++ * the first core powers up. While all cores are off, devfreq is suspended and
++ * a new rate is only recorded.
++ */
++
++#include <linux/device.h>
++#include <linux/of.h>
++#include <linux/pm_opp.h>
++
++#include "rocket_core.h"
++#include "rocket_device.h"
++#include "rocket_devfreq.h"
++
++#define ROCKET_PARK_RATE	200000000
++
++static void rocket_devfreq_update_utilization(struct rocket_devfreq *rdf)
++{
++	ktime_t now = ktime_get();
++
++	if (rdf->busy_count)
++		rdf->busy_time += ktime_sub(now, rdf->time_last_update);
++	else
++		rdf->idle_time += ktime_sub(now, rdf->time_last_update);
++
++	rdf->time_last_update = now;
++}
++
++static void rocket_devfreq_reset(struct rocket_devfreq *rdf)
++{
++	rdf->busy_time = 0;
++	rdf->idle_time = 0;
++	rdf->time_last_update = ktime_get();
++}
++
++static int rocket_devfreq_target(struct device *dev, unsigned long *freq,
++				 u32 flags)
++{
++	struct rocket_device *rdev = dev_get_drvdata(dev);
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++	struct dev_pm_opp *opp;
++	int err = 0;
++
++	opp = devfreq_recommended_opp(dev, freq, flags);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++	dev_pm_opp_put(opp);
++
++	guard(mutex)(&rdf->lock);
++	if (rdf->active)
++		err = dev_pm_opp_set_rate(dev, *freq);
++	if (!err)
++		rdf->rate = *freq;
++
++	return err;
++}
++
++static int rocket_devfreq_get_dev_status(struct device *dev,
++					 struct devfreq_dev_status *status)
++{
++	struct rocket_device *rdev = dev_get_drvdata(dev);
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++
++	status->current_frequency = rdf->rate;
++
++	guard(spinlock_irqsave)(&rdf->busy_lock);
++	rocket_devfreq_update_utilization(rdf);
++	status->total_time = ktime_to_ns(ktime_add(rdf->busy_time, rdf->idle_time));
++	status->busy_time = ktime_to_ns(rdf->busy_time);
++	rocket_devfreq_reset(rdf);
++
++	dev_dbg(dev, "busy %lu total %lu %lu %% freq %lu MHz\n",
++		status->busy_time, status->total_time,
++		status->busy_time / (status->total_time / 100 + 1),
++		status->current_frequency / 1000 / 1000);
++
++	return 0;
++}
++
++/* Called with pm_lock held. */
++static void rocket_devfreq_park(struct rocket_devfreq *rdf)
++{
++	int err;
++
++	guard(mutex)(&rdf->lock);
++	rdf->active = false;
++
++	/* Clock down first, then the voltage, then release the supply. */
++	err = dev_pm_opp_set_rate(rdf->dev, ROCKET_PARK_RATE);
++	if (!err)
++		err = dev_pm_opp_set_rate(rdf->dev, 0);
++	if (err)
++		dev_err(rdf->dev, "failed to park the NPU clock: %d\n", err);
++}
++
++/* Called with pm_lock held. */
++static void rocket_devfreq_unpark(struct rocket_devfreq *rdf)
++{
++	int err;
++
++	scoped_guard(mutex, &rdf->lock) {
++		/* The OPP core sets the voltage before raising the clock. */
++		err = dev_pm_opp_set_rate(rdf->dev, rdf->rate);
++		if (err)
++			dev_err(rdf->dev, "failed to set the NPU clock to %lu Hz: %d\n",
++				rdf->rate, err);
++		rdf->active = true;
++	}
++
++	scoped_guard(spinlock_irqsave, &rdf->busy_lock)
++		rocket_devfreq_reset(rdf);
++}
++
++/* Before the first core powers up, after its clocks are enabled. */
++void rocket_devfreq_power_up(struct rocket_device *rdev)
++{
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++
++	guard(mutex)(&rdf->pm_lock);
++	if (rdf->powered++ || !rdf->dev)
++		return;
++
++	rocket_devfreq_unpark(rdf);
++	WARN_ON(devfreq_resume_device(rdf->devfreq));
++}
++
++/* Before the last core powers down, while its clocks are still enabled. */
++void rocket_devfreq_power_down(struct rocket_device *rdev)
++{
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++
++	guard(mutex)(&rdf->pm_lock);
++	if (WARN_ON(!rdf->powered) || --rdf->powered || !rdf->dev)
++		return;
++
++	WARN_ON(devfreq_suspend_device(rdf->devfreq));
++	rocket_devfreq_park(rdf);
++}
++
++void rocket_devfreq_record_busy(struct rocket_device *rdev)
++{
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++
++	guard(spinlock_irqsave)(&rdf->busy_lock);
++	rocket_devfreq_update_utilization(rdf);
++	rdf->busy_count++;
++}
++
++void rocket_devfreq_record_idle(struct rocket_device *rdev)
++{
++	struct rocket_devfreq *rdf = &rdev->devfreq;
++
++	guard(spinlock_irqsave)(&rdf->busy_lock);
++	rocket_devfreq_update_utilization(rdf);
++	if (!WARN_ON(!rdf->busy_count))
++		rdf->busy_count--;
++}
++
++static void rocket_devfreq_fini(void *data)
++{
++	struct rocket_devfreq *rdf = data;
++
++	/* Leave the clock parked for the cores that stay. */
++	guard(mutex)(&rdf->pm_lock);
++	if (rdf->powered)
++		rocket_devfreq_park(rdf);
++	rdf->dev = NULL;
++	rdf->devfreq = NULL;
++}
++
++int rocket_devfreq_init(struct rocket_core *core)
++{
++	struct rocket_devfreq *rdf = &core->rdev->devfreq;
++	static const char * const supplies[] = { "npu", NULL };
++	struct device *dev = core->dev;
++	unsigned long freq = ULONG_MAX;
++	struct dev_pm_opp *opp;
++	struct devfreq *devfreq;
++	int err;
++
++	if (rdf->dev || !of_property_present(dev->of_node, "operating-points-v2"))
++		return 0;
++
++	err = devm_pm_opp_set_clkname(dev, "pvtpll");
++	if (err)
++		return dev_err_probe(dev, err, "failed to set the OPP clock\n");
++
++	err = devm_pm_opp_set_regulators(dev, supplies);
++	if (err == -ENODEV) {
++		dev_warn(dev, "no NPU supply, not scaling the NPU clock\n");
++		return 0;
++	}
++	if (err)
++		return dev_err_probe(dev, err, "failed to set the OPP supply\n");
++
++	err = devm_pm_opp_of_add_table(dev);
++	if (err)
++		return dev_err_probe(dev, err, "failed to add the OPP table\n");
++
++	/* The highest OPP the supply can reach, the initial rate. */
++	opp = dev_pm_opp_find_freq_floor(dev, &freq);
++	if (IS_ERR(opp)) {
++		dev_warn(dev, "no usable OPP, not scaling the NPU clock\n");
++		return 0;
++	}
++	dev_pm_opp_put(opp);
++
++	rdf->rate = freq;
++	rdf->profile.timer = DEVFREQ_TIMER_DELAYED;
++	rdf->profile.polling_ms = 100;
++	rdf->profile.initial_freq = freq;
++	rdf->profile.target = rocket_devfreq_target;
++	rdf->profile.get_dev_status = rocket_devfreq_get_dev_status;
++	/*
++	 * Most inferences keep the NPU busy for only 15-55% of their time at
++	 * the highest OPP (the CPU runs the rest of the model and prepares
++	 * the jobs), and the cores power down 50 ms after the last job, which
++	 * is a polling interval of idle before devfreq suspends. So it takes
++	 * little load to go to the highest OPP, and the interval is long
++	 * enough that the idle tail does not drag the rate of the next burst.
++	 */
++	rdf->gov_data.upthreshold = 20;
++	rdf->gov_data.downdifferential = 10;
++
++	devfreq = devm_devfreq_add_device(dev, &rdf->profile,
++					  DEVFREQ_GOV_SIMPLE_ONDEMAND,
++					  &rdf->gov_data);
++	if (IS_ERR(devfreq))
++		return dev_err_probe(dev, PTR_ERR(devfreq), "failed to add devfreq\n");
++
++	scoped_guard(mutex, &rdf->pm_lock) {
++		rdf->dev = dev;
++		rdf->devfreq = devfreq;
++		if (rdf->powered)
++			rocket_devfreq_unpark(rdf);
++		else
++			WARN_ON(devfreq_suspend_device(devfreq));
++	}
++
++	return devm_add_action_or_reset(dev, rocket_devfreq_fini, rdf);
++}
+diff --git a/drivers/accel/rocket/rocket_devfreq.h b/drivers/accel/rocket/rocket_devfreq.h
+new file mode 100644
+index 000000000..f588200b5
+--- /dev/null
++++ b/drivers/accel/rocket/rocket_devfreq.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef __ROCKET_DEVFREQ_H__
++#define __ROCKET_DEVFREQ_H__
++
++#include <linux/devfreq.h>
++#include <linux/ktime.h>
++#include <linux/mutex_types.h>
++#include <linux/spinlock_types.h>
++
++struct rocket_core;
++struct rocket_device;
++
++struct rocket_devfreq {
++	/* The core that owns the OPP table and the devfreq device, if any. */
++	struct device *dev;
++	struct devfreq *devfreq;
++	struct devfreq_dev_profile profile;
++	struct devfreq_simple_ondemand_data gov_data;
++
++	/* Serialises power up and down of the cores; protects powered. */
++	struct mutex pm_lock;
++	unsigned int powered;
++
++	/*
++	 * Protects active, and rate against power up and down. Taken inside
++	 * the devfreq lock, which also protects rate.
++	 */
++	struct mutex lock;
++	bool active;
++	unsigned long rate;
++
++	/* Utilisation of all cores together; busy while any core runs a job. */
++	spinlock_t busy_lock;
++	unsigned int busy_count;
++	ktime_t busy_time;
++	ktime_t idle_time;
++	ktime_t time_last_update;
++};
++
++int rocket_devfreq_init(struct rocket_core *core);
++void rocket_devfreq_power_up(struct rocket_device *rdev);
++void rocket_devfreq_power_down(struct rocket_device *rdev);
++void rocket_devfreq_record_busy(struct rocket_device *rdev);
++void rocket_devfreq_record_idle(struct rocket_device *rdev);
++
++#endif /* __ROCKET_DEVFREQ_H__ */
+diff --git a/drivers/accel/rocket/rocket_device.c b/drivers/accel/rocket/rocket_device.c
+index 0fd0fc775..df11a8f48 100644
+--- a/drivers/accel/rocket/rocket_device.c
++++ b/drivers/accel/rocket/rocket_device.c
+@@ -46,6 +46,15 @@ struct rocket_device *rocket_device_init(struct platform_device *pdev,
+ 	if (err)
+ 		return ERR_PTR(err);
+ 
++	err = devm_mutex_init(dev, &rdev->devfreq.pm_lock);
++	if (err)
++		return ERR_PTR(err);
++
++	err = devm_mutex_init(dev, &rdev->devfreq.lock);
++	if (err)
++		return ERR_PTR(err);
++	spin_lock_init(&rdev->devfreq.busy_lock);
++
+ 	err = devm_mutex_init(dev, &rdev->sched_lock);
+ 	if (err)
+ 		return ERR_PTR(-ENOMEM);
+diff --git a/drivers/accel/rocket/rocket_device.h b/drivers/accel/rocket/rocket_device.h
+index 00d7936f8..c22f997ff 100644
+--- a/drivers/accel/rocket/rocket_device.h
++++ b/drivers/accel/rocket/rocket_device.h
+@@ -11,6 +11,7 @@
+ #include <linux/platform_device.h>
+ 
+ #include "rocket_core.h"
++#include "rocket_devfreq.h"
+ 
+ struct rocket_file_priv;
+ 
+@@ -36,6 +37,8 @@ struct rocket_device {
+ 	struct dma_fence *excl_fences[ROCKET_EXCL_SLOTS];
+ 	struct dma_fence *excl_barrier[ROCKET_EXCL_SLOTS];
+ 
++	struct rocket_devfreq devfreq;
++
+ 	struct rocket_core *cores;
+ 	unsigned int num_cores;
+ 	unsigned int max_cores;
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index fdc9724c1..148c0db8d 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -305,6 +305,8 @@ static int rocket_device_runtime_resume(struct device *dev)
+ 		return err;
+ 	}
+ 
++	rocket_devfreq_power_up(rdev);
++
+ 	return 0;
+ }
+ 
+@@ -319,6 +321,7 @@ static int rocket_device_runtime_suspend(struct device *dev)
+ 	if (!rocket_job_is_idle(&rdev->cores[core]))
+ 		return -EBUSY;
+ 
++	rocket_devfreq_power_down(rdev);
+ 	clk_bulk_disable_unprepare(rdev->cores[core].soc->num_clks, rdev->cores[core].clks);
+ 
+ 	return 0;
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 3cb4cd90e..d964077dc 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -416,6 +416,7 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 
+ 	scoped_guard(spinlock_irqsave, &core->job_lock) {
+ 		core->in_flight_job = job;
++		rocket_devfreq_record_busy(rdev);
+ 		rocket_job_hw_submit(core, job);
+ 	}
+ 
+@@ -452,6 +453,7 @@ static void rocket_job_next_locked(struct rocket_core *core)
+ 	}
+ 
+ 	core->in_flight_job = NULL;
++	rocket_devfreq_record_idle(core->rdev);
+ 	dma_fence_signal(job->done_fence);
+ 	pm_runtime_mark_last_busy(core->dev);
+ 	pm_runtime_put_autosuspend(core->dev);
+@@ -516,6 +518,8 @@ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ 
+ 		put_job_ref = core->in_flight_job;
+ 		core->in_flight_job = NULL;
++		if (put_job_ref)
++			rocket_devfreq_record_idle(core->rdev);
+ 	}
+ 
+ 	if (powered) {
+-- 
+2.55.0
+

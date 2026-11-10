@@ -1,0 +1,263 @@
+From ba62a9a050c6301a39da838b5eb8dc9e9d695d17 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:47:06 +0100
+Subject: [PATCH 11/11] accel/rocket: power-cycle a core after a job timeout
+
+After a job timeout, rocket_reset() pulses the core reset and moves the
+core's IOMMU group back to its default domain. On RK3576 neither brings
+the core back to a clean state. Measured after a job that hung in its
+DPU (a first convolution with a wrong DPU output-width config, 0x4050):
+
+ - the next job on the same core hangs as well, even with the IOMMU
+   reprogrammed by hand;
+ - the reset pulse (SRST_A_RKNNx) resets only the second of the IOMMU's
+   two MMU register windows. The first one keeps paging with the old
+   directory and ignores writes to its DTE address, so the IOMMU driver
+   fails to enable the default domain ("rk_iommu ...: Error during raw
+   reset. MMU_DTE_ADDR is not functioning", followed by a WARN in
+   __iommu_group_set_core_domain()) and every later attach on the core
+   fails the same way. rocket_job_run() then fails the job without
+   running it, which userspace cannot see: the job's outputs simply keep
+   their old contents.
+
+Both last until the core's power domain switches off, which happens
+only after 50 ms without jobs (autosuspend). A process that went on
+using the NPU got wrong results from every job on that core, for
+example the core 0 half of every two-core layer, while a fresh process
+started later was fine.
+
+Switch the core's power domain off as part of the recovery instead:
+drop the runtime PM references, suspend the core synchronously and wait
+for the GENPD_NOTIFY_OFF notification of its domain, which follows once
+the IOMMU (a runtime PM supplier of the core in the same domain) has
+suspended too. Powering the domain off resets the core, the IOMMU and
+their bus interface; the job's IOMMU domain stays attached and the
+IOMMU driver programs it from scratch when the next job powers the
+domain up. The reset pulse before it is kept: it stops the hung core,
+so that the domain's idle request can complete.
+
+If the core has no generic power domain, or the domain does not switch
+off within 100 ms, recover as before.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_core.c | 48 ++++++++++++++++++++++
+ drivers/accel/rocket/rocket_core.h | 12 ++++++
+ drivers/accel/rocket/rocket_job.c  | 65 ++++++++++++++++++++++--------
+ 3 files changed, 109 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.c b/drivers/accel/rocket/rocket_core.c
+index ffcf95743..7f90c2eab 100644
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -8,6 +8,7 @@
+ #include <linux/err.h>
+ #include <linux/iommu.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+ 
+@@ -15,6 +16,20 @@
+ #include "rocket_devfreq.h"
+ #include "rocket_job.h"
+ 
++/* How long the recovery waits for the core's power domain to switch off. */
++#define ROCKET_PD_OFF_TIMEOUT_MS 100
++
++static int rocket_core_pd_notify(struct notifier_block *nb,
++				 unsigned long action, void *data)
++{
++	struct rocket_core *core = container_of(nb, struct rocket_core, pd_nb);
++
++	if (action == GENPD_NOTIFY_OFF)
++		complete_all(&core->pd_off);
++
++	return NOTIFY_OK;
++}
++
+ int rocket_core_init(struct rocket_core *core)
+ {
+ 	struct device *dev = core->dev;
+@@ -76,6 +91,10 @@ int rocket_core_init(struct rocket_core *core)
+ 		return err;
+ 	}
+ 
++	init_completion(&core->pd_off);
++	core->pd_nb.notifier_call = rocket_core_pd_notify;
++	core->pd_nb_registered = !dev_pm_genpd_add_notifier(dev, &core->pd_nb);
++
+ 	pm_runtime_use_autosuspend(dev);
+ 
+ 	/*
+@@ -109,6 +128,10 @@ void rocket_core_fini(struct rocket_core *core)
+ {
+ 	pm_runtime_dont_use_autosuspend(core->dev);
+ 	pm_runtime_disable(core->dev);
++	if (core->pd_nb_registered) {
++		dev_pm_genpd_remove_notifier(core->dev);
++		core->pd_nb_registered = false;
++	}
+ 	iommu_group_put(core->iommu_group);
+ 	core->iommu_group = NULL;
+ 	rocket_job_fini(core);
+@@ -125,3 +148,28 @@ void rocket_core_reset(struct rocket_core *core)
+ 	/* Let the core and its IOMMU come out of reset before they are used. */
+ 	usleep_range(10, 20);
+ }
++
++/*
++ * Switch the core's power domain off, which resets everything in it: the
++ * core, its IOMMU and their bus interface. The caller must hold no runtime
++ * PM reference on the core, and nothing may resume it until this returns.
++ * The domain goes off once the core and its IOMMU (a runtime PM supplier
++ * of the core, suspended through the device link right after the core)
++ * are both suspended; the next job powers it on again, and the IOMMU
++ * driver's resume then programs the attached domain from scratch.
++ *
++ * Returns true if the domain was switched off.
++ */
++bool rocket_core_power_cycle(struct rocket_core *core)
++{
++	if (!core->pd_nb_registered)
++		return false;
++
++	reinit_completion(&core->pd_off);
++
++	if (pm_runtime_suspend(core->dev) < 0)
++		return false;
++
++	return wait_for_completion_timeout(&core->pd_off,
++					   msecs_to_jiffies(ROCKET_PD_OFF_TIMEOUT_MS));
++}
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index 91faf3e36..61fb6bb76 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -6,8 +6,10 @@
+ 
+ #include <drm/gpu_scheduler.h>
+ #include <linux/clk.h>
++#include <linux/completion.h>
+ #include <linux/io.h>
+ #include <linux/mutex_types.h>
++#include <linux/notifier.h>
+ #include <linux/reset.h>
+ #include <linux/spinlock.h>
+ 
+@@ -76,6 +78,15 @@ struct rocket_core {
+ 		atomic_t pending;
+ 	} reset;
+ 
++	/*
++	 * Signalled when the core's power domain switches off, for the
++	 * recovery after a hung job (rocket_core_power_cycle()). pd_nb is
++	 * only registered when the core has a generic power domain.
++	 */
++	struct notifier_block pd_nb;
++	struct completion pd_off;
++	bool pd_nb_registered;
++
+ 	struct drm_gpu_scheduler sched;
+ 	struct workqueue_struct *submit_wq;
+ 	u64 fence_context;
+@@ -85,5 +96,6 @@ struct rocket_core {
+ int rocket_core_init(struct rocket_core *core);
+ void rocket_core_fini(struct rocket_core *core);
+ void rocket_core_reset(struct rocket_core *core);
++bool rocket_core_power_cycle(struct rocket_core *core);
+ 
+ #endif
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index d964077dc..1a3fd01bc 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -485,7 +485,7 @@ static void rocket_job_dump_state(struct rocket_core *core)
+ static void
+ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ {
+-	bool put_job_ref, powered;
++	bool put_job_ref, powered, cycled = false;
+ 
+ 	if (!atomic_read(&core->reset.pending))
+ 		return;
+@@ -539,28 +539,61 @@ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ 	}
+ 
+ 	/*
+-	 * On RK3576 the core reset also resets the core's IOMMU, so the
+-	 * IOMMU registers no longer match what the IOMMU driver thinks it
+-	 * programmed (and where it does not, the IOMMU may be left stalled
+-	 * or faulting by the hung job). Moving the group back to its
+-	 * default domain disables the IOMMU and enables it again from
+-	 * scratch: force reset, DTE address, paging. With the core in reset
+-	 * state nothing uses the IOMMU while this happens. The next job
+-	 * attaches its own domain the same way.
++	 * The reset pulse stops the core but does not bring it back to a
++	 * clean state. Measured on RK3576 after a job that hung in its DPU:
++	 * the next job on the core hangs as well, the first of the IOMMU's
++	 * two MMU windows is still paging with the old directory and ignores
++	 * writes to its DTE address (only the second window is reset), so
++	 * the IOMMU driver can no longer enable any domain on it ("MMU_DTE_ADDR
++	 * is not functioning") and every later job on the core failed to
++	 * attach. Both stay that way until the power domain switches off,
++	 * which only happened after 50 ms without jobs, so a client that kept
++	 * the NPU busy got wrong results from every later job on that core.
++	 *
++	 * So switch the core's power domain off now, before the scheduler
++	 * runs anything on it again. That resets the core, its IOMMU and their
++	 * bus interface. The job's IOMMU domain stays attached: the IOMMU
++	 * driver programs it from scratch when the domain powers up for the
++	 * next job.
+ 	 */
+-	scoped_guard(mutex, &core->attach_lock) {
+-		iommu_detach_group(NULL, core->iommu_group);
+-		if (core->attached) {
+-			rocket_iommu_domain_put(core->attached);
+-			core->attached = NULL;
++	if (powered) {
++		if (put_job_ref)
++			pm_runtime_put_noidle(core->dev);
++		put_job_ref = false;
++		pm_runtime_put_noidle(core->dev);
++
++		cycled = rocket_core_power_cycle(core);
++		if (cycled) {
++			powered = false;
++		} else {
++			dev_warn(core->dev,
++				 "core %u: power domain did not switch off after the reset\n",
++				 core->index);
++			powered = pm_runtime_resume_and_get(core->dev) >= 0;
++		}
++	}
++
++	/*
++	 * Without the power cycle, move the group back to its default domain:
++	 * this disables the IOMMU and enables it again (force reset, DTE
++	 * address, paging), and the next job attaches its own domain the same
++	 * way.
++	 */
++	if (!cycled) {
++		scoped_guard(mutex, &core->attach_lock) {
++			iommu_detach_group(NULL, core->iommu_group);
++			if (core->attached) {
++				rocket_iommu_domain_put(core->attached);
++				core->attached = NULL;
++			}
+ 		}
+ 	}
+ 
+ 	enable_irq(core->irq);
+ 
+ 	/*
+-	 * Drop the reference of the job we just killed and our own one, now
+-	 * that the core has been reset, so the PM counters stay balanced.
++	 * Drop the reference of the job we just killed and our own one, if
++	 * the power cycle did not, so the PM counters stay balanced.
+ 	 */
+ 	if (put_job_ref)
+ 		pm_runtime_put_autosuspend(core->dev);
+-- 
+2.55.0
+

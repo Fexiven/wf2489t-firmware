@@ -1,0 +1,119 @@
+From 5006d355044b71c45cd8d7935e00a59429a90222 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:33:17 +0100
+Subject: [PATCH 09/11] dt-bindings: npu: rockchip,rknn: add RK3576 PVTPLL
+ clock and OPP table
+
+The RK3576 NPU can run from the PVTPLL, a clock that the firmware sets
+through SCMI, and has an operating point table from 300 MHz at 725 mV to
+950 MHz at 875 mV. The NPU clock from the CRU ("npu") runs at one fixed
+rate.
+
+For rockchip,rk3576-rknn-core, allow an optional seventh clock "pvtpll"
+and "operating-points-v2". A core with an OPP table needs the "pvtpll"
+clock, the clock the table applies to; the voltages of the table apply
+to "npu-supply", which the binding has already.
+
+The RK3588 is unchanged: four clocks and no OPP table.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../npu/rockchip,rk3588-rknn-core.yaml        | 49 ++++++++++++++++++-
+ 1 file changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml b/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
+index 2eb933781..2e61121cd 100644
+--- a/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
++++ b/Documentation/devicetree/bindings/npu/rockchip,rk3588-rknn-core.yaml
+@@ -35,7 +35,7 @@ properties:
+ 
+   clocks:
+     minItems: 4
+-    maxItems: 6
++    maxItems: 7
+ 
+   clock-names:
+     minItems: 4
+@@ -46,6 +46,7 @@ properties:
+       - const: pclk
+       - const: aclk_cbuf
+       - const: hclk_cbuf
++      - const: pvtpll # NPU clock from the PVTPLL, set through the firmware
+ 
+   interrupts:
+     maxItems: 1
+@@ -55,6 +56,8 @@ properties:
+ 
+   npu-supply: true
+ 
++  operating-points-v2: true
++
+   power-domains:
+     maxItems: 1
+ 
+@@ -99,6 +102,7 @@ allOf:
+           minItems: 2
+         reset-names:
+           minItems: 2
++        operating-points-v2: false
+       required:
+         - sram-supply
+     else:
+@@ -113,6 +117,20 @@ allOf:
+           maxItems: 1
+         sram-supply: false
+ 
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: rockchip,rk3576-rknn-core
++      required:
++        - operating-points-v2
++    then:
++      properties:
++        clocks:
++          minItems: 7
++        clock-names:
++          minItems: 7
++
+ additionalProperties: false
+ 
+ examples:
+@@ -145,4 +163,33 @@ examples:
+         sram-supply = <&vdd_npu_mem_s0>;
+       };
+     };
++
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/power/rockchip,rk3576-power.h>
++
++    bus {
++      #address-cells = <2>;
++      #size-cells = <2>;
++
++      npu@27700000 {
++        compatible = "rockchip,rk3576-rknn-core";
++        reg = <0x0 0x27700000 0x0 0x1000>,
++              <0x0 0x27701000 0x0 0x1000>,
++              <0x0 0x27703000 0x0 0x1000>;
++        reg-names = "pc", "cna", "core";
++        clocks = <&cru 229>, <&cru 231>, <&cru 232>, <&cru 233>,
++                 <&cru 240>, <&cru 244>, <&scmi_clk 238>;
++        clock-names = "aclk", "hclk", "npu", "pclk",
++                      "aclk_cbuf", "hclk_cbuf", "pvtpll";
++        interrupts = <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>;
++        iommus = <&rknn_mmu_0>;
++        npu-supply = <&vdd_npu_s0>;
++        operating-points-v2 = <&npu_opp_table>;
++        power-domains = <&power RK3576_PD_NPU0>;
++        resets = <&cru 204>;
++        reset-names = "srst_a";
++      };
++    };
+ ...
+-- 
+2.55.0
+

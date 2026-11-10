@@ -1,0 +1,100 @@
+From 8064a23cfdb768ed5978dfd085fc3b520f6d71ae Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:55:05 +0100
+Subject: [PATCH 08/11] accel/rocket: complete tasks on the PPU interrupt too
+
+A task that only uses the PPU, such as a max pooling task (PPU and PPU
+RDMA), raises PPU_0/PPU_1 when it finishes, not DPU_0/DPU_1. The driver
+only unmasks and accepts the DPU interrupts, so such a task never
+completes and the job times out.
+
+Unmask, clear and accept the PPU interrupts as well, and add
+DRM_ROCKET_PARAM_PPU_TASKS, so that userspace only emits PPU-only tasks
+on kernels that complete them.
+
+Tested on RK3576S: the max pooling layers of Inception V1 and
+EfficientDet-Lite0 run as PPU tasks and complete.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_drv.c |  3 +++
+ drivers/accel/rocket/rocket_job.c | 14 ++++++++++----
+ include/uapi/drm/rocket_accel.h   |  5 +++++
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index 3bb95bf46..fdc9724c1 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -154,6 +154,9 @@ rocket_ioctl_get_param(struct drm_device *dev, void *data, struct drm_file *file
+ 	case DRM_ROCKET_PARAM_NUM_CORES:
+ 		args->value = rocket_priv->num_core_entities;
+ 		return 0;
++	case DRM_ROCKET_PARAM_PPU_TASKS:
++		args->value = 1;
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 0597e34b8..3cb4cd90e 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -22,6 +22,13 @@
+ 
+ #define JOB_TIMEOUT_MS 500
+ 
++/*
++ * The interrupts that end a task: a task whose last block is the DPU raises
++ * DPU_0/DPU_1, a task that only uses the PPU (pooling) raises PPU_0/PPU_1.
++ */
++#define ROCKET_DONE_MASK (PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1 | \
++			  PC_INTERRUPT_MASK_PPU_0 | PC_INTERRUPT_MASK_PPU_1)
++
+ /*
+  * The PC unit fetches two 64-bit register commands per pc_data_amount unit,
+  * and the field holds (regcmd_count + 1) / 2 - 1.
+@@ -168,8 +175,8 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
+ 	rocket_pc_writel(core, REGISTER_AMOUNTS,
+ 			 PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+ 
+-	rocket_pc_writel(core, INTERRUPT_MASK, PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1);
+-	rocket_pc_writel(core, INTERRUPT_CLEAR, PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1);
++	rocket_pc_writel(core, INTERRUPT_MASK, ROCKET_DONE_MASK);
++	rocket_pc_writel(core, INTERRUPT_CLEAR, ROCKET_DONE_MASK);
+ 
+ 	if (core->soc->task_con_16bit)
+ 		rocket_pc_writel(core, TASK_CON,
+@@ -611,8 +618,7 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ 	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_READ_ERROR);
+ 	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_WRITE_ERROR);
+ 
+-	if (!(raw_status & PC_INTERRUPT_RAW_STATUS_DPU_0 ||
+-	      raw_status & PC_INTERRUPT_RAW_STATUS_DPU_1))
++	if (!(raw_status & ROCKET_DONE_MASK))
+ 		return IRQ_NONE;
+ 
+ 	/*
+diff --git a/include/uapi/drm/rocket_accel.h b/include/uapi/drm/rocket_accel.h
+index 7fe59be06..ef868a2a2 100644
+--- a/include/uapi/drm/rocket_accel.h
++++ b/include/uapi/drm/rocket_accel.h
+@@ -206,10 +206,15 @@ struct drm_rocket_submit {
+  * @DRM_ROCKET_PARAM_HW_VERSION: an enum drm_rocket_hw_version value.
+  * @DRM_ROCKET_PARAM_NUM_CORES: the number of NPU cores a job can be pinned
+  *	to with &drm_rocket_job.core.
++ * @DRM_ROCKET_PARAM_PPU_TASKS: 1 if a task may end in the PPU, such as a
++ *	pooling task that uses only the PPU and its RDMA: the kernel completes
++ *	tasks on the PPU interrupt as well. Kernels without this parameter only
++ *	complete tasks that end in the DPU.
+  */
+ enum drm_rocket_param {
+ 	DRM_ROCKET_PARAM_HW_VERSION = 0,
+ 	DRM_ROCKET_PARAM_NUM_CORES = 1,
++	DRM_ROCKET_PARAM_PPU_TASKS = 2,
+ };
+ 
+ /**
+-- 
+2.55.0
+

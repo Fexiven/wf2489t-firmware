@@ -1,0 +1,137 @@
+From 6cfe8264c71ddd18395771cac4d04f9b306e6c45 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:01:49 +0100
+Subject: [PATCH 06/11] accel/rocket: route the NPU interrupts to the
+ submitting CPU
+
+The NPU core interrupts keep the default routing, which on RK3576 is
+CPU 0, a Cortex-A53 that is often in a deep idle state or at a low
+clock. Every completion has to wake it, and from there the scheduler
+work for the next dependent job and the client waiting for the result.
+With the per-CPU submit queue that work also runs on CPU 0. A trace of
+Inception showed every job whose dependency had just finished waiting
+50-130 us before it started on the NPU, 725 us per inference in total,
+and the NPU idle for 618 us of its 3.6 ms busy span. Raising the CPU
+latency QoS alone did not help; the routing did.
+
+On every submit, route the interrupts of the cores to the CPU of the
+submitter, if that changed since the last submit. The interrupt, the
+run-job work for the next job and the waiting client then run on one
+CPU that is awake. The device remembers the CPU so that a submit from
+the same CPU costs nothing. The routing is handed back to all CPUs when
+the core is removed.
+
+Tested on RK3576S with Mesa splitting layers over both cores, together
+with the per-CPU submit queue (medians of 30 invokes, ms):
+
+  model                 before   after
+  Inception v1           8.11     6.77
+  SSD MobileNetV2        7.34     6.23
+  MobileNetV2            3.00     2.50
+  MoveNet Lightning      7.94     7.09
+  MoveNet Thunder       18.43    13.07
+
+On Inception a dependent job now starts about 20 us after its
+dependency, 277 us per inference, and the NPU idles 286 us of its span.
+The 10 test models give byte-identical results, and three processes
+running at the same time give no wrong results.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_device.c |  1 +
+ drivers/accel/rocket/rocket_device.h |  3 +++
+ drivers/accel/rocket/rocket_job.c    | 31 ++++++++++++++++++++++++++--
+ 3 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_device.c b/drivers/accel/rocket/rocket_device.c
+index 39e8b7c49..624b7a135 100644
+--- a/drivers/accel/rocket/rocket_device.c
++++ b/drivers/accel/rocket/rocket_device.c
+@@ -33,6 +33,7 @@ struct rocket_device *rocket_device_init(struct platform_device *pdev,
+ 			num_cores++;
+ 
+ 	rdev->max_cores = num_cores;
++	rdev->irq_cpu = -1;
+ 
+ 	rdev->cores = devm_kcalloc(dev, num_cores, sizeof(*rdev->cores), GFP_KERNEL);
+ 	if (!rdev->cores)
+diff --git a/drivers/accel/rocket/rocket_device.h b/drivers/accel/rocket/rocket_device.h
+index c62d56701..64a3a022a 100644
+--- a/drivers/accel/rocket/rocket_device.h
++++ b/drivers/accel/rocket/rocket_device.h
+@@ -20,6 +20,9 @@ struct rocket_device {
+ 	struct rocket_core *cores;
+ 	unsigned int num_cores;
+ 	unsigned int max_cores;
++
++	/* CPU the core interrupts are routed to, -1 for the default routing */
++	int irq_cpu;
+ };
+ 
+ struct rocket_device *rocket_device_init(struct platform_device *pdev,
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index a313cad75..d981c5c39 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -601,6 +601,26 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * Route the NPU interrupts to the CPU that submitted last. The interrupt
++ * signals the fences the submitter then waits on, and with a per-CPU submit
++ * queue the scheduler work for the next dependent job runs right after it on
++ * the same CPU. Left at the default routing (CPU 0 on RK3576, a Cortex-A53
++ * that is often in a deep idle state or at a low clock), every job boundary
++ * with a dependency cost 50-130 us before the next job started on the NPU,
++ * and waking the waiting client another 20-50 us.
++ */
++static void rocket_irq_follow_submitter(struct rocket_device *rdev)
++{
++	int cpu = raw_smp_processor_id();
++
++	if (READ_ONCE(rdev->irq_cpu) == cpu)
++		return;
++	WRITE_ONCE(rdev->irq_cpu, cpu);
++	for (unsigned int i = 0; i < rdev->num_cores; i++)
++		irq_set_affinity(rdev->cores[i].irq, cpumask_of(cpu));
++}
++
+ int rocket_job_init(struct rocket_core *core)
+ {
+ 	struct drm_sched_init_args args = {
+@@ -643,8 +663,9 @@ int rocket_job_init(struct rocket_core *core)
+ 	 * dependency it has on the other core, and the run-job work for a job
+ 	 * whose dependency was just signalled from the NPU interrupt then runs
+ 	 * right after it on the CPU that took the interrupt, instead of waking
+-	 * an unbound worker on another, possibly idle, CPU. drm_sched does not
+-	 * need an ordered queue.
++	 * an unbound worker on another, possibly idle, CPU (see
++	 * rocket_irq_follow_submitter()). drm_sched does not need an ordered
++	 * queue.
+ 	 */
+ 	core->submit_wq = alloc_workqueue("rocket-submit-%d",
+ 					  WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_PERCPU,
+@@ -671,6 +692,10 @@ int rocket_job_init(struct rocket_core *core)
+ 
+ void rocket_job_fini(struct rocket_core *core)
+ {
++	/* hand the interrupt back to the default routing */
++	if (READ_ONCE(core->rdev->irq_cpu) >= 0)
++		irq_set_affinity(core->irq, cpu_possible_mask);
++
+ 	scoped_guard(mutex, &core->attach_lock)
+ 		rocket_core_detach_domain(core);
+ 
+@@ -847,6 +872,8 @@ int rocket_ioctl_submit(struct drm_device *dev, void *data, struct drm_file *fil
+ 	if (args->job_count == 0)
+ 		return 0;
+ 
++	rocket_irq_follow_submitter(to_rocket_device(dev));
++
+ 	/* the struct before drm_rocket_job.core was added is still accepted */
+ 	if (args->job_struct_size < offsetof(struct drm_rocket_job, core)) {
+ 		drm_dbg(dev, "job_struct_size field in drm_rocket_submit struct is too small.\n");
+-- 
+2.55.0
+

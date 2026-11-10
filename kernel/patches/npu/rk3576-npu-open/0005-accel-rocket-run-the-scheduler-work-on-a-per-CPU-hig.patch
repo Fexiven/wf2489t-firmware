@@ -1,0 +1,92 @@
+From a23af9219c9cb12b013ddc01e5c5d3927f174ed3 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:01:32 +0100
+Subject: [PATCH 05/11] accel/rocket: run the scheduler work on a per-CPU high
+ priority queue
+
+When a job depends on a job of the other core, its fence callback runs
+from the NPU interrupt that completes the dependency and queues the
+scheduler's run-job work. drm_sched queues it on its default submit
+queue, an unbound ordered workqueue, so a kworker has to be woken on
+some other CPU, which on RK3576 is often in a deep idle state (exit
+latency 370 us) or at a low clock. A job trace showed the scheduler work
+item costing about 20 us per job, and every job whose dependency had
+just finished waited 50-130 us before it started on the NPU.
+
+Give each core's scheduler its own high priority, per-CPU submit
+workqueue, as nouveau does. The run-job work for a job whose dependency
+was just signalled then runs right after the interrupt, on the CPU that
+took it. drm_sched does not need an ordered submit queue.
+
+Tested on RK3576S with Mesa splitting layers over both cores: together
+with routing the NPU interrupt to the submitting CPU (next patch), a job
+whose dependency just finished starts after about 20 us instead of
+50-130 us. The 10 test models give byte-identical results.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_core.h |  1 +
+ drivers/accel/rocket/rocket_job.c  | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index ad6c37c8e..91faf3e36 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -77,6 +77,7 @@ struct rocket_core {
+ 	} reset;
+ 
+ 	struct drm_gpu_scheduler sched;
++	struct workqueue_struct *submit_wq;
+ 	u64 fence_context;
+ 	u64 emit_seqno;
+ };
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 8b1c9aeda..a313cad75 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -636,6 +636,24 @@ int rocket_job_init(struct rocket_core *core)
+ 	core->fence_context = dma_fence_context_alloc(1);
+ 
+ 	args.timeout_wq = core->reset.wq;
++
++	/*
++	 * A high priority submit queue, bound to the CPU that queues the
++	 * work: the next job of a core waits for this work item after every
++	 * dependency it has on the other core, and the run-job work for a job
++	 * whose dependency was just signalled from the NPU interrupt then runs
++	 * right after it on the CPU that took the interrupt, instead of waking
++	 * an unbound worker on another, possibly idle, CPU. drm_sched does not
++	 * need an ordered queue.
++	 */
++	core->submit_wq = alloc_workqueue("rocket-submit-%d",
++					  WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_PERCPU,
++					  0, core->index);
++	if (!core->submit_wq) {
++		ret = -ENOMEM;
++		goto err_sched;
++	}
++	args.submit_wq = core->submit_wq;
+ 	ret = drm_sched_init(&core->sched, &args);
+ 	if (ret) {
+ 		dev_err(core->dev, "Failed to create scheduler: %d.", ret);
+@@ -645,6 +663,8 @@ int rocket_job_init(struct rocket_core *core)
+ 	return 0;
+ 
+ err_sched:
++	if (core->submit_wq)
++		destroy_workqueue(core->submit_wq);
+ 	destroy_workqueue(core->reset.wq);
+ 	return ret;
+ }
+@@ -658,6 +678,7 @@ void rocket_job_fini(struct rocket_core *core)
+ 
+ 	cancel_work_sync(&core->reset.work);
+ 	destroy_workqueue(core->reset.wq);
++	destroy_workqueue(core->submit_wq);
+ }
+ 
+ int rocket_job_open(struct rocket_file_priv *rocket_priv)
+-- 
+2.55.0
+

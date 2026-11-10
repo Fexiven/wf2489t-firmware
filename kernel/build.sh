@@ -1,6 +1,7 @@
 #!/bin/sh
 # Mainline kernel for the WF2489T as Debian packages (runs in the build container).
-# arm64 defconfig + kernel/config.fragment, board DTS from dts/, kernel/patches/*.
+# arm64 defconfig + kernel/config.fragment, board DTS from dts/, kernel/patches/*
+# and the NPU patches (kernel/patches/npu/, until they are upstream).
 # Output: out/kernel/linux-image-*.deb, linux-headers-*.deb, the Wi-Fi driver
 # and linux-image-wf2489t (depends on both, so apt upgrade gets new kernels).
 # Version: date of the last commit that changed kernel/ or dts/.
@@ -20,7 +21,9 @@ fi
 git -C $SRC checkout -q --detach $COMMIT
 git -C $SRC reset -q --hard
 git -C $SRC clean -q -fdx
-for p in kernel/patches/*.patch; do [ -e "$p" ] || continue; git -C $SRC apply "$PWD/$p"; done
+for p in kernel/patches/*.patch kernel/patches/npu/v16/*.patch kernel/patches/npu/rk3576-npu-open/*.patch; do
+	[ -e "$p" ] || continue; git -C $SRC apply "$PWD/$p"
+done
 cp dts/rk3576s-wf2489t.dtsi dts/rk3576s-wf2489t.dts $SRC/arch/arm64/boot/dts/rockchip/
 echo 'dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576s-wf2489t.dtb' >> $SRC/arch/arm64/boot/dts/rockchip/Makefile
 

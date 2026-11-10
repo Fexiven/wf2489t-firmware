@@ -1,0 +1,219 @@
+From f0c207ff139baa58ca152c1666dc0cd411098306 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:21:42 +0100
+Subject: [PATCH 02/11] accel/rocket: let userspace pin a job to one core
+
+All jobs of a DRM file go through one scheduler entity, and an entity
+runs its jobs in order on one core at a time (drm_sched_entity_select_rq()
+only moves it when it is idle). One process can therefore never keep two
+NPU cores busy, even when it submits independent jobs.
+
+The RK3576 vendor runtime splits large layers over both cores: each core
+computes part of the output rows, with its own placement in the
+convolution buffer (CBUF) that the two cores share. To do the same,
+userspace has to choose the core a job runs on.
+
+Add drm_rocket_job.core (0: any core, as before; N: core N - 1), backed
+by one more entity per core and file, and DRM_ROCKET_PARAM_NUM_CORES to
+discover the number of cores. The submit ioctl keeps accepting the
+previous, shorter struct drm_rocket_job.
+
+Tested on RK3576S with Mesa splitting layers over both cores: the jobs of
+one process run on both cores at the same time.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_drv.c |  4 +++
+ drivers/accel/rocket/rocket_drv.h |  4 +++
+ drivers/accel/rocket/rocket_job.c | 52 ++++++++++++++++++++++++++++---
+ include/uapi/drm/rocket_accel.h   | 17 ++++++++++
+ 4 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index c094f6843..3bb95bf46 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -135,6 +135,7 @@ rocket_ioctl_get_param(struct drm_device *dev, void *data, struct drm_file *file
+ {
+ 	struct rocket_device *rdev = to_rocket_device(dev);
+ 	struct drm_rocket_get_param *args = data;
++	struct rocket_file_priv *rocket_priv = file->driver_priv;
+ 	const struct rocket_soc_data *soc;
+ 
+ 	if (args->reserved != 0) {
+@@ -150,6 +151,9 @@ rocket_ioctl_get_param(struct drm_device *dev, void *data, struct drm_file *file
+ 	case DRM_ROCKET_PARAM_HW_VERSION:
+ 		args->value = soc->hw_version;
+ 		return 0;
++	case DRM_ROCKET_PARAM_NUM_CORES:
++		args->value = rocket_priv->num_core_entities;
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/accel/rocket/rocket_drv.h b/drivers/accel/rocket/rocket_drv.h
+index 0cd692a66..c12711ee9 100644
+--- a/drivers/accel/rocket/rocket_drv.h
++++ b/drivers/accel/rocket/rocket_drv.h
+@@ -26,6 +26,10 @@ struct rocket_file_priv {
+ 	struct mutex mm_lock;
+ 
+ 	struct drm_sched_entity sched_entity;
++
++	/* one entity per core, for jobs pinned with drm_rocket_job.core */
++	struct drm_sched_entity *core_entities;
++	unsigned int num_core_entities;
+ };
+ 
+ struct rocket_iommu_domain *rocket_iommu_domain_get(struct rocket_file_priv *rocket_priv);
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index a68ca5585..91c9187c4 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -661,12 +661,47 @@ int rocket_job_open(struct rocket_file_priv *rocket_priv)
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
++	/*
++	 * One more entity per core, each bound to that core's scheduler only,
++	 * for jobs pinned with drm_rocket_job.core. The shared entity above
++	 * runs its jobs in order on one core at a time, so it can never keep
++	 * two cores busy for one file.
++	 */
++	rocket_priv->core_entities = kzalloc_objs(*rocket_priv->core_entities,
++						  rdev->num_cores);
++	if (!rocket_priv->core_entities)
++		goto err_destroy;
++
++	for (core = 0; core < rdev->num_cores; core++) {
++		ret = drm_sched_entity_init(&rocket_priv->core_entities[core],
++					    DRM_SCHED_PRIORITY_NORMAL,
++					    &scheds[core], 1, NULL);
++		if (WARN_ON(ret)) {
++			while (core--)
++				drm_sched_entity_destroy(&rocket_priv->core_entities[core]);
++			kfree(rocket_priv->core_entities);
++			rocket_priv->core_entities = NULL;
++			goto err_destroy;
++		}
++	}
++	rocket_priv->num_core_entities = rdev->num_cores;
++
+ 	return 0;
++
++err_destroy:
++	kfree(rocket_priv->sched_entity.sched_list);
++	drm_sched_entity_destroy(&rocket_priv->sched_entity);
++	return ret ? ret : -ENOMEM;
+ }
+ 
+ void rocket_job_close(struct rocket_file_priv *rocket_priv)
+ {
+ 	struct drm_sched_entity *entity = &rocket_priv->sched_entity;
++	unsigned int core;
++
++	for (core = 0; core < rocket_priv->num_core_entities; core++)
++		drm_sched_entity_destroy(&rocket_priv->core_entities[core]);
++	kfree(rocket_priv->core_entities);
+ 
+ 	kfree(entity->sched_list);
+ 	drm_sched_entity_destroy(entity);
+@@ -686,12 +721,19 @@ static int rocket_ioctl_submit_job(struct drm_device *dev, struct drm_file *file
+ {
+ 	struct rocket_device *rdev = to_rocket_device(dev);
+ 	struct rocket_file_priv *file_priv = file->driver_priv;
++	struct drm_sched_entity *entity = &file_priv->sched_entity;
+ 	struct rocket_job *rjob = NULL;
+ 	int ret = 0;
+ 
+ 	if (job->task_count == 0)
+ 		return -EINVAL;
+ 
++	if (job->reserved != 0 || job->core > file_priv->num_core_entities)
++		return -EINVAL;
++
++	if (job->core)
++		entity = &file_priv->core_entities[job->core - 1];
++
+ 	rjob = kzalloc_obj(*rjob);
+ 	if (!rjob)
+ 		return -ENOMEM;
+@@ -701,8 +743,7 @@ static int rocket_ioctl_submit_job(struct drm_device *dev, struct drm_file *file
+ 	rjob->rdev = rdev;
+ 	rjob->domain = rocket_iommu_domain_get(file_priv);
+ 
+-	ret = drm_sched_job_init(&rjob->base,
+-				 &file_priv->sched_entity,
++	ret = drm_sched_job_init(&rjob->base, entity,
+ 				 1, NULL, file->client_id);
+ 	if (ret)
+ 		goto out_put_job;
+@@ -748,7 +789,8 @@ int rocket_ioctl_submit(struct drm_device *dev, void *data, struct drm_file *fil
+ 	if (args->job_count == 0)
+ 		return 0;
+ 
+-	if (args->job_struct_size < sizeof(struct drm_rocket_job)) {
++	/* the struct before drm_rocket_job.core was added is still accepted */
++	if (args->job_struct_size < offsetof(struct drm_rocket_job, core)) {
+ 		drm_dbg(dev, "job_struct_size field in drm_rocket_submit struct is too small.\n");
+ 		return -EINVAL;
+ 	}
+@@ -758,7 +800,7 @@ int rocket_ioctl_submit(struct drm_device *dev, void *data, struct drm_file *fil
+ 		return -EINVAL;
+ 	}
+ 
+-	jobs = kvmalloc_objs(*jobs, args->job_count);
++	jobs = kvzalloc_objs(*jobs, args->job_count);
+ 	if (!jobs) {
+ 		drm_dbg(dev, "Failed to allocate incoming job array\n");
+ 		return -ENOMEM;
+@@ -767,7 +809,7 @@ int rocket_ioctl_submit(struct drm_device *dev, void *data, struct drm_file *fil
+ 	for (i = 0; i < args->job_count; i++) {
+ 		if (copy_from_user(&jobs[i],
+ 				   u64_to_user_ptr(args->jobs) + i * args->job_struct_size,
+-				   sizeof(*jobs))) {
++				   min_t(size_t, args->job_struct_size, sizeof(*jobs)))) {
+ 			ret = -EFAULT;
+ 			drm_dbg(dev, "Failed to copy incoming job array\n");
+ 			goto exit;
+diff --git a/include/uapi/drm/rocket_accel.h b/include/uapi/drm/rocket_accel.h
+index 597bf892c..7fe59be06 100644
+--- a/include/uapi/drm/rocket_accel.h
++++ b/include/uapi/drm/rocket_accel.h
+@@ -157,6 +157,20 @@ struct drm_rocket_job {
+ 	 * (size is that times 4).
+ 	 */
+ 	__u32 out_bo_handle_count;
++
++	/**
++	 * @core: Input: 0 lets the kernel pick the core, as before. N > 0
++	 * runs the job on NPU core N - 1, for userspace that splits one layer
++	 * over several cores and has laid out each part for its core (the
++	 * RK3576's cores share one convolution buffer). Must be at most the
++	 * DRM_ROCKET_PARAM_NUM_CORES value.
++	 */
++	__u32 core;
++
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
++	__u32 reserved;
+ };
+ 
+ /**
+@@ -190,9 +204,12 @@ struct drm_rocket_submit {
+ /**
+  * enum drm_rocket_param - parameters for DRM_IOCTL_ROCKET_GET_PARAM
+  * @DRM_ROCKET_PARAM_HW_VERSION: an enum drm_rocket_hw_version value.
++ * @DRM_ROCKET_PARAM_NUM_CORES: the number of NPU cores a job can be pinned
++ *	to with &drm_rocket_job.core.
+  */
+ enum drm_rocket_param {
+ 	DRM_ROCKET_PARAM_HW_VERSION = 0,
++	DRM_ROCKET_PARAM_NUM_CORES = 1,
+ };
+ 
+ /**
+-- 
+2.55.0
+

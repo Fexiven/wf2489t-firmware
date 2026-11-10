@@ -1,0 +1,166 @@
+From c293a106c0502810e14e064155fbac2f032f7a39 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:55:03 +0100
+Subject: [PATCH 07/11] accel/rocket: do not run jobs of different clients at
+ the same time
+
+The two RK3576 NPU cores share one CBUF, and every client lays out its
+data in it as if it had the NPU to itself. Jobs of two processes that
+run at the same time on the two cores therefore overwrite each other's
+data: with two processes running MobileNetV1, 300 of 300 and 298 of 300
+results were wrong.
+
+Serialise the clients. Under sched_lock the device remembers the client
+that pushed the last jobs and the finished fences of its latest job per
+entity. When another client pushes a job, these fences become a barrier
+that every job of the new client waits for. The jobs of one client still
+run on both cores at the same time; the client keeps its own two-core
+layout apart.
+
+Tested on RK3576S: four processes running different models at the same
+time, two of them on both cores, 0 of 1000 results wrong.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_device.c |  6 +++++
+ drivers/accel/rocket/rocket_device.h | 19 +++++++++++++++
+ drivers/accel/rocket/rocket_job.c    | 35 ++++++++++++++++++++++++++++
+ drivers/accel/rocket/rocket_job.h    |  4 ++++
+ 4 files changed, 64 insertions(+)
+
+diff --git a/drivers/accel/rocket/rocket_device.c b/drivers/accel/rocket/rocket_device.c
+index 624b7a135..0fd0fc775 100644
+--- a/drivers/accel/rocket/rocket_device.c
++++ b/drivers/accel/rocket/rocket_device.c
+@@ -4,6 +4,7 @@
+ #include <drm/drm_drv.h>
+ #include <linux/array_size.h>
+ #include <linux/clk.h>
++#include <linux/dma-fence.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+@@ -60,5 +61,10 @@ void rocket_device_fini(struct rocket_device *rdev)
+ {
+ 	WARN_ON(rdev->num_cores > 0);
+ 
++	for (unsigned int i = 0; i < ROCKET_EXCL_SLOTS; i++) {
++		dma_fence_put(rdev->excl_fences[i]);
++		dma_fence_put(rdev->excl_barrier[i]);
++	}
++
+ 	drm_dev_unregister(&rdev->ddev);
+ }
+diff --git a/drivers/accel/rocket/rocket_device.h b/drivers/accel/rocket/rocket_device.h
+index 64a3a022a..00d7936f8 100644
+--- a/drivers/accel/rocket/rocket_device.h
++++ b/drivers/accel/rocket/rocket_device.h
+@@ -12,11 +12,30 @@
+ 
+ #include "rocket_core.h"
+ 
++struct rocket_file_priv;
++
++/* Per client: one fence slot per core (up to three) and one for the shared entity */
++#define ROCKET_EXCL_SLOTS 4
++
+ struct rocket_device {
+ 	struct drm_device ddev;
+ 
+ 	struct mutex sched_lock;
+ 
++	/*
++	 * The NPU cores of the RK3576 share one CBUF, and each client places
++	 * its data in it as if it had the NPU to itself, so jobs of different
++	 * clients must not run at the same time, even on different cores (two
++	 * processes running a model each corrupt each other's results almost
++	 * every time otherwise). Under sched_lock: the client that pushed the
++	 * last jobs (the owner), the finished fences of its latest job per
++	 * entity (each core's, then the shared one), and the same fences of
++	 * the previous owner, which every job of the owner waits for.
++	 */
++	struct rocket_file_priv *excl_owner;
++	struct dma_fence *excl_fences[ROCKET_EXCL_SLOTS];
++	struct dma_fence *excl_barrier[ROCKET_EXCL_SLOTS];
++
+ 	struct rocket_core *cores;
+ 	unsigned int num_cores;
+ 	unsigned int max_cores;
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index d981c5c39..0597e34b8 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -255,6 +255,32 @@ static int rocket_job_push(struct rocket_job *job)
+ 		if (ret)
+ 			goto err_unlock;
+ 
++		if (rdev->excl_owner != job->file_priv) {
++			/* the previous owner's jobs become the barrier */
++			for (unsigned int i = 0; i < ROCKET_EXCL_SLOTS; i++) {
++				dma_fence_put(rdev->excl_barrier[i]);
++				rdev->excl_barrier[i] = rdev->excl_fences[i];
++				rdev->excl_fences[i] = NULL;
++			}
++			rdev->excl_owner = job->file_priv;
++		}
++		for (unsigned int i = 0; i < ROCKET_EXCL_SLOTS; i++) {
++			struct dma_fence *f = rdev->excl_barrier[i];
++
++			if (!f)
++				continue;
++			if (dma_fence_is_signaled(f)) {
++				dma_fence_put(f);
++				rdev->excl_barrier[i] = NULL;
++				continue;
++			}
++			ret = drm_sched_job_add_dependency(&job->base, dma_fence_get(f));
++			if (ret)
++				goto err_unlock;
++		}
++		dma_fence_put(rdev->excl_fences[job->excl_slot]);
++		rdev->excl_fences[job->excl_slot] = dma_fence_get(job->inference_done_fence);
++
+ 		kref_get(&job->refcount); /* put by scheduler job completion */
+ 
+ 		drm_sched_entity_push_job(&job->base);
+@@ -770,6 +796,11 @@ void rocket_job_close(struct rocket_file_priv *rocket_priv)
+ 	kfree(entity->sched_list);
+ 	drm_sched_entity_destroy(entity);
+ 
++	/* a later client at the same address must still wait for our jobs */
++	scoped_guard(mutex, &rdev->sched_lock)
++		if (rdev->excl_owner == rocket_priv)
++			rdev->excl_owner = NULL;
++
+ 	/*
+ 	 * Do not leave this file's domain attached to an idle core. A job of
+ 	 * this file still on the hardware keeps it; the next job of another
+@@ -825,6 +856,10 @@ static int rocket_ioctl_submit_job(struct drm_device *dev, struct drm_file *file
+ 
+ 	rjob->rdev = rdev;
+ 	rjob->domain = rocket_iommu_domain_get(file_priv);
++	rjob->file_priv = file_priv;
++	rjob->excl_slot = min_t(unsigned int,
++				job->core ? job->core - 1 : rdev->num_cores,
++				ROCKET_EXCL_SLOTS - 1);
+ 
+ 	ret = drm_sched_job_init(&rjob->base, entity,
+ 				 1, NULL, file->client_id);
+diff --git a/drivers/accel/rocket/rocket_job.h b/drivers/accel/rocket/rocket_job.h
+index 4ae00feec..78a0d10df 100644
+--- a/drivers/accel/rocket/rocket_job.h
++++ b/drivers/accel/rocket/rocket_job.h
+@@ -39,6 +39,10 @@ struct rocket_job {
+ 	struct rocket_iommu_domain *domain;
+ 
+ 	struct kref refcount;
++
++	/* the submitting client and its entity slot, see rocket_device.excl_* */
++	struct rocket_file_priv *file_priv;
++	unsigned int excl_slot;
+ };
+ 
+ int rocket_ioctl_submit(struct drm_device *dev, void *data, struct drm_file *file);
+-- 
+2.55.0
+

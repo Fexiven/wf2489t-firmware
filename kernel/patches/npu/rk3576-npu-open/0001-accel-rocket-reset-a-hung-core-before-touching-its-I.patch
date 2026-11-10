@@ -1,0 +1,221 @@
+From 6e665b4bcdcb0ce24802cb7fdca4670ba27bd56c Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:13:06 +0100
+Subject: [PATCH 01/11] accel/rocket: reset a hung core before touching its
+ IOMMU
+
+When a job times out, rocket_reset() moves the core's IOMMU group back to
+its default domain first and pulses the core reset afterwards. The detach
+disables the IOMMU: it enables stall, disables paging and clears the DTE
+address. The core is still hung at that point and can have DMA in flight
+or start new DMA, and a Rockchip IOMMU with paging disabled passes IOVAs
+through as physical addresses. On RK3576 this ends with "rk_iommu ...:
+Error during raw reset. MMU_DTE_ADDR is not functioning" right after "NPU
+job timed out", and the whole SoC freezes shortly afterwards: rocket IOVAs
+start at 0, and the low physical addresses are the SoC's device
+registers.
+
+Recover in the order the vendor driver uses (core reset first, IOMMU
+detach and attach afterwards):
+
+ 1. stop the scheduler and take a runtime PM reference for the whole
+    recovery, so that the core and its IOMMU stay powered,
+ 2. disable the interrupt line, which is shared with the IOMMU, so that
+    neither handler touches the hardware during the reset,
+ 3. mask the core's interrupts, stop the PC and print its state,
+ 4. pulse the core reset with the job's domain still attached, so that
+    a stray access of the hung core is translated or faults,
+ 5. move the group to its default domain: the IOMMU driver disables the
+    (now reset) IOMMU and enables it again from a force reset, with a
+    fresh DTE address,
+ 6. enable the interrupt line again and drop the PM references.
+
+Also:
+ - give the core 10 us after deasserting the reset before the IOMMU is
+   reprogrammed, as the vendor driver does,
+ - do not read core registers from the hard interrupt handler while the
+   core is not runtime active: the line is shared with the IOMMU, which
+   can raise it while the core clocks are off,
+ - use core->iommu_group when a job completes instead of taking a group
+   reference per job that is never put.
+
+Tested on RK3576S: a job that never completes now times out, the core is
+reset and the following jobs run normally; before, the SoC froze.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_core.c |   3 +
+ drivers/accel/rocket/rocket_job.c  | 109 ++++++++++++++++++++++++-----
+ 2 files changed, 94 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.c b/drivers/accel/rocket/rocket_core.c
+index 128ebb4f1..ef2ed0fda 100644
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -116,4 +116,7 @@ void rocket_core_reset(struct rocket_core *core)
+ 	udelay(10);
+ 
+ 	reset_control_bulk_deassert(core->soc->num_resets, core->resets);
++
++	/* Let the core and its IOMMU come out of reset before they are used. */
++	usleep_range(10, 20);
+ }
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index a33c9ea69..a68ca5585 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -389,7 +389,7 @@ static void rocket_job_next_locked(struct rocket_core *core)
+ 		return;
+ 	}
+ 
+-	iommu_detach_group(NULL, iommu_group_get(core->dev));
++	iommu_detach_group(NULL, core->iommu_group);
+ 	dma_fence_signal(core->in_flight_job->done_fence);
+ 	pm_runtime_put_autosuspend(core->dev);
+ 	core->in_flight_job = NULL;
+@@ -412,44 +412,107 @@ static void rocket_job_handle_irq(struct rocket_core *core)
+ 	}
+ }
+ 
++/* The RK3576 PC has its task status at 0x48 instead of 0x3c. */
++#define RK3576_PC_TASK_STATUS	0x48
++
++static void rocket_job_dump_state(struct rocket_core *core)
++{
++	u32 task_status;
++
++	if (core->soc->task_con_16bit)
++		task_status = readl(core->pc_iomem + RK3576_PC_TASK_STATUS);
++	else
++		task_status = rocket_pc_readl(core, TASK_STATUS);
++
++	dev_err(core->dev,
++		"core %u: irq raw %#x status %#x mask %#x, task con %#x status %#x, regcmd %#x\n",
++		core->index,
++		rocket_pc_readl(core, INTERRUPT_RAW_STATUS),
++		rocket_pc_readl(core, INTERRUPT_STATUS),
++		rocket_pc_readl(core, INTERRUPT_MASK),
++		rocket_pc_readl(core, TASK_CON),
++		task_status,
++		rocket_pc_readl(core, BASE_ADDRESS));
++}
++
+ static void
+ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ {
+-	bool put_job_ref;
++	bool put_job_ref, powered;
+ 
+ 	if (!atomic_read(&core->reset.pending))
+ 		return;
+ 
+ 	drm_sched_stop(&core->sched, bad);
+ 
++	/*
++	 * Keep the core powered for the whole recovery: the reset needs the
++	 * core clocks running, and the IOMMU, a runtime PM supplier of the
++	 * core, has to stay powered while it is reprogrammed below. If the
++	 * core cannot be resumed, its power domain is off and nothing runs
++	 * on it; the next power up resets it and its IOMMU anyway.
++	 */
++	powered = pm_runtime_resume_and_get(core->dev) >= 0;
++
++	/*
++	 * The interrupt line is shared with the core's IOMMU. Keep both
++	 * handlers away until the core is out of reset and the IOMMU is
++	 * reprogrammed; this also waits for a running handler to finish.
++	 */
++	disable_irq(core->irq);
++
+ 	scoped_guard(mutex, &core->job_lock) {
+-		if (pm_runtime_get_if_active(core->dev) > 0) {
++		if (powered) {
++			rocket_job_dump_state(core);
+ 			rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
+ 			rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
+-			pm_runtime_put_autosuspend(core->dev);
++			rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
+ 		}
++
++		put_job_ref = core->in_flight_job;
++		core->in_flight_job = NULL;
+ 	}
+ 
+-	synchronize_irq(core->irq);
++	if (powered) {
++		/*
++		 * Reset the core while the job's IOMMU domain is still
++		 * attached. A hung core can still have DMA in flight, or start
++		 * new DMA at any time. Detaching first disables paging, and a
++		 * Rockchip IOMMU with paging disabled passes the core's IOVAs
++		 * through as physical addresses: the core then reads and
++		 * writes random memory and device registers until the reset
++		 * lands, which can take the whole SoC down. With the domain
++		 * attached, a stray access hits the job's own buffers or
++		 * faults. The job's buffers stay mapped until the scheduler
++		 * frees the job, after this function.
++		 */
++		rocket_core_reset(core);
++	}
+ 
+ 	/*
+-	 * Remaining interrupts have been handled, but we might still have
+-	 * stuck jobs. Let's make sure the PM counters stay balanced by
+-	 * dropping the job's reference once the core has been reset.
++	 * On RK3576 the core reset also resets the core's IOMMU, so the
++	 * IOMMU registers no longer match what the IOMMU driver thinks it
++	 * programmed (and where it does not, the IOMMU may be left stalled
++	 * or faulting by the hung job). Moving the group back to its
++	 * default domain disables the IOMMU and enables it again from
++	 * scratch: force reset, DTE address, paging. With the core in reset
++	 * state nothing uses the IOMMU while this happens. The next job
++	 * attaches its own domain the same way.
+ 	 */
+-	scoped_guard(mutex, &core->job_lock) {
+-		put_job_ref = core->in_flight_job;
++	iommu_detach_group(NULL, core->iommu_group);
+ 
+-		iommu_detach_group(NULL, core->iommu_group);
+-
+-		core->in_flight_job = NULL;
+-	}
+-
+-	/* Proceed with reset now. */
+-	rocket_core_reset(core);
++	enable_irq(core->irq);
+ 
++	/*
++	 * Drop the reference of the job we just killed and our own one, now
++	 * that the core has been reset, so the PM counters stay balanced.
++	 */
+ 	if (put_job_ref)
+ 		pm_runtime_put_autosuspend(core->dev);
++	if (powered) {
++		pm_runtime_mark_last_busy(core->dev);
++		pm_runtime_put_autosuspend(core->dev);
++	}
+ 
+ 	/* NPU has been reset, we can clear the reset pending bit. */
+ 	atomic_set(&core->reset.pending, 0);
+@@ -498,7 +561,17 @@ static irqreturn_t rocket_job_irq_handler_thread(int irq, void *data)
+ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ {
+ 	struct rocket_core *core = data;
+-	u32 raw_status = rocket_pc_readl(core, INTERRUPT_RAW_STATUS);
++	u32 raw_status;
++
++	/*
++	 * The line is shared with the core's IOMMU, which can raise it while
++	 * the core is suspending or resuming, with its clocks off. Reading a
++	 * core register then stalls the bus.
++	 */
++	if (!pm_runtime_active(core->dev))
++		return IRQ_NONE;
++
++	raw_status = rocket_pc_readl(core, INTERRUPT_RAW_STATUS);
+ 
+ 	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_READ_ERROR);
+ 	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_WRITE_ERROR);
+-- 
+2.55.0
+

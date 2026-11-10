@@ -1,0 +1,182 @@
+From 0e64435b1f904921cc14454109b72e3ea8508e2d Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:00:36 +0100
+Subject: [PATCH 03/11] accel/rocket: keep the IOMMU domain attached between
+ jobs
+
+Every job attaches its client's IOMMU domain to the core before it runs
+and detaches it again when it completes. On RK3576 the detach turns
+paging off, and the attach does a force reset, writes the DTE address
+and zaps the TLB. A job trace of MobileNetV2 showed this pair costing
+about 25 us per job, out of about 50 us of overhead per job, while a
+task of that model runs only about 47 us on the NPU. Consecutive jobs
+almost always come from the same client, so the pair is mostly wasted.
+
+Keep the domain attached to the core after the job completes, and only
+switch it when a job of another client comes. The core holds a reference
+on the attached domain. It is dropped:
+
+ - on a core reset, which already moves the group back to its default
+   domain because the core reset also resets the IOMMU;
+ - when its client closes and no job of that client is on the core;
+ - when the core is removed.
+
+The Rockchip IOMMU driver restores an attached domain on runtime resume,
+so the domain may stay attached while the core is suspended.
+
+Tested on RK3576S: the 10 test models give byte-identical results, and
+several processes on both cores give no wrong results.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/rocket/rocket_core.h | 11 ++++++
+ drivers/accel/rocket/rocket_job.c  | 55 ++++++++++++++++++++++++++++--
+ 2 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index 13d962467..fd93dfac1 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -10,6 +10,8 @@
+ #include <linux/mutex_types.h>
+ #include <linux/reset.h>
+ 
++struct rocket_iommu_domain;
++
+ #include "rocket_registers.h"
+ 
+ #define rocket_pc_readl(core, reg) \
+@@ -52,6 +54,15 @@ struct rocket_core {
+ 	struct mutex job_lock;
+ 	struct rocket_job *in_flight_job;
+ 
++	/*
++	 * The IOMMU domain attached to this core. It stays attached after a
++	 * job, so that consecutive jobs of the same client skip the IOMMU
++	 * detach (paging off) and attach (force reset, DTE, zap) pairs. Holds
++	 * a reference on the domain.
++	 */
++	struct rocket_iommu_domain *attached;
++	struct mutex attach_lock; /* protects attached */
++
+ 	spinlock_t fence_lock;
+ 
+ 	struct {
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 91c9187c4..9a35bf3b5 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -327,6 +327,16 @@ static struct rocket_core *sched_to_core(struct rocket_device *rdev,
+ 	return NULL;
+ }
+ 
++/* attach_lock held: drop the domain kept attached to the core (rocket_job_run) */
++static void rocket_core_detach_domain(struct rocket_core *core)
++{
++	if (!core->attached)
++		return;
++	iommu_detach_group(NULL, core->iommu_group);
++	rocket_iommu_domain_put(core->attached);
++	core->attached = NULL;
++}
++
+ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ {
+ 	struct rocket_job *job = to_rocket_job(sched_job);
+@@ -357,7 +367,17 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 	if (ret < 0)
+ 		goto err_put_fences;
+ 
+-	ret = iommu_attach_group(job->domain->domain, core->iommu_group);
++	scoped_guard(mutex, &core->attach_lock) {
++		if (core->attached != job->domain) {
++			rocket_core_detach_domain(core);
++			ret = iommu_attach_group(job->domain->domain,
++						 core->iommu_group);
++			if (ret >= 0) {
++				kref_get(&job->domain->kref);
++				core->attached = job->domain;
++			}
++		}
++	}
+ 	if (ret < 0)
+ 		goto err_put_pm;
+ 
+@@ -389,7 +409,6 @@ static void rocket_job_next_locked(struct rocket_core *core)
+ 		return;
+ 	}
+ 
+-	iommu_detach_group(NULL, core->iommu_group);
+ 	dma_fence_signal(core->in_flight_job->done_fence);
+ 	pm_runtime_put_autosuspend(core->dev);
+ 	core->in_flight_job = NULL;
+@@ -499,7 +518,13 @@ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ 	 * state nothing uses the IOMMU while this happens. The next job
+ 	 * attaches its own domain the same way.
+ 	 */
+-	iommu_detach_group(NULL, core->iommu_group);
++	scoped_guard(mutex, &core->attach_lock) {
++		iommu_detach_group(NULL, core->iommu_group);
++		if (core->attached) {
++			rocket_iommu_domain_put(core->attached);
++			core->attached = NULL;
++		}
++	}
+ 
+ 	enable_irq(core->irq);
+ 
+@@ -600,6 +625,7 @@ int rocket_job_init(struct rocket_core *core)
+ 	INIT_WORK(&core->reset.work, rocket_reset_work);
+ 	spin_lock_init(&core->fence_lock);
+ 	mutex_init(&core->job_lock);
++	mutex_init(&core->attach_lock);
+ 
+ 	core->irq = platform_get_irq(to_platform_device(core->dev), 0);
+ 	if (core->irq < 0)
+@@ -637,6 +663,9 @@ int rocket_job_init(struct rocket_core *core)
+ 
+ void rocket_job_fini(struct rocket_core *core)
+ {
++	scoped_guard(mutex, &core->attach_lock)
++		rocket_core_detach_domain(core);
++
+ 	drm_sched_fini(&core->sched);
+ 
+ 	cancel_work_sync(&core->reset.work);
+@@ -696,6 +725,7 @@ int rocket_job_open(struct rocket_file_priv *rocket_priv)
+ 
+ void rocket_job_close(struct rocket_file_priv *rocket_priv)
+ {
++	struct rocket_device *rdev = rocket_priv->rdev;
+ 	struct drm_sched_entity *entity = &rocket_priv->sched_entity;
+ 	unsigned int core;
+ 
+@@ -705,6 +735,25 @@ void rocket_job_close(struct rocket_file_priv *rocket_priv)
+ 
+ 	kfree(entity->sched_list);
+ 	drm_sched_entity_destroy(entity);
++
++	/*
++	 * Do not leave this file's domain attached to an idle core. A job of
++	 * this file still on the hardware keeps it; the next job of another
++	 * file replaces it then.
++	 */
++	for (core = 0; core < rdev->num_cores; core++) {
++		struct rocket_core *rcore = &rdev->cores[core];
++		bool busy;
++
++		guard(mutex)(&rcore->attach_lock);
++		if (rcore->attached != rocket_priv->domain)
++			continue;
++		scoped_guard(mutex, &rcore->job_lock)
++			busy = rcore->in_flight_job &&
++			       rcore->in_flight_job->domain == rocket_priv->domain;
++		if (!busy)
++			rocket_core_detach_domain(rcore);
++	}
+ }
+ 
+ int rocket_job_is_idle(struct rocket_core *core)
+-- 
+2.55.0
+
