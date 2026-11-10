@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:58:11 +0100
+Subject: [PATCH 22/23] rocket: rk3576: 2x - 1 RESIZE_NEAREST_NEIGHBOR
+
+EfficientDet-Lite upsamples its 3x3 level to 5x5 in each of its three
+BiFPN layers. Only exact 2x resizes ran on the NPU, so the three 3 -> 5
+resizes cut the network into four NPU partitions.
+
+With the asymmetric floor mapping, output pixel x of an out = 2 * in - 1
+resize reads input x * in / out = x / 2, as in the 2x resize: it is the
+2x resize without its last row and column. It runs as the 2x resize into
+an internal tensor followed by DPU copy tasks, one per row and
+16-channel group, that copy the top-left out x out pixels into the
+output. The copy task is the one rknn-toolkit2 emits for concatenation
+inputs (rkt_ops_copy_emit). Its RDMA reads contiguously; the RK3588 line
+notch field (0x5048) and a surface notch (0x504c) over several groups
+had no effect, hence one task per row and group (20 tasks of a few
+microseconds for 3 -> 5 with 64 channels).
+
+EfficientDet-Lite0: 4 -> 1 NPU partitions, 26.8 -> 25.7 ms, outputs
+byte-identical; conv -> resize -> ADD test models for 3 -> 5, 5 -> 9,
+7 -> 13 and 10 -> 19 with 16 to 64 channels are within one step of the
+CPU in one- and two-core mode and without batching.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c     |  75 ++++++++++++++-
+ src/gallium/drivers/rocket/rkt_ops.h    | 119 ++++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_regcmd.c |  12 ++-
+ 3 files changed, 201 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index fc8e5e9..40f4f34 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -767,6 +767,12 @@ rkt_ops_pool_supported(struct rkt_screen *screen,
+    return true;
+ }
+ 
++/*
++ * 2x, or 2x - 1 (EfficientDet-Lite's 3 -> 5): with the asymmetric floor
++ * mapping output pixel x reads input x * in / out, which for
++ * out = 2 * in - 1 is x / 2 as well, so that resize is the 2x one without
++ * its last row and column (lower_resize_crop_rk3576).
++ */
+ static bool
+ rkt_ops_resize_supported(const struct pipe_ml_operation *operation)
+ {
+@@ -776,7 +782,9 @@ rkt_ops_resize_supported(const struct pipe_ml_operation *operation)
+    /* align_corners and half_pixel_centers: rkt_ml_operation_supported() */
+    if (!rkt_ops_io_ok(operation))
+       return false;
+-   return o->dims[1] == 2 * i->dims[1] && o->dims[1] <= 128;
++   return (o->dims[1] == 2 * i->dims[1] ||
++           (o->dims[1] == 2 * i->dims[1] - 1 && i->dims[1] >= 2)) &&
++          o->dims[1] <= 128;
+ }
+ 
+ static void
+@@ -839,6 +847,50 @@ lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
+    }
+ }
+ 
++/*
++ * A 2x - 1 resize (rkt_ops_resize_supported): the 2x resize writes into a
++ * new internal tensor, and crop, DPU copy tasks of one row of one
++ * 16-channel group each (rkt_ops_copy_emit), copies the top-left out x out
++ * pixels to the real output. 3 -> 5 with 64 channels: 4 + 1 resize tasks
++ * and 20 copy tasks of a few microseconds.
++ */
++static void
++lower_resize_crop_rk3576(struct rkt_ml_subgraph *subgraph,
++                         struct rkt_operation *resize,
++                         struct rkt_operation *crop)
++{
++   unsigned full = 2 * resize->ops.in_w;
++   unsigned idx =
++      util_dynarray_num_elements(&subgraph->tensors, struct pipe_resource *);
++
++   util_dynarray_append(&subgraph->tensors, struct pipe_resource *, NULL);
++
++   util_dynarray_init(&crop->tasks, NULL);
++   crop->soc = resize->soc;
++   crop->cbuf_banks = resize->cbuf_banks;
++   crop->cbuf_entries_per_bank = resize->cbuf_entries_per_bank;
++   crop->cbuf_bank_size = resize->cbuf_bank_size;
++   crop->add_tensor = -1;
++   crop->input_index = idx;
++   crop->input_width = crop->input_height = full;
++   crop->input_channels = resize->output_channels;
++   crop->input_zero_point = resize->output_zero_point;
++   crop->input_scale = resize->output_scale;
++   crop->output_index = resize->output_index;
++   crop->output_width = resize->output_width;
++   crop->output_height = resize->output_height;
++   crop->output_channels = resize->output_channels;
++   crop->output_zero_point = resize->output_zero_point;
++   crop->output_scale = resize->output_scale;
++   crop->ops = resize->ops;
++   crop->ops.kind = RKT_OPS_COPY;
++   crop->ops.in_w = crop->ops.in_h = full;
++
++   resize->output_index = idx;
++   resize->output_width = resize->output_height = full;
++   resize->ops.out_w = resize->ops.out_h = full;
++}
++
+ /*
+  * A concatenation whose inputs do not all start at a multiple of 16
+  * channels (except the last), such as YOLOX's 4 + 1 + 80 channel heads.
+@@ -1734,12 +1786,21 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          break;
+       }
+       case PIPE_ML_OPERATION_TYPE_POOLING:
+-      case PIPE_ML_OPERATION_TYPE_RESIZE:
++      case PIPE_ML_OPERATION_TYPE_RESIZE: {
+          /* rkt_ops.h */
++         struct rkt_operation crop = {0};
+          lower_ops_rk3576(subgraph, &poperations[i], &operation);
++         bool cropped = operation.ops.kind == RKT_OPS_RESIZE &&
++                        operation.ops.out_w != 2 * operation.ops.in_w;
++         if (cropped)
++            lower_resize_crop_rk3576(subgraph, &operation, &crop);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+                               operation);
++         if (cropped)
++            util_dynarray_append(&subgraph->operations, struct rkt_operation,
++                                 crop);
+          break;
++      }
+       default:
+          DBG("poperation->type %d\n", poperations[i].type);
+          UNREACHABLE("Unsupported ML operation type");
+@@ -1845,9 +1906,15 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          /* zero copy, nothing to run */
+          continue;
+       } else if (operation->ops.kind != RKT_OPS_NONE) {
+-         /* PPU pool = one task; 2x resize = one task per group */
++         /*
++          * PPU pool = one task; 2x resize = one task per group and the
++          * flush task; crop copy = one task per row and group
++          */
+          unsigned n = operation->ops.kind == RKT_OPS_RESIZE
+-                         ? operation->ops.groups + 1 : 1;
++                         ? operation->ops.groups + 1
++                         : operation->ops.kind == RKT_OPS_COPY
++                         ? operation->output_height * operation->ops.groups
++                         : 1;
+          for (unsigned t = 0; t < n; t++) {
+             struct split_task task = {0};
+             task.num = t;
+diff --git a/src/gallium/drivers/rocket/rkt_ops.h b/src/gallium/drivers/rocket/rkt_ops.h
+index 71daa07..c366102 100644
+--- a/src/gallium/drivers/rocket/rkt_ops.h
++++ b/src/gallium/drivers/rocket/rkt_ops.h
+@@ -8,6 +8,8 @@
+  *   MAX_POOL_2D              one PPU + PPU RDMA task (enable mask 0x60)
+  *   RESIZE_NEAREST_NEIGHBOR  2x: one DPU + DPU RDMA task per 16-channel group
+  *                            (enable mask 0x18, EW bypass, DPU upsample mode)
++ *   copy                     DPU + DPU RDMA (enable mask 0x18), as the
++ *                            vendor copies CONCATENATION inputs
+  *
+  * The register values are reproduced from the vendor's .rknn for
+  * maxpool 40/20/10/5 x 64/32/128/24/8 ch, 3x3 s2, 2x2 s2, 5x5 s1, 3x3 s1 and
+@@ -43,6 +45,11 @@ enum rkt_ops_kind {
+     * producers write straight into the concat output. No tasks.
+     */
+    RKT_OPS_CONCAT,
++   /*
++    * DPU copy of the top-left out_w x out_h pixels of an in_w x in_h
++    * tensor (the crop of a 2x - 1 resize), one task per row and group
++    */
++   RKT_OPS_COPY,
+ };
+ 
+ struct rkt_ops_params {
+@@ -242,4 +249,116 @@ rkt_ops_resize_emit(const struct rkt_ops_params *p, uint64_t *out)
+    return n;
+ }
+ 
++/*
++ * DPU copy of one 16-channel group, w x h pixels, from in_addr to
++ * out_addr: the task rknn-toolkit2 emits for every CONCATENATION input
++ * (concat 20x20 24 + 40: enable mask 0x18, the resize stream without the
++ * upsample words, 0x401c = the output plane). The RDMA reads the w * h
++ * pixels contiguously (its line notch, 0x5048 [31:19] on RK3588, had no
++ * effect), so a crop takes one task per row.
++ */
++struct rkt_ops_copy {
++   unsigned w, h, out_plane;
++   uint32_t in_addr, out_addr;
++};
++
++static inline unsigned
++rkt_ops_copy_emit(const struct rkt_ops_copy *p, uint64_t *out)
++{
++   unsigned n = 0;
++   unsigned w = p->w, h = p->h, c = 16;
++   uint32_t open = RKT_OPS_OPEN;
++
++#define R_DPU(reg, val)  out[n++] = rkt_ew_word(0x1001, (reg), (uint32_t)(val))
++#define R_RDMA(reg, val) out[n++] = rkt_ew_word(0x2001, (reg), (uint32_t)(val))
++
++   R_DPU(0x4004, 0x0000000e);
++   R_RDMA(0x5004, 0x0000000e);
++
++   R_DPU(0x400c, 0x00000005);
++   R_DPU(0x4010, 0x00000000);
++   R_DPU(0x4014, 0x00000000);
++   R_DPU(0x4018, p->out_addr);
++   R_DPU(0x401c, p->out_plane);
++   R_DPU(0x4020, w - 1);
++   R_DPU(0x4024, h - 1);
++   R_DPU(0x4028, 0x00000000);
++   R_DPU(0x402c, c - 1);
++   R_DPU(0x4030, ((c - 1) << 16) | 0x0f00);
++   R_DPU(0x4034, ((h - 1) << 16) | (w - 1));
++   R_DPU(0x4038, 0x00000053);
++   R_DPU(0x403c, 0x00000000);
++   R_DPU(0x4044, 0x00000002);
++   R_DPU(0x4048, 0x80000000);
++   R_DPU(0x404c, 0x7fffffff);
++   R_DPU(0x4050, 0x00020000);
++   R_DPU(0x4058, 0x80000000);
++   R_DPU(0x405c, 0x7fffffff);
++   R_DPU(0x4060, 0x00000903);
++   R_DPU(0x406c, 0x80000000);
++   R_DPU(0x4070, 0x7fffffff);
++   R_DPU(0x4074, 0x80000000);
++   R_DPU(0x4078, 0x7fffffff);
++   R_DPU(0x407c, 0x010041c1);          /* EW_CFG: bypass */
++   R_DPU(0x4080, 0x00000000);
++   R_DPU(0x4084, 0x00000001);
++   R_DPU(0x4088, 0x80000000);
++   R_DPU(0x408c, 0x7fffffff);
++   R_DPU(0x4090, 0x00000000);
++   R_DPU(0x4094, 0x00000000);
++   R_DPU(0x409c, 0x00000000);
++   R_DPU(0x40a4, 0x80000000);
++   R_DPU(0x40a8, 0x7fffffff);
++   R_DPU(0x40ac, 0x00000000);
++   R_DPU(0x40b0, 0x00010001);          /* OUT_CVT: identity */
++   R_DPU(0x40b4, 0x00000000);
++   R_DPU(0x40b8, 0x00000000);
++   R_DPU(0x40bc, 0x00000000);
++   R_DPU(0x40c0, 0x04440000);
++   R_DPU(0x40c8, 0x00000000);
++   R_DPU(0x40cc, 0x00000000);
++   R_DPU(0x40d0, 0x0040ffff);
++   for (uint32_t r = 0x4100; r <= 0x4120; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4130, 0x00000000);
++   for (uint32_t r = 0x4140; r <= 0x4154; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4160, 0x00000000);
++   R_DPU(0x4170, 0x00000000);
++   R_DPU(0x4174, 0x00000000);
++   R_DPU(0x4184, 0x00000000);
++   R_DPU(0x4188, 0x00000000);
++   R_DPU(0x418c, 0x00000000);
++   R_DPU(0x4190, 0x00000000);
++   R_DPU(0x4194, 0x00000000);
++
++   R_RDMA(0x500c, w - 1);
++   R_RDMA(0x5010, h - 1);
++   R_RDMA(0x5014, c - 1);
++   R_RDMA(0x5018, p->in_addr);
++   R_RDMA(0x501c, 0x00000000);
++   R_RDMA(0x5020, 0x00000000);
++   R_RDMA(0x5024, 0x00000000);
++   R_RDMA(0x5028, 0x00000000);
++   R_RDMA(0x502c, 0x00000000);
++   R_RDMA(0x5030, 0x00000000);
++   R_RDMA(0x5034, 0x00000001);
++   R_RDMA(0x5038, 0x00000000);
++   R_RDMA(0x5040, 0x00000000);
++   R_RDMA(0x5044, 0x00000009);
++   R_RDMA(0x5048, 0x00000000);
++   R_RDMA(0x504c, 0x00000000);
++   R_RDMA(0x5064, 0x00000000);
++   R_RDMA(0x506c, 0x00000000);
++   R_RDMA(0x5078, 0x00000000);
++   R_RDMA(0x507c, 0x00000000);
++
++   R_DPU(0x4008, open);
++   R_RDMA(0x5008, open);
++
++#undef R_DPU
++#undef R_RDMA
++   return n;
++}
++
+ #endif /* RKT_OPS_H */
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 836727e..6666e7f 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -2309,7 +2309,17 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+             util_dynarray_append(regs, uint64_t, words[i]);
+          return;
+       }
+-      if (p.kind == RKT_OPS_RESIZE) {
++      if (p.kind == RKT_OPS_COPY) {
++         /* task_num = output row * groups + 16-channel group */
++         unsigned g = task_num % p.groups, r = task_num / p.groups;
++         struct rkt_ops_copy c = {
++            .w = p.out_w, .h = 1,
++            .out_plane = p.out_w * p.out_h,
++            .in_addr = p.in_addr + (g * p.in_h + r) * p.in_w * 16,
++            .out_addr = p.out_addr + (g * p.out_h + r) * p.out_w * 16,
++         };
++         n = rkt_ops_copy_emit(&c, words);
++      } else if (p.kind == RKT_OPS_RESIZE) {
+          /* task_num = 16-channel group, tight planes */
+          p.in_addr += task_num * p.in_w * p.in_h * 16;
+          p.out_addr += task_num * p.out_w * p.out_h * 16;
+-- 
+2.55.0
+

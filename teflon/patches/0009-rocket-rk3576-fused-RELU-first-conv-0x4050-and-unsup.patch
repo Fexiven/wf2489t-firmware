@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:32 +0100
+Subject: [PATCH 09/23] rocket: rk3576: fused RELU, first-conv 0x4050 and
+ unsupported small-channel convs
+
+ - Fused RELU / RELU6: rocket programmed no activation and relied on the
+   output range, which only holds when the output zero point is the
+   type's minimum. A tensor that shares its quantisation with another one
+   (a CONCATENATION input) has the zero point inside the range, and the
+   negative half came out unclamped. Use the vendor's DPU BN stage RELU
+   (0x4060 = 0x902, lower bounds 0) with the output lift 0 so that the
+   clamp sits at a real 0.
+ - First conv 0x4050: bit 8 follows the parity of the 16-channel output
+   groups, as on the regular path. The encoder had one fixed word per
+   bias mode, so every first conv of the other parity came back flat
+   (<= 16 outputs, and int8 per-tensor with 17..32 outputs).
+ - Convolutions with <= 4 input channels that the first-conv encoder does
+   not cover (1x1, 2 or 4 channels, ...) would read first-conv buffers
+   with the generic encoder; leave them to the CPU.
+
+Checked with a generated sweep of 894 small models (input conv shapes,
+concatenation inputs, kernels 3/5/7, stride 1/2): 892 within one step of
+TFLite, the other two at rounding level.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_coefs.c  | 10 +++---
+ src/gallium/drivers/rocket/rkt_ml.c     | 25 ++++++++++++++
+ src/gallium/drivers/rocket/rkt_ml.h     | 33 +++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_regcmd.c | 43 +++++++++++++++++++------
+ 4 files changed, 98 insertions(+), 13 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index 3a4303d..b2e4b11 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -1109,8 +1109,9 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+                                    : poperation->conv.weight_tensor->scale;
+                   float out_sc = poperation->output_tensors[0]->scale;
+                   float mult = in_sc * wt_sc / out_sc;
+-                  float lift = (float)rkt_out_lift(
+-                     poperation->output_tensors[0]->zero_point);
++                  float lift = (float)rkt_out_lift_act(
++                     poperation->output_tensors[0]->zero_point,
++                     poperation->conv.relu);
+                   /*
+                    * The offset takes the LIFT back out and knows nothing about
+                    * the rounding term, which is the point: one is compensated
+@@ -1234,8 +1235,9 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+                 * agree, 128 is right and 0 reproduces today's floor; if they do
+                 * not, the response across a sweep says by how much.
+                 */
+-               float lift = (float)rkt_out_lift(
+-                  poperation->output_tensors[0]->zero_point);
++               float lift = (float)rkt_out_lift_act(
++                  poperation->output_tensors[0]->zero_point,
++                  poperation->conv.relu);
+                /*
+                 * The offset takes the LIFT back out and knows nothing about
+                 * the rounding term, which is the point: one is compensated and
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 0eddf4b..eb8cb46 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -404,6 +404,7 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+    operation->cbuf_bank_size = screen->cbuf_bank_size;
+ 
+    operation->depthwise = rkt_is_depthwise(poperation);
++   operation->relu = poperation->conv.relu;
+    operation->padding_same = poperation->conv.padding_same;
+    operation->stride = poperation->conv.stride_x;
+ 
+@@ -689,6 +690,30 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+           operation->conv.dilation_height_factor == 1)
+          supported = true;
+ 
++      /*
++       * on RK3576 every non-depthwise convolution with <= 4 input
++       * channels reads the tight NHWC first-conv input (rkt_ml_subgraph_create,
++       * rkt_ml_subgraph_invoke) and packs the first-conv weights
++       * (rkt_fill_weights), but only the shapes rkt_rk3576_firstconv() accepts
++       * get the first-conv encoder; the others (any 1x1, 2 or 4 channels, ...)
++       * ran the generic encoder over that data and came out as noise. Give
++       * them to the CPU.
++       */
++      if (supported && rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
++          !rkt_is_depthwise(operation) && input_tensor->dims[3] <= 4) {
++         struct rkt_operation fc = {
++            .soc = RKT_SOC_RK3576,
++            .input_channels = input_tensor->dims[3],
++            .input_width = input_tensor->dims[1],
++            .output_channels = output_tensor->dims[3],
++            .weights_width = weight_tensor->dims[1],
++            .weights_height = weight_tensor->dims[2],
++            .stride = operation->conv.stride_x,
++         };
++         supported = operation->conv.stride_x == operation->conv.stride_y &&
++                     rkt_rk3576_firstconv(&fc);
++      }
++
+       break;
+    }
+    case PIPE_ML_OPERATION_TYPE_ADD:
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 34038af..2d67b23 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -132,6 +132,8 @@ struct rkt_operation {
+    /* the activation input is a signed int8 tensor (int8 on) */
+    bool in_signed;
+    bool depthwise;
++   /* fused RELU / RELU6 (rkt_out_lift_act) */
++   bool relu;
+    bool reuse_weights_cbuf;
+    unsigned truncate_bits;
+    bool padding_same;
+@@ -470,6 +472,37 @@ rkt_out_lift(int32_t output_zero_point)
+    return output_zero_point > 0 ? output_zero_point : 0;
+ }
+ 
++/*
++ * A convolution with a fused RELU / RELU6.
++ *
++ * Rocket used to program no activation for a convolution: the RELU was taken
++ * as implied by the output range, which holds only when the output zero point
++ * is the type's minimum (Teflon checks just the RELU6 top). A tensor whose
++ * quantisation is shared with another one (a CONCATENATION input) has its
++ * zero point inside the range, so the negative half would come out as it is
++ * instead of at the zero point.
++ *
++ * The fix is the vendor's: the DPU BN stage RELU (rkt_relu_on(), 0x4060 = 0x902,
++ * lower bounds 0) clamps the biased accumulator at 0. The lift has to be 0 for
++ * that, or the clamp would sit at -lift / mult; the RELU6 top stays the output
++ * range's (fused_relu6_supported). For a zero point at the type's minimum the
++ * lift already was 0 and the clamp only repeats the output saturation.
++ */
++static inline int32_t
++rkt_out_lift_act(int32_t output_zero_point, bool relu)
++{
++   if (relu)
++      return 0;
++   return rkt_out_lift(output_zero_point);
++}
++
++/* program the DPU BN stage RELU for this convolution */
++static inline bool
++rkt_relu_on(const struct rkt_operation *operation)
++{
++   return operation->relu;
++}
++
+ /*
+  * ROCKET_ROUND, in counts of the requantised output, added to A alongside the
+  * lift and by the same mechanism.
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 1874199..a0ebf37 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -417,13 +417,29 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4044, fc_pt114 ? 0x00000000 : 0x00000001);
+    R_DPU(0x4048, 0x80000000);
+    R_DPU(0x404c, 0x7fffffff);
+-   R_DPU(0x4050, fc_pt114 ? 0x80021011 : 0x80011111);
++   /*
++    * Bit 8 of 0x4050 follows the parity of the 16-channel output groups, as
++    * on the regular path (0x80011111 for an even count, 0x80011011 for an odd
++    * one). With a fixed word every first conv with the other parity comes
++    * back flat.
++    */
++   bool fc_even = (DIV_ROUND_UP(fc_oc, FEATURE_ATOMIC_SIZE) & 1) == 0;
++   R_DPU(0x4050, (fc_pt114 ? 0x80021011 : 0x80011011) | (fc_even ? 0x100 : 0));
+    R_DPU(0x4058, 0x80000000);
+    R_DPU(0x405c, 0x7fffffff);
+-   R_DPU(0x4060, 0x00000903);
+-   R_DPU(0x406c, 0x80000000);
++   /*
++    * A fused RELU / RELU6 is the vendor's BN stage RELU (0x4060 = 0x902,
++    * lower bounds 0x406c = 0x4074 = 0, as in every relu layer the vendor
++    * compiler emits). With it the lift is 0 (rkt_out_lift_act), so the stage
++    * sees the accumulator with the bias and nothing else and clamps at a real
++    * 0. Leaving the RELU to the output range is wrong when the output zero
++    * point is above the type's minimum.
++    */
++   bool bn_relu = rkt_relu_on(operation);
++   R_DPU(0x4060, bn_relu ? 0x00000902 : 0x00000903);
++   R_DPU(0x406c, bn_relu ? 0x00000000 : 0x80000000);
+    R_DPU(0x4070, 0x7fffffff);
+-   R_DPU(0x4074, 0x80000000);
++   R_DPU(0x4074, bn_relu ? 0x00000000 : 0x80000000);
+    R_DPU(0x4078, 0x7fffffff);
+    R_DPU(0x407c, 0x010041c1);
+    R_DPU(0x4080, 0x00000000);
+@@ -490,7 +506,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+       if (fc_scale < (1 << 14))
+          fc_scale |= (1 << 14);
+       int32_t fc_off = (int32_t)task->output_zero_point - 0x80 -
+-                       rkt_out_lift(task->output_zero_point);
++                       rkt_out_lift_act(task->output_zero_point, operation->relu);
+ 
+       /*
+        * ROCKET_FC_CVT_DOWN, the same trade the generic path makes.
+@@ -811,7 +827,7 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    if (cvt_scale < (1 << 14))
+       cvt_scale |= (1 << 14);
+    int32_t out_offset = (int32_t)task->output_zero_point - 0x80 -
+-                        rkt_out_lift(task->output_zero_point);
++                        rkt_out_lift_act(task->output_zero_point, operation->relu);
+    /*
+     * ROCKET_CVT_DOWN=T: the OUT_CVT does (temp * cvt_scale) >> shift in (apparently)
+     * signed int32; with cvt_scale ~2^15 and the relu'd accumulator up to ~2^18 the
+@@ -1318,10 +1334,19 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    }
+    R_DPU(0x4058, 0x80000000);
+    R_DPU(0x405c, 0x7fffffff);
+-   R_DPU(0x4060, 0x00000903);
+-   R_DPU(0x406c, 0x80000000);
++   /*
++    * A fused RELU / RELU6 is the vendor's BN stage RELU (0x4060 = 0x902,
++    * lower bounds 0x406c = 0x4074 = 0, as in every relu layer the vendor
++    * compiler emits). With it the lift is 0 (rkt_out_lift_act), so the stage
++    * sees the accumulator with the bias and nothing else and clamps at a real
++    * 0. Leaving the RELU to the output range is wrong when the output zero
++    * point is above the type's minimum.
++    */
++   bool bn_relu = rkt_relu_on(operation);
++   R_DPU(0x4060, bn_relu ? 0x00000902 : 0x00000903);
++   R_DPU(0x406c, bn_relu ? 0x00000000 : 0x80000000);
+    R_DPU(0x4070, 0x7fffffff);
+-   R_DPU(0x4074, 0x80000000);
++   R_DPU(0x4074, bn_relu ? 0x00000000 : 0x80000000);
+    R_DPU(0x4078, 0x7fffffff);
+    R_DPU(0x407c, 0x010041c1);
+    R_DPU(0x4080, 0x00000000);
+-- 
+2.55.0
+

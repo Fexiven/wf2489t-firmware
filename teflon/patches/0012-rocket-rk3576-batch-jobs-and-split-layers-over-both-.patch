@@ -1,0 +1,1187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:42:54 +0100
+Subject: [PATCH 12/23] rocket: rk3576: batch jobs and split layers over both
+ NPU cores
+
+Every task was its own job, and a job costs about 50 us of scheduler,
+interrupt and IOMMU overhead against 20-50 us of NPU work per task. One
+process also never used the second core.
+
+ - Job batching: the tasks of consecutive operations go into one job per
+   core; a job is only cut where a task needs rows that the other core
+   computes. ROCKET_BATCH=0 submits one job per task.
+ - Two-core region split, used when the kernel can pin jobs to a core
+   (DRM_ROCKET_PARAM_NUM_CORES >= 2, drm_rocket_job.core): rkt_mc_plan
+   walks the subgraph backwards and gives every splittable operation an
+   output row range per core, its own half plus the halo rows its
+   consumers on that core read, so chains of layers run on both cores
+   without cross-core waits. Where the recomputed rows would cost too
+   much the operation falls back to plain halves and the jobs are cut
+   there. Core 1 uses the vendor's single-core core-1 CBUF window (banks
+   7..13), so the cores never share banks. Element-wise ADD tasks are
+   split per 16-channel surface and row range. ROCKET_MULTICORE=0 keeps
+   everything on core 0.
+ - Output conversion walks the destination sequentially with the int8
+   flip folded in; a BO is mapped once and the mapping kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/meson.build  |   1 +
+ src/gallium/drivers/rocket/rkt_device.c |  25 +-
+ src/gallium/drivers/rocket/rkt_device.h |   3 +
+ src/gallium/drivers/rocket/rkt_mc.c     | 259 +++++++++++++++
+ src/gallium/drivers/rocket/rkt_mc.h     |  46 +++
+ src/gallium/drivers/rocket/rkt_ml.c     | 411 ++++++++++++++++++++++--
+ src/gallium/drivers/rocket/rkt_ml.h     |  36 +++
+ src/gallium/drivers/rocket/rkt_regcmd.c |  22 +-
+ src/gallium/drivers/rocket/rkt_task.c   |  43 ++-
+ src/gallium/drivers/rocket/rkt_task.h   |   4 +
+ 10 files changed, 811 insertions(+), 39 deletions(-)
+ create mode 100644 src/gallium/drivers/rocket/rkt_mc.c
+ create mode 100644 src/gallium/drivers/rocket/rkt_mc.h
+
+diff --git a/src/gallium/drivers/rocket/meson.build b/src/gallium/drivers/rocket/meson.build
+index 03e75c0..c22070e 100644
+--- a/src/gallium/drivers/rocket/meson.build
++++ b/src/gallium/drivers/rocket/meson.build
+@@ -13,6 +13,7 @@ files_rocket = files(
+   'rkt_coefs.c',
+   'rkt_device.c',
+   'rkt_int8.c',
++  'rkt_mc.c',
+   'rkt_ml.c',
+   'rkt_regcmd.c',
+   'rkt_task.c',
+diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+index faf1e56..8a2496b 100644
+--- a/src/gallium/drivers/rocket/rkt_device.c
++++ b/src/gallium/drivers/rocket/rkt_device.c
+@@ -6,6 +6,7 @@
+ 
+ #include "rkt_device.h"
+ #include "rkt_ml.h"
++#include "rkt_mc.h"
+ 
+ #include "drm-uapi/rocket_accel.h"
+ 
+@@ -119,13 +120,21 @@ rkt_buffer_map(struct pipe_context *pctx,
+    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
+    assert(ret != -1);
+ 
+-   uint8_t *map = os_mmap(NULL, prsc->width0, PROT_READ | PROT_WRITE, MAP_SHARED,
+-                          screen->fd, rsc->fake_offset);
+-   assert(map != MAP_FAILED);
++   /*
++    * Map once and keep the mapping: a fresh mmap per map (never unmapped)
++    * leaked one VMA per invoke and page-faulted the whole BO in again every
++    * time.
++    */
++   if (!rsc->cpu_map) {
++      uint8_t *map = os_mmap(NULL, prsc->width0, PROT_READ | PROT_WRITE,
++                             MAP_SHARED, screen->fd, rsc->fake_offset);
++      assert(map != MAP_FAILED);
++      rsc->cpu_map = map;
++   }
+ 
+    *out_transfer = transfer;
+ 
+-   return map + box->x;
++   return rsc->cpu_map + box->x;
+ }
+ 
+ static void
+@@ -217,6 +226,7 @@ rkt_resource_create(struct pipe_screen *pscreen,
+       void *map = os_mmap(NULL, arg.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           screen->fd, rsc->fake_offset);
+       memset(map, 0, arg.size);
++      rsc->cpu_map = map;
+    }
+ 
+    return &rsc->base;
+@@ -235,6 +245,9 @@ rkt_resource_destroy(struct pipe_screen *pscreen,
+    struct drm_gem_close arg = {0};
+    int ret;
+ 
++   if (rsc->cpu_map)
++      os_munmap(rsc->cpu_map, prsc->width0);
++
+    arg.handle = rsc->handle;
+ 
+    ret = drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &arg);
+@@ -268,6 +281,10 @@ rkt_screen_create(int fd,
+    rkt_screen->fd = fd;
+ 
+    rkt_screen->soc = rkt_detect_soc(fd);
++
++   struct drm_rocket_get_param gp = {.param = DRM_ROCKET_PARAM_NUM_CORES};
++   rkt_mc_init(rkt_screen->soc,
++               drmIoctl(fd, DRM_IOCTL_ROCKET_GET_PARAM, &gp) == 0 ? gp.value : 0);
+    if (rkt_screen->soc == RKT_SOC_RK3576) {
+       /* RK3576: 16 banks x 64 KiB (1 MiB), 512 x 128-byte entries per bank. */
+       rkt_screen->cbuf_banks = 16;
+diff --git a/src/gallium/drivers/rocket/rkt_device.h b/src/gallium/drivers/rocket/rkt_device.h
+index 56091a9..207f166 100644
+--- a/src/gallium/drivers/rocket/rkt_device.h
++++ b/src/gallium/drivers/rocket/rkt_device.h
+@@ -78,6 +78,9 @@ struct rkt_resource {
+    uint64_t obj_addr;
+    uint64_t fake_offset;
+    uint64_t bo_size;
++
++   /* CPU mapping, made on the first map and kept until the BO is freed */
++   uint8_t *cpu_map;
+ };
+ 
+ static inline struct rkt_resource *
+diff --git a/src/gallium/drivers/rocket/rkt_mc.c b/src/gallium/drivers/rocket/rkt_mc.c
+new file mode 100644
+index 0000000..811b0ad
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_mc.c
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * RK3576 two-core layer split, derived from vendor runtime captures of
++ * layers run with core mask 0x3 and pinned to either core.
++ *
++ * What the vendor does with core mask 0x3, per layer:
++ *  - one submit with two subcore task ranges, one task (or window chain) per
++ *    core; core 0 gets output rows [0, mid), core 1 rows [mid, oh), mid = oh/2
++ *  - every address and geometry register is that of a row window: the input
++ *    and output pointers move by the first row, pad_top only on core 0 and
++ *    pad_bottom only on core 1, exactly like two windows of a single-core split
++ *  - the CBUF is ONE 16 bank array the two cores share, so the halves must not
++ *    overlap in it. These registers place them (B = first data bank, D = data
++ *    banks, entries are 1024 x 64 bytes a bank):
++ *      0x1018  [15:8] D, [7:0] B + D               (bit 31: data reuse)
++ *      0x103c  [15:0] read pointer + B * 1024
++ *      0x1040  [31:24] 4 * first weight bank, [15:0] write pointer + B * 1024
++ *      0x1038  [7:0] end of the weight banks (0x07 core 0, 0x0e core 1 when the
++ *              layer runs on one core; 0x10 with both), bit 8 on the core 1
++ *              single-core layout, bit 31: the weights are already in the CBUF
++ *  - the single-core layout for core 1 (vendor tasks 7..13 of mdet_000 /
++ *    5..9 of inc_003) is the core 0 one moved by 7 banks.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "rkt_mc.h"
++#include "rkt_task.h"
++
++#define MC_TGT_CNA 0x0201
++/* fewest output rows per core worth splitting */
++#define MC_MIN_ROWS 4
++/* halo rows (in percent of the rows) and recomputed MACs an operation may
++ * cost before it is cut into plain halves instead */
++#define MC_OVERLAP 50
++#define MC_HALO_MACS (4u << 20)
++
++/*
++ * The region split is used when the kernel can pin jobs to the two cores
++ * (DRM_ROCKET_PARAM_NUM_CORES >= 2). Without pinning both cores' jobs would
++ * run one after the other, so the recomputed halo rows would only cost time.
++ */
++static bool mc_enabled;
++
++void
++rkt_mc_init(enum rkt_soc soc, unsigned pin_cores)
++{
++   const char *s = getenv("ROCKET_MULTICORE");
++
++   mc_enabled = soc == RKT_SOC_RK3576 && pin_cores >= 2 && !(s && atoi(s) == 0);
++}
++
++static inline uint32_t
++mc_val(uint64_t w)
++{
++   return (uint32_t)(w >> 16);
++}
++
++static inline uint64_t
++mc_set(uint64_t w, uint32_t v)
++{
++   return (w & 0xffff00000000ffffull) | ((uint64_t)v << 16);
++}
++
++void
++rkt_mc_fixup_regcmd(const struct rkt_operation *operation,
++                    const struct split_task *task,
++                    struct util_dynarray *regs)
++{
++   const unsigned base = 7; /* first data bank of core 1 */
++
++   if (operation->multicore == RKT_MC_OFF || task->mc_core == 0)
++      return; /* the normal single-core layout */
++
++   util_dynarray_foreach (regs, uint64_t, w) {
++      uint32_t v = mc_val(*w);
++
++      if ((*w >> 48) != MC_TGT_CNA)
++         continue;
++
++      switch (*w & 0xffff) {
++      case 0x1018: {
++         unsigned d = (v >> 8) & 0xff;
++         v = (v & 0xffff0000) | (d << 8) | ((base + d) & 0xff);
++         break;
++      }
++      case 0x1038:
++         v = (task->mc_first ? 0 : (v & 0x80000000)) | 0x10e;
++         break;
++      case 0x103c:
++         v = (v & 0xffff0000) | (((v & 0xffff) + base * 1024) & 0xffff);
++         break;
++      case 0x1040: {
++         unsigned wbank4 = (v >> 24) & 0xff; /* 4 x first weight bank */
++         wbank4 += 4 * base;
++         v = (wbank4 << 24) | (v & 0x00ff0000) |
++             (((v & 0xffff) + base * 1024) & 0xffff);
++         break;
++      }
++      default:
++         continue;
++      }
++      *w = mc_set(*w, v);
++   }
++}
++
++void
++rkt_mc_in_rows(const struct rkt_operation *operation, unsigned r0, unsigned r1,
++               unsigned *lo, unsigned *hi)
++{
++   unsigned pad_top, pad_bottom, pad_left, pad_right;
++   int l, h;
++
++   if (r0 >= r1) {
++      *lo = *hi = 0;
++      return;
++   }
++   if (operation->ew_add) {
++      /* element-wise: the same rows */
++      *lo = r0;
++      *hi = r1;
++      return;
++   }
++
++   rkt_calc_explicit_padding(operation, &pad_top, &pad_bottom, &pad_left,
++                             &pad_right);
++   l = (int)(r0 * operation->stride) - (int)pad_top;
++   h = (int)((r1 - 1) * operation->stride) - (int)pad_top +
++       (int)operation->weights_height; /* exclusive */
++   *lo = MAX2(l, 0);
++   *hi = MIN2(MAX2(h, 0), (int)operation->input_height);
++   if (*lo >= *hi)
++      *lo = *hi = 0;
++}
++
++/* an operation the RK3576 row-window splitter can give any row range */
++static bool
++mc_region_ok(const struct rkt_operation *operation)
++{
++   return operation->soc == RKT_SOC_RK3576 &&
++          operation->output_height >= 2 * MC_MIN_ROWS &&
++          (operation->ew_add || (!operation->addition_input &&
++                                 operation->add_tensor == -1 &&
++                                 operation->input_channels > 4 &&
++                                 !rkt_rk3576_firstconv(operation)));
++}
++
++static void
++mc_hull(unsigned *lo, unsigned *hi, unsigned l, unsigned h)
++{
++   if (l >= h)
++      return;
++   if (*lo >= *hi) {
++      *lo = l;
++      *hi = h;
++   } else {
++      *lo = MIN2(*lo, l);
++      *hi = MAX2(*hi, h);
++   }
++}
++
++/*
++ * Region split. Going backwards through the subgraph,
++ * every splittable operation computes on core c the output rows its
++ * consumers on core c read, plus its own half of the rows (so that all rows
++ * exist for readers outside the subgraph). Where the two ranges overlap by
++ * more than MC_OVERLAP percent of the rows (halo rows add up through
++ * 3x3 layers, and double at every stride 2), the operation falls back to
++ * plain halves and its consumers fetch the missing rows from the other core
++ * (rkt_batch_jobs then cuts the jobs there). Operations that cannot be split
++ * run on core 0, whole.
++ *
++ * So a chain of layers runs as one job per core with no cross-core wait at
++ * all, at the price of recomputing the halo rows. The CBUF placement of core
++ * 1 is the vendor's single-core core 1 window (rkt_mc_fixup_regcmd), so the
++ * two cores never share banks.
++ */
++void
++rkt_mc_plan(struct rkt_ml_subgraph *subgraph)
++{
++   unsigned n = util_dynarray_num_elements(&subgraph->operations,
++                                           struct rkt_operation);
++   struct rkt_operation *ops = util_dynarray_begin(&subgraph->operations);
++   unsigned (*need)[2][2];
++
++   if (!mc_enabled || !n || getenv("ROCKET_WHOLE_GRAPH"))
++      return;
++
++   need = calloc(n, sizeof(*need)); /* need[i][core] = {lo, hi} */
++
++   for (int i = n - 1; i >= 0; i--) {
++      struct rkt_operation *op = &ops[i];
++      unsigned oh = op->output_height;
++      unsigned r[2][2] = {{0, oh}, {0, 0}};
++
++      if (mc_region_ok(op)) {
++         unsigned mid = DIV_ROUND_UP(oh, 2);
++         bool cut;
++
++         uint64_t row_macs = (uint64_t)op->output_width * op->output_channels *
++                             MAX2(op->weights_width * op->weights_height, 1) *
++                             (op->depthwise || op->ew_add ? 1 : op->input_channels);
++         unsigned extra;
++
++         r[0][0] = need[i][0][0];
++         r[0][1] = need[i][0][1];
++         r[1][0] = need[i][1][0];
++         r[1][1] = need[i][1][1];
++         /*
++          * Recompute only for consumers on BOTH cores; rows that only one
++          * core's consumers read are better fetched from the other core.
++          */
++         cut = r[0][0] >= r[0][1] || r[1][0] >= r[1][1];
++         mc_hull(&r[0][0], &r[0][1], 0, mid);
++         mc_hull(&r[1][0], &r[1][1], mid, oh);
++         extra = (r[0][1] - r[0][0]) + (r[1][1] - r[1][0]) - oh;
++         cut |= extra > oh * MC_OVERLAP / 100 || extra * row_macs > MC_HALO_MACS;
++         if (cut) {
++            r[0][0] = 0;
++            r[0][1] = mid;
++            r[1][0] = mid;
++            r[1][1] = oh;
++         }
++         op->mc_planned = true;
++      }
++
++      for (unsigned c = 0; c < 2; c++) {
++         op->mc_r0[c] = r[c][0];
++         op->mc_r1[c] = r[c][1];
++      }
++
++      /* what this operation's core c part reads from its producers */
++      int inputs[2] = {op->input_index, op->add_tensor};
++      for (unsigned k = 0; k < 2; k++) {
++         if (inputs[k] < 0)
++            continue;
++         for (int j = i - 1; j >= 0; j--) {
++            if (ops[j].output_index != (unsigned)inputs[k])
++               continue;
++            for (unsigned c = 0; c < 2; c++) {
++               unsigned lo, hi;
++               if (k == 1) {
++                  lo = r[c][0];
++                  hi = r[c][1];
++               } else {
++                  rkt_mc_in_rows(op, r[c][0], r[c][1], &lo, &hi);
++               }
++               mc_hull(&need[j][c][0], &need[j][c][1], lo, hi);
++            }
++            break;
++         }
++      }
++   }
++
++   free(need);
++}
+diff --git a/src/gallium/drivers/rocket/rkt_mc.h b/src/gallium/drivers/rocket/rkt_mc.h
+new file mode 100644
+index 0000000..dbfe90d
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_mc.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef RKT_MC_H
++#define RKT_MC_H
++
++#include "rkt_ml.h"
++
++/*
++ * RK3576 two-core split.
++ *
++ * Each operation gets an output row range per core (rkt_mc_plan). Core 0
++ * computes its range with the normal single-core CBUF layout (data banks from
++ * 0, weights up to bank 7), core 1 with the layout the vendor runtime compiles
++ * for a model pinned to core 1 (data banks from 7, weights up to bank 14).
++ * Both load their own weights and nothing is shared between the cores, so the
++ * result is the same whether the two jobs run in parallel or one after the
++ * other.
++ */
++enum rkt_mc_mode {
++   RKT_MC_OFF = 0,
++   RKT_MC_SPLIT = 1,
++};
++
++/*
++ * Plan per-core output row ranges for the whole subgraph, before the
++ * operations are split into tasks. Done when the kernel can pin jobs to the
++ * two cores; ROCKET_MULTICORE=0 keeps everything on core 0.
++ */
++void rkt_mc_plan(struct rkt_ml_subgraph *subgraph);
++
++/* input rows [*lo, *hi) that output rows [r0, r1) of this operation read */
++void rkt_mc_in_rows(const struct rkt_operation *operation, unsigned r0,
++                    unsigned r1, unsigned *lo, unsigned *hi);
++
++/* the cores jobs can be pinned to (DRM_ROCKET_PARAM_NUM_CORES, 0 if unknown) */
++void rkt_mc_init(enum rkt_soc soc, unsigned pin_cores);
++
++/* rewrite the CBUF placement registers of one task for its core */
++void rkt_mc_fixup_regcmd(const struct rkt_operation *operation,
++                         const struct split_task *task,
++                         struct util_dynarray *regs);
++
++#endif /* RKT_MC_H */
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index f2b894c..7409f07 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -19,6 +19,7 @@
+ #include "rkt_ml.h"
+ #include "rkt_regcmd.h"
+ #include "rkt_task.h"
++#include "rkt_mc.h"
+ 
+ void
+ rkt_dump_buffer(const uint8_t *ptr, char *name, int operation_nr,
+@@ -302,6 +303,10 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
+    for (int i = 0; i < num_tasks; i++) {
+       util_dynarray_init(&regcfgs[i], NULL);
+       rkt_fill_regcmd(subgraph, operation, &regcfgs[i], i);
++      rkt_mc_fixup_regcmd(operation,
++                          util_dynarray_element(&operation->tasks,
++                                                struct split_task, i),
++                          &regcfgs[i]);
+ 
+       unsigned size =
+          util_dynarray_num_elements(&regcfgs[i], uint64_t) * sizeof(uint64_t);
+@@ -388,6 +393,10 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
+    }
+ 
+    free(regcfgs);
++
++   if (operation->multicore)
++      operation->mc_sync = pipe_buffer_create(pcontext->screen, 0,
++                                              PIPE_USAGE_DEFAULT, 64);
+ }
+ 
+ static void
+@@ -922,10 +931,47 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+                     calc_raw_output_size(operation));
+    }
+ 
++   if (subgraph->operations.size &&
++       util_dynarray_begin(&subgraph->operations) &&
++       ((struct rkt_operation *)util_dynarray_begin(&subgraph->operations))->soc ==
++          RKT_SOC_RK3576)
++      rkt_mc_plan(subgraph);
++
+    /* Compile */
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+-      if (operation->ew_add) {
++      if (!operation->mc_planned) {
++         /* one core, all rows; a two-core split overrides it */
++         operation->mc_r0[0] = 0;
++         operation->mc_r1[0] = operation->output_height;
++         operation->mc_r0[1] = operation->mc_r1[1] = 0;
++      }
++      if (operation->ew_add && operation->mc_planned) {
++         /*
++          * Two-core ADD (rkt_mc_plan): per core, one task per 16 channel
++          * surface over that core's rows.
++          */
++         for (unsigned core = 0; core < 2; core++) {
++            for (unsigned s = 0;
++                 s < DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) &&
++                 operation->mc_r1[core] > operation->mc_r0[core];
++                 s++) {
++               struct split_task task = {0};
++               task.output_width = operation->output_width;
++               task.output_height = operation->mc_r1[core] - operation->mc_r0[core];
++               task.output_channels = operation->output_channels;
++               task.output_channels_real = operation->output_channels;
++               task.mc_core = core;
++               task.mc_first = s == 0;
++               task.ew_part = true;
++               task.ew_r0 = operation->mc_r0[core];
++               task.ew_r1 = operation->mc_r1[core];
++               task.ew_surf = s;
++               util_dynarray_append(&operation->tasks, struct split_task, task);
++            }
++         }
++         operation->multicore = RKT_MC_SPLIT;
++      } else if (operation->ew_add) {
+          /* one task, no CBUF: the DPU streams both operands from DRAM */
+          struct split_task task = {0};
+          task.output_width = operation->output_width;
+@@ -982,6 +1028,210 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+    return &subgraph->base;
+ }
+ 
++/*
++ * Job batching (ROCKET_BATCH=0 turns it off).
++ *
++ * Every job costs a round trip through the DRM scheduler (fence signal, work
++ * item, run_job, IOMMU attach) of about 50 us on this SoC, as much as an
++ * average task takes on the NPU. Tasks inside one job follow each other
++ * straight from the IRQ handler. So the tasks of consecutive operations go
++ * into ONE job per core, in graph order, and a job is only cut where a task needs the
++ * output of a task on the other core: then the producer's job is closed (it
++ * is pushed first, its fence is what the consumer waits for) and so is the
++ * consumer core's open job, so that the work before the cut does not wait.
++ *
++ * A job reads the tensors it does not write itself and writes the ones it
++ * does. A two-core layer (rkt_mc.c) fences its core 0 half on its mc_sync BO,
++ * so its two halves never wait for each other through the output BO.
++ */
++struct rkt_bjob {
++   unsigned core;
++   struct util_dynarray tasks; /* struct drm_rocket_task */
++   struct util_dynarray in;    /* uint32_t handles */
++   struct util_dynarray out;   /* uint32_t handles */
++};
++
++static void
++rkt_handle_add(struct util_dynarray *set, uint32_t h)
++{
++   util_dynarray_foreach (set, uint32_t, x)
++      if (*x == h)
++         return;
++   util_dynarray_append(set, uint32_t, h);
++}
++
++static bool
++rkt_handle_has(struct util_dynarray *set, uint32_t h)
++{
++   util_dynarray_foreach (set, uint32_t, x)
++      if (*x == h)
++         return true;
++   return false;
++}
++
++static void
++rkt_bjob_close(struct util_dynarray *bjobs, int *open, unsigned core,
++               struct util_dynarray *jobs, bool pin)
++{
++   if (open[core] < 0)
++      return;
++
++   struct rkt_bjob *b = util_dynarray_element(bjobs, struct rkt_bjob, open[core]);
++   unsigned nin = 0, nout = util_dynarray_num_elements(&b->out, uint32_t);
++   uint32_t *in = malloc(MAX2(util_dynarray_num_elements(&b->in, uint32_t), 1) *
++                         sizeof(uint32_t));
++   uint32_t *out = malloc(MAX2(nout, 1) * sizeof(uint32_t));
++
++   /* what the job writes itself is ordered inside the job, not an input */
++   util_dynarray_foreach (&b->in, uint32_t, h)
++      if (!rkt_handle_has(&b->out, *h))
++         in[nin++] = *h;
++   memcpy(out, util_dynarray_begin(&b->out), nout * sizeof(uint32_t));
++
++   unsigned ntasks = util_dynarray_num_elements(&b->tasks, struct drm_rocket_task);
++   struct drm_rocket_task *tasks = malloc(ntasks * sizeof(*tasks));
++   memcpy(tasks, util_dynarray_begin(&b->tasks), ntasks * sizeof(*tasks));
++
++   struct drm_rocket_job job = {0};
++   job.task_struct_size = sizeof(struct drm_rocket_task);
++   job.in_bo_handles = (uint64_t)(uintptr_t)in;
++   job.in_bo_handle_count = nin;
++   job.out_bo_handles = (uint64_t)(uintptr_t)out;
++   job.out_bo_handle_count = nout;
++   job.tasks = (uint64_t)(uintptr_t)tasks;
++   job.task_count = ntasks;
++   job.core = pin ? core + 1 : 0;
++   util_dynarray_append(jobs, struct drm_rocket_job, job);
++
++   open[core] = -1;
++}
++
++static bool
++rkt_batch_enabled(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("ROCKET_BATCH");
++      on = e ? atoi(e) != 0 : 1;
++   }
++   return on;
++}
++
++static void
++rkt_batch_jobs(struct rkt_ml_subgraph *subgraph, struct util_dynarray *jobs)
++{
++   struct util_dynarray bjobs;
++   int open[2] = {-1, -1};
++   bool any_core1 = false;
++   bool pin;
++
++   util_dynarray_init(&bjobs, NULL);
++
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op) {
++      op->batch_job[0] = op->batch_job[1] = -1;
++      util_dynarray_foreach (&op->tasks, struct split_task, task)
++         any_core1 |= task->mc_core != 0;
++   }
++   pin = any_core1;
++
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op) {
++      int inputs[2] = {op->input_index, op->add_tensor};
++      unsigned num_inputs = op->add_tensor != -1 ? 2 : 1;
++      uint32_t out_h = rkt_get_tensor(subgraph, op->output_index)->handle;
++
++      for (unsigned core = 0; core < 2; core++) {
++         bool has = false;
++         util_dynarray_foreach (&op->tasks, struct split_task, task)
++            has |= task->mc_core == core;
++         if (!has)
++            continue;
++
++         /*
++          * The parts of the producers this core's part reads. A part on
++          * the same core is ordered by the core's job queue; a part on the
++          * other core is waited for through its fence, and both jobs are cut
++          * there: the producer's job has to be pushed first, and the work
++          * already in this core's job must not wait for it.
++          */
++         uint32_t deps[4];
++         unsigned ndeps = 0;
++         for (unsigned k = 0; k < num_inputs; k++) {
++            struct rkt_operation *p = find_producer(subgraph, inputs[k]);
++            uint32_t t_h = rkt_get_tensor(subgraph, inputs[k])->handle;
++            unsigned lo, hi;
++
++            if (!p) {
++               deps[ndeps++] = t_h; /* written by the CPU, no fence */
++               continue;
++            }
++            if (k == 1)
++               lo = op->mc_r0[core], hi = op->mc_r1[core];
++            else
++               rkt_mc_in_rows(op, op->mc_r0[core], op->mc_r1[core], &lo, &hi);
++
++            bool own = p->batch_job[core] >= 0 && p->mc_r0[core] <= lo &&
++                       hi <= p->mc_r1[core];
++            if (own || p->batch_job[!core] < 0 ||
++                !(p->mc_r0[!core] < hi && lo < p->mc_r1[!core]))
++               continue;
++
++            /* the other core's part: core 0 parts fence the sync BO */
++            uint32_t h = core == 1 && p->mc_sync
++                            ? rkt_resource(p->mc_sync)->handle
++                            : t_h;
++            if (open[!core] == p->batch_job[!core])
++               rkt_bjob_close(&bjobs, open, !core, jobs, pin);
++            if (open[core] >= 0) {
++               struct rkt_bjob *ob =
++                  util_dynarray_element(&bjobs, struct rkt_bjob, open[core]);
++               if (!rkt_handle_has(&ob->in, h))
++                  rkt_bjob_close(&bjobs, open, core, jobs, pin);
++            }
++            deps[ndeps++] = h;
++         }
++
++         if (open[core] < 0) {
++            struct rkt_bjob b = {.core = core};
++            util_dynarray_init(&b.tasks, NULL);
++            util_dynarray_init(&b.in, NULL);
++            util_dynarray_init(&b.out, NULL);
++            util_dynarray_append(&bjobs, struct rkt_bjob, b);
++            open[core] = util_dynarray_num_elements(&bjobs, struct rkt_bjob) - 1;
++         }
++         struct rkt_bjob *b =
++            util_dynarray_element(&bjobs, struct rkt_bjob, open[core]);
++
++         for (unsigned k = 0; k < ndeps; k++)
++            rkt_handle_add(&b->in, deps[k]);
++         /* core 0's half of a two-core layer is fenced on the sync BO */
++         rkt_handle_add(&b->out, op->mc_sync && core == 0
++                                    ? rkt_resource(op->mc_sync)->handle
++                                    : out_h);
++
++         util_dynarray_foreach (&op->tasks, struct split_task, task) {
++            if (task->mc_core != core)
++               continue;
++            struct drm_rocket_task t = {
++               .regcmd = task->regcfg_addr,
++               .regcmd_count = task->regcfg_amount,
++            };
++            util_dynarray_append(&b->tasks, struct drm_rocket_task, t);
++         }
++         op->batch_job[core] = open[core];
++      }
++   }
++
++   rkt_bjob_close(&bjobs, open, 0, jobs, pin);
++   rkt_bjob_close(&bjobs, open, 1, jobs, pin);
++
++   util_dynarray_foreach (&bjobs, struct rkt_bjob, b) {
++      util_dynarray_fini(&b->tasks);
++      util_dynarray_fini(&b->in);
++      util_dynarray_fini(&b->out);
++   }
++   util_dynarray_fini(&bjobs);
++}
++
+ void
+ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                        struct pipe_ml_subgraph *psubgraph,
+@@ -1092,19 +1342,34 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                }
+             }
+          } else {
+-            unsigned n = 0;
+-            for (int u = 0; u < DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE);
+-                 u++) {
+-               for (int x = 0; x < input_width; x++) {
+-                  for (int y = 0; y < input_height; y++) {
+-                     for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
+-                        unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
+-                        if (input_channel < input_channels)
+-                           map[n++] = input_in[x][y][input_channel] - 0x80;
+-                        else
+-                           map[n++] = zero_point - 0x80;
+-                     }
+-                  }
++            /*
++             * NHWC -> NC1HWC2, - 0x80, the same element order as
++             * map[((u * W + x) * H + y) * 16 + c] = in[x][y][u * 16 + c],
++             * walked in source order so the loads are sequential.
++             */
++            const unsigned full = input_channels / FEATURE_ATOMIC_SIZE;
++            const unsigned rest = input_channels % FEATURE_ATOMIC_SIZE;
++            const size_t plane = (size_t)input_width * input_height *
++                                 FEATURE_ATOMIC_SIZE;
++            const uint8_t *src = input_data;
++            const uint8_t pad = zero_point - 0x80;
++            (void)input_in;
++
++            for (unsigned p = 0; p < input_width * input_height; p++) {
++               const uint8_t *s = src + (size_t)p * input_channels;
++               uint8_t *d = map + (size_t)p * FEATURE_ATOMIC_SIZE;
++               unsigned u;
++               for (u = 0; u < full; u++) {
++                  for (unsigned c = 0; c < FEATURE_ATOMIC_SIZE; c++)
++                     d[c] = s[c] ^ 0x80;
++                  s += FEATURE_ATOMIC_SIZE;
++                  d += plane;
++               }
++               if (rest) {
++                  for (unsigned c = 0; c < rest; c++)
++                     d[c] = s[c] ^ 0x80;
++                  for (unsigned c = rest; c < FEATURE_ATOMIC_SIZE; c++)
++                     d[c] = pad;
+                }
+             }
+          }
+@@ -1224,11 +1489,14 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+       job.tasks = (uint64_t)tasks;
+       job.task_count = task_count;
+       util_dynarray_append(&jobs, struct drm_rocket_job, job);
++   } else if (rkt_batch_enabled()) {
++      rkt_batch_jobs(subgraph, &jobs);
+    } else
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+       unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
+-      uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
++      /* + up to two sync BOs of two-core producers (rkt_mc.c) */
++      uint32_t *in_bo_handles = calloc(num_inputs + 2, sizeof(uint32_t));
+       uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+ 
+       in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
+@@ -1237,10 +1505,54 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+          in_bo_handles[1] =
+             rkt_get_tensor(subgraph, operation->add_tensor)->handle;
+ 
++      /*
++       * A producer split over both cores fences its output BO with its core 1
++       * jobs only and its sync BO with the core 0 ones, so wait for both.
++       */
++      for (unsigned k = 0, n = num_inputs; k < n; k++) {
++         struct rkt_operation *producer = find_producer(
++            subgraph, k ? operation->add_tensor : operation->input_index);
++         if (producer && producer->mc_sync)
++            in_bo_handles[num_inputs++] = rkt_resource(producer->mc_sync)->handle;
++      }
++
+       out_bo_handles[0] =
+          rkt_get_tensor(subgraph, operation->output_index)->handle;
+ 
+-      if (operation->reuse_weights_cbuf && getenv("ROCKET_TILE_JOBS") == NULL) {
++      if (operation->multicore) {
++         /*
++          * RK3576 two-core split (rkt_mc.c): every task its own job, pinned to
++          * the core its CBUF layout was made for (DRM_ROCKET_JOB core = N + 1;
++          * a kernel without per-core submission ignores it and runs the jobs
++          * one after the other, which gives the same result). The core 0 jobs
++          * fence the sync BO instead of the output BO, so the implicit write
++          * dependency on the output does not serialise the two halves.
++          */
++         util_dynarray_foreach (&operation->tasks, struct split_task, task) {
++            struct drm_rocket_task *ktask = calloc(1, sizeof(*ktask));
++            ktask->regcmd = task->regcfg_addr;
++            ktask->regcmd_count = task->regcfg_amount;
++
++            uint32_t *in_copy = malloc(num_inputs * sizeof(uint32_t));
++            memcpy(in_copy, in_bo_handles, num_inputs * sizeof(uint32_t));
++            uint32_t *out_copy = malloc(sizeof(uint32_t));
++            *out_copy = task->mc_core ? out_bo_handles[0]
++                                      : rkt_resource(operation->mc_sync)->handle;
++
++            struct drm_rocket_job job = {0};
++            job.task_struct_size = sizeof(struct drm_rocket_task);
++            job.in_bo_handles = (uint64_t)(uintptr_t)in_copy;
++            job.in_bo_handle_count = num_inputs;
++            job.out_bo_handles = (uint64_t)(uintptr_t)out_copy;
++            job.out_bo_handle_count = 1;
++            job.tasks = (uint64_t)ktask;
++            job.task_count = 1;
++            job.core = task->mc_core + 1;
++            util_dynarray_append(&jobs, struct drm_rocket_job, job);
++         }
++         free(in_bo_handles);
++         free(out_bo_handles);
++      } else if (operation->reuse_weights_cbuf && getenv("ROCKET_TILE_JOBS") == NULL) {
+          /* Submit all tasks to the same core, so weights can be reused */
+          unsigned num_tasks =
+             util_dynarray_num_elements(&operation->tasks, struct split_task);
+@@ -1293,6 +1605,22 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+       }
+    }
+ 
++   /*
++    * With a two-core layer in the graph, pin every other job to core 0 too.
++    * The cores share one CBUF and an unsplit layer uses core 0's banks
++    * (0..6); left to the kernel, an independent branch could run on core 1
++    * while core 0 computes its half of a split layer in the same banks.
++    */
++   if (!rkt_batch_enabled()) {
++      bool any_mc = false;
++      util_dynarray_foreach (&subgraph->operations, struct rkt_operation, op)
++         any_mc |= op->multicore != 0;
++      if (any_mc)
++         util_dynarray_foreach (&jobs, struct drm_rocket_job, j)
++            if (!j->core)
++               j->core = 1;
++   }
++
+    struct drm_rocket_submit submit = {0};
+    submit.job_struct_size = sizeof(struct drm_rocket_job);
+    submit.jobs = (uint64_t)util_dynarray_begin(&jobs);
+@@ -1349,6 +1677,14 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+                          [FEATURE_ATOMIC_SIZE];
+       uint8_t(*output_out)[operation->output_width][operation->output_channels];
+ 
++      /* a two-core producer: its core 0 half is fenced on the sync BO */
++      if (operation->mc_sync) {
++         struct pipe_transfer *sync_transfer = NULL;
++         pipe_buffer_map(pcontext, operation->mc_sync, PIPE_MAP_READ,
++                         &sync_transfer);
++         pipe_buffer_unmap(pcontext, sync_transfer);
++      }
++
+       DBG("Before pipe_buffer_map\n");
+       raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
+                                    &transfer);
+@@ -1362,22 +1698,40 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+       if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
+          rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
+ 
+-      for (int oc = 0; oc < operation->output_channels; oc++) {
+-         for (int x = 0; x < operation->output_width; x++) {
+-            for (int y = 0; y < operation->output_height; y++) {
+-               unsigned c = oc % FEATURE_ATOMIC_SIZE;
+-               unsigned g = oc / FEATURE_ATOMIC_SIZE;
+-               output_out[y][x][oc] = output_in[g][y][x][c] + 0x80;
++      /*
++       * NC1HWC2 (16 channel atoms) -> NHWC, + 0x80. Written destination
++       * order so the stores are sequential and the inner loop is a 16 byte
++       * vector op; the int8 flip of rkt_int8.h (another ^ 0x80) is folded in.
++       */
++      {
++         const unsigned ow = operation->output_width;
++         const unsigned ohh = operation->output_height;
++         const unsigned oc = operation->output_channels;
++         const unsigned full = oc / FEATURE_ATOMIC_SIZE;
++         const unsigned rest = oc % FEATURE_ATOMIC_SIZE;
++         const size_t plane = (size_t)ohh * ow * FEATURE_ATOMIC_SIZE;
++         const uint8_t flip =
++            (is_signed && is_signed[i]) ? 0 : 0x80;
++         const uint8_t *src = raw_output;
++         uint8_t *dst = outputs[i];
++         (void)output_in;
++         (void)output_out;
++
++         for (unsigned p = 0; p < ohh * ow; p++) {
++            const uint8_t *s = src + (size_t)p * FEATURE_ATOMIC_SIZE;
++            uint8_t *d = dst + (size_t)p * oc;
++            unsigned g;
++            for (g = 0; g < full; g++) {
++               for (unsigned c = 0; c < FEATURE_ATOMIC_SIZE; c++)
++                  d[c] = s[c] ^ flip;
++               s += plane;
++               d += FEATURE_ATOMIC_SIZE;
+             }
++            for (unsigned c = 0; c < rest; c++)
++               d[c] = s[c] ^ flip;
+          }
+       }
+ 
+-      /* Offset uint8 back to int8, see rkt_int8.h. */
+-      if (is_signed && is_signed[i])
+-         rkt_int8_flip(outputs[i], operation->output_width *
+-                                   operation->output_height *
+-                                   operation->output_channels);
+-
+       DBG("Converted data\n");
+ 
+       pipe_buffer_unmap(pcontext, transfer);
+@@ -1398,6 +1752,7 @@ free_operation(struct rkt_operation *operation)
+    pipe_resource_reference(&operation->regcmd, NULL);
+    pipe_resource_reference(&operation->weights, NULL);
+    pipe_resource_reference(&operation->biases, NULL);
++   pipe_resource_reference(&operation->mc_sync, NULL);
+ }
+ 
+ void
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 2d67b23..0c70c6f 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -91,6 +91,21 @@ struct split_task {
+    bool dw_group_first;   /* first row window of the group: new weights */
+    unsigned dw_c0;
+ 
++   /*
++    * RK3576 two-core split (rkt_mc.c): the NPU core this
++    * task runs on, and whether it is the first window of its core's row range
++    * in its channel group (it loads the weights itself).
++    */
++   unsigned mc_core;
++   bool mc_first;
++
++   /*
++    * RK3576 element-wise ADD split for two cores (rkt_mc_plan): this task
++    * covers rows [ew_r0, ew_r1) of the 16 channel surface ew_surf only.
++    */
++   bool ew_part;
++   unsigned ew_r0, ew_r1, ew_surf;
++
+    unsigned output_width;
+    unsigned output_height;
+    unsigned output_channels;
+@@ -183,6 +198,27 @@ struct rkt_operation {
+    unsigned cbuf_bank_size;
+ 
+    struct util_dynarray tasks; /* struct split_task */
++
++   /*
++    * RK3576 two-core split (rkt_mc.c): 0 = one core, else an rkt_mc_mode.
++    * mc_sync is a small BO the core 0 jobs list as their output, so that the
++    * two halves do not wait for each other; every reader of the output
++    * (consumers, the CPU readback) waits for it too.
++    */
++   unsigned multicore;
++   struct pipe_resource *mc_sync;
++
++   /*
++    * Output rows [mc_r0[c], mc_r1[c]) are computed on core c (empty when
++    * mc_r0 >= mc_r1). Two-core ranges may overlap (the
++    * rows a core's next layers need are recomputed instead of fetched from
++    * the other core). mc_planned: set by rkt_mc_plan().
++    */
++   unsigned mc_r0[2], mc_r1[2];
++   bool mc_planned;
++
++   /* invoke scratch (rkt_batch_jobs): the job each core's tasks went to */
++   int batch_job[2];
+ };
+ 
+ struct rkt_ml_subgraph {
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index a0ebf37..6c108a3 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -2235,8 +2235,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
+ static void
+ fill_regcmd_rk3576_ew_add(struct rkt_ml_subgraph *subgraph,
+                           const struct rkt_operation *operation,
+-                          struct util_dynarray *regs)
++                          struct util_dynarray *regs, unsigned task_num)
+ {
++   const struct split_task *task =
++      util_dynarray_element(&operation->tasks, struct split_task, task_num);
+    struct rkt_ew_add p = operation->ew;
+    uint64_t words[RKT_EW_ADD_MAX_REGS];
+ 
+@@ -2245,6 +2247,22 @@ fill_regcmd_rk3576_ew_add(struct rkt_ml_subgraph *subgraph,
+    p.out_addr = rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
+    p.table_addr = rkt_resource(operation->biases)->phys_addr;
+ 
++   if (task->ew_part) {
++      /*
++       * One 16 channel surface, rows [r0, r1): a standalone ADD of a
++       * (r1 - r0) x w x 16 tensor whose three surfaces start that far into
++       * the full ones, so no surface stride is involved.
++       */
++      uint32_t off = task->ew_surf * p.width * p.height * FEATURE_ATOMIC_SIZE +
++                     task->ew_r0 * p.width * FEATURE_ATOMIC_SIZE;
++      p.a_addr += off;
++      p.b_addr += off;
++      p.out_addr += off;
++      p.height = task->ew_r1 - task->ew_r0;
++      p.channels = MIN2(p.channels - task->ew_surf * FEATURE_ATOMIC_SIZE,
++                        FEATURE_ATOMIC_SIZE);
++   }
++
+    unsigned n = rkt_ew_add_emit(&p, words);
+    for (unsigned i = 0; i < n; i++)
+       util_dynarray_append(regs, uint64_t, words[i]);
+@@ -2256,7 +2274,7 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+                 struct util_dynarray *regs, unsigned task_num)
+ {
+    if (operation->soc == RKT_SOC_RK3576 && operation->ew_add) {
+-      fill_regcmd_rk3576_ew_add(subgraph, operation, regs);
++      fill_regcmd_rk3576_ew_add(subgraph, operation, regs, task_num);
+       return;
+    }
+ 
+diff --git a/src/gallium/drivers/rocket/rkt_task.c b/src/gallium/drivers/rocket/rkt_task.c
+index 507ed43..8b69663 100644
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -9,6 +9,7 @@
+ 
+ #include "rkt_task.h"
+ #include "rkt_ml.h"
++#include "rkt_mc.h"
+ 
+ static unsigned
+ calc_entries_per_slice(struct rkt_operation *operation)
+@@ -104,6 +105,14 @@ calc_explicit_padding(const struct rkt_operation *operation,
+    }
+ }
+ 
++void
++rkt_calc_explicit_padding(const struct rkt_operation *operation,
++                          unsigned *pad_top, unsigned *pad_bottom,
++                          unsigned *pad_left, unsigned *pad_right)
++{
++   calc_explicit_padding(operation, pad_top, pad_bottom, pad_left, pad_right);
++}
++
+ static void
+ fill_task(struct rkt_ml_subgraph *subgraph,
+           struct rkt_operation *operation,
+@@ -335,7 +344,8 @@ rkt_dw_group_size(const struct rkt_operation *operation)
+ static void
+ rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
+                          struct rkt_operation *operation,
+-                         unsigned c0, unsigned gc)
++                         unsigned c0, unsigned gc,
++                         unsigned r0, unsigned r1, unsigned core)
+ {
+    bool fc = rkt_rk3576_firstconv(operation);
+    bool group = gc != operation->input_channels;
+@@ -372,13 +382,18 @@ rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
+    unsigned out_plane = operation->output_width * operation->output_height *
+                         FEATURE_ATOMIC_SIZE;
+ 
+-   for (unsigned o0 = 0; o0 < out_h;) {
++   /*
++    * Output rows [r0, r1): the whole layer, or one core's half of it
++    * (rkt_mc.c). A core's range starts like a layer of its own: the ring at
++    * entry 0, nothing reused from the other core's rows.
++    */
++   for (unsigned o0 = r0; o0 < r1;) {
+       int lo_s = (int)(o0 * s) - (int)pad_top;
+       unsigned lo = lo_s < 0 ? 0 : lo_s;
+       unsigned o1 = o0 + 1, hi = 0;
+ 
+       /* largest o1 whose span fits; always at least one output row */
+-      for (unsigned c = o0 + 1; c <= out_h; c++) {
++      for (unsigned c = o0 + 1; c <= r1; c++) {
+          int h = (int)((c - 1) * s) - (int)pad_top + (int)k - 1;
+          unsigned hc = MIN2((unsigned)MAX2(h, 0), in_h - 1);
+          if (c > o0 + 1 && (hc - lo + 1) * eps > budget)
+@@ -401,7 +416,7 @@ rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
+          task.input_channels = ALIGN(MAX2(gc, FEATURE_ATOMIC_SIZE), FEATURE_ATOMIC_SIZE);
+          task.output_channels = ALIGN(task.input_channels, 64);
+          task.dw_group = true;
+-         task.dw_group_first = o0 == 0;
++         task.dw_group_first = o0 == r0;
+          task.dw_c0 = c0;
+       }
+       task.input_banks = data_banks;
+@@ -421,6 +436,8 @@ rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
+       task.atomic_count = task.output_width * task.output_height;
+ 
+       task.rk3576_vendor = true;
++      task.mc_core = core;
++      task.mc_first = o0 == r0;
+       task.data_banks = data_banks;
+       task.data_reuse = reuse;
+       if (reuse) {
+@@ -448,8 +465,24 @@ rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+    unsigned c = operation->input_channels;
+    unsigned g = rkt_dw_group_size(operation);
+ 
++   if (operation->mc_planned) {
++      /* per-core ranges from rkt_mc_plan() */
++      operation->multicore = operation->mc_r1[1] > operation->mc_r0[1]
++                                ? RKT_MC_SPLIT : RKT_MC_OFF;
++      for (unsigned c0 = 0; c0 < c; c0 += g)
++         for (unsigned core = 0; core < 2; core++)
++            if (operation->mc_r1[core] > operation->mc_r0[core])
++               rkt_split_windows_rk3576(subgraph, operation, c0,
++                                        MIN2(g, c - c0),
++                                        operation->mc_r0[core],
++                                        operation->mc_r1[core], core);
++      return;
++   }
++
++   operation->multicore = RKT_MC_OFF;
+    for (unsigned c0 = 0; c0 < c; c0 += g)
+-      rkt_split_windows_rk3576(subgraph, operation, c0, MIN2(g, c - c0));
++      rkt_split_windows_rk3576(subgraph, operation, c0, MIN2(g, c - c0),
++                               0, operation->output_height, 0);
+ }
+ 
+ void
+diff --git a/src/gallium/drivers/rocket/rkt_task.h b/src/gallium/drivers/rocket/rkt_task.h
+index 6b52e97..277ea8b 100644
+--- a/src/gallium/drivers/rocket/rkt_task.h
++++ b/src/gallium/drivers/rocket/rkt_task.h
+@@ -13,4 +13,8 @@ void rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
+ 
+ bool rkt_rk3576_firstconv(const struct rkt_operation *operation);
+ 
++void rkt_calc_explicit_padding(const struct rkt_operation *operation,
++                               unsigned *pad_top, unsigned *pad_bottom,
++                               unsigned *pad_left, unsigned *pad_right);
++
+ #endif /* RKT_TASK_H */
+\ No newline at end of file
+-- 
+2.55.0
+

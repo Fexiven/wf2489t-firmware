@@ -1,0 +1,608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:10 +0100
+Subject: [PATCH 08/23] rocket: run element-wise ADD on the RK3576 NPU
+
+A standalone ADD (both operands graph inputs, e.g. ssdmobilenetv2/009)
+crashed: the ADD lowering looks up the convolutions producing both
+operands, finds none, and with asserts compiled out writes through NULL.
+On RK3576 even a fused ADD silently returned the bare convolution, since
+the RK3576 encoders never program the DPU element-wise stage.
+
+The vendor runtime never fuses an ADD on RK3576: the convolution writes
+DRAM, then one DPU-only task reads both operands. Decoded from four
+captures:
+
+  A (main operand)  RDMA 0x5018, coefficient record at 0x5024
+  B (EW operand)    RDMA 0x5038, surface stride 0x5040
+  EW_CFG            0x407c = 0x8002c0c0 (ADD; convs write the bypass)
+  B offset / scale  0x4080 = -zB, 0x4084 = shift << 16 | mult
+  OUT_CVT           0x40ac = zO, 0x40b0 = 1 << 16 | mult, 0x40b4 = shift
+
+A is the operand with the larger scale. The requantisation rule
+reproduces the vendor's registers from the TFLite scales, and the
+encoder (rkt_ew.h) reproduces an int8 capture bit for bit (89/89
+registers plus the coefficient record).
+
+ - RK3576: ADD of two non-constant operands of the output's shape, per
+   tensor quantisation, more than 4 channels, runs as that task (1x1
+   vector ADDs stay on the CPU).
+ - All SoCs: an ADD whose operands are not produced by convolutions
+   fails subgraph creation with a message instead of dereferencing NULL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_ew.h     | 225 ++++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_ml.c     | 199 +++++++++++++++++++--
+ src/gallium/drivers/rocket/rkt_ml.h     |  12 ++
+ src/gallium/drivers/rocket/rkt_regcmd.c |  27 +++
+ 4 files changed, 453 insertions(+), 10 deletions(-)
+ create mode 100644 src/gallium/drivers/rocket/rkt_ew.h
+
+diff --git a/src/gallium/drivers/rocket/rkt_ew.h b/src/gallium/drivers/rocket/rkt_ew.h
+new file mode 100644
+index 0000000..481bf68
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_ew.h
+@@ -0,0 +1,225 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * RK3576 element-wise ADD as one DPU-only task, the way librknnrt 2.3.2 runs
++ * it.
++ *
++ * Vendor runtime captures (librknnrt 2.3.2, rknpu 0.9.8) of four ADD layers:
++ * ml_014 (int8 48x48x24 + 48x48x24), ssd_009 (uint8 75x75x24 twice),
++ * mnv2_c008 (uint8 1x1 conv -> + residual) and ed_c009 (int8 conv -> +
++ * residual). In every one the ADD is a single task with enable mask 0x18 (DPU
++ * + DPU RDMA, no CNA/CORE) and 89 register writes that read BOTH operands from
++ * DRAM. A producing convolution is never fused: it writes its int8 result to
++ * DRAM like any other layer and the EW task reads it back. (ssd_009 adds an
++ * identity 1x1 "pre_weight" depthwise per operand first; its EW task is the
++ * same and the identity convs only restride 75x75 surfaces from 5625 to 5628.)
++ *
++ *   main operand A   RDMA 0x5018, surface stride implied by the cube
++ *   EW operand B     RDMA 0x5038 (ERDMA), surface stride 0x5040
++ *   output           DPU 0x4018, surface stride 0x401c
++ *   A coefficients   RDMA 0x5024 -> 48 bytes, format 0x501c = 0x1a:
++ *                    s32 -zA @0, s32 -zA @16, s16 0x4000 @32
++ *   EW_CFG           DPU 0x407c = 0x8002c0c0 (ADD; 0x010041c1 is bypass)
++ *   B offset         DPU 0x4080 = -zB
++ *   B scale          DPU 0x4084 = shift << 16 | mult, B' = (B - zB) * mult >> shift
++ *   OUT_CVT          0x40ac = zO, 0x40b0 = 1 << 16 | mult, 0x40b4 = shift
++ *
++ * So with all zero points in the int8 domain the hardware computes
++ *
++ *   S   = (A - zA) * 2^14 + (B - zB) * m_b >> sh_b       m_b >> sh_b ~ sB/sA * 2^14
++ *   out = clamp((S * m_o >> sh_o) + zO)                  m_o >> sh_o ~ sA/sO / 2^14
++ *
++ * which is TFLite's ADD as long as sB <= sA, so A is always the operand with
++ * the larger scale (true of the main operand in all four captures). The
++ * register values below are reproduced bit for bit from the TFLite scales of
++ * ml_014 (0x1799a, 0x17ae3, 0x1d) and ssd_009 (0x14c92, 0x17b7e, 0x1d); the
++ * mnv2/ed captures fit the same rule with the convolution's output scale.
++ * rknn-toolkit2's equal-scale standalone ADD has
++ * 0x4084 = 0x4000, the sh_b = 0 end of the same rule.
++ */
++
++#ifndef RKT_EW_H
++#define RKT_EW_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* 89 vendor registers + 2 per-unit OP_ENs + the 4 tail words the PC fetches */
++#define RKT_EW_ADD_MAX_REGS 96
++#define RKT_EW_ADD_TABLE_BYTES 64
++
++struct rkt_ew_add {
++   unsigned width;      /* Mesa's output_width (TFLite dim 1) */
++   unsigned height;     /* Mesa's output_height (TFLite dim 2) */
++   unsigned channels;
++
++   uint32_t a_addr, b_addr, out_addr, table_addr;
++
++   int32_t a_zp, b_zp, out_zp;   /* int8 domain */
++   uint32_t b_cvt;               /* 0x4084 */
++   uint32_t out_scale;           /* 0x40b0 */
++   uint32_t out_shift;           /* 0x40b4 */
++};
++
++/*
++ * Scales: sa >= sb (the caller swaps the operands otherwise).
++ */
++static inline void
++rkt_ew_add_quant(float sa, float sb, float so, uint32_t *b_cvt,
++                 uint32_t *out_scale, uint32_t *out_shift)
++{
++   double r = (double)sb / (double)sa;     /* (0, 1] */
++   double q = (double)sa / (double)so;
++   unsigned sh = 0;
++   long m = lround(r * 16384.0);
++
++   while (m < 16384 && sh < 31) {
++      sh++;
++      m = lround(r * ldexp(1.0, 14 + sh));
++   }
++   if (m > 0x7fff)   /* r rounding up to exactly 2 with sh = 1: cannot happen for r <= 1 */
++      m = 0x7fff;
++   *b_cvt = (sh << 16) | (uint32_t)m;
++
++   int e = 14;
++   while (e > -14 && lround(q * ldexp(1.0, e)) >= 32768)
++      e--;
++   while (e < 40 && lround(q * ldexp(1.0, e)) < 16384)
++      e++;
++   long mo = lround(q * ldexp(1.0, e));
++   if (mo > 0x7fff)
++      mo = 0x7fff;
++   *out_scale = (1u << 16) | (uint32_t)mo;
++   *out_shift = (uint32_t)(14 + e);
++}
++
++/* The A coefficient record the EW task's BS RDMA reads (0x5024, 0x501c 0x1a). */
++static inline void
++rkt_ew_add_table(int32_t a_zp, uint8_t table[RKT_EW_ADD_TABLE_BYTES])
++{
++   int32_t neg = -a_zp;
++   uint16_t one = 0x4000;
++
++   memset(table, 0, RKT_EW_ADD_TABLE_BYTES);
++   memcpy(table + 0, &neg, 4);
++   memcpy(table + 16, &neg, 4);
++   memcpy(table + 32, &one, 2);
++}
++
++static inline uint64_t
++rkt_ew_word(uint32_t target, uint32_t reg, uint32_t value)
++{
++   return ((uint64_t)target << 48) | ((uint64_t)value << 16) | reg;
++}
++
++/*
++ * The register stream, in the vendor's order (ml_014 capture, task 0), then
++ * the per-unit OP_ENs Mesa's RK3576 streams end with, for DPU and DPU RDMA
++ * only (the vendor's descriptor enable mask is 0x18: CNA and CORE stay off).
++ * Returns the number of words written to out[].
++ */
++static inline unsigned
++rkt_ew_add_emit(const struct rkt_ew_add *p, uint64_t *out)
++{
++   unsigned n = 0;
++   unsigned w = p->width, h = p->height, c = p->channels;
++   uint32_t plane = w * h;
++
++#define R_DPU(reg, val)  out[n++] = rkt_ew_word(0x1001, (reg), (uint32_t)(val))
++#define R_RDMA(reg, val) out[n++] = rkt_ew_word(0x2001, (reg), (uint32_t)(val))
++
++   R_DPU(0x4004, 0x0000000e);
++   R_RDMA(0x5004, 0x0000000e);
++
++   R_DPU(0x400c, 0x00000005);          /* DPU fed by its RDMA, not by CORE */
++   R_DPU(0x4010, 0x00000000);
++   R_DPU(0x4014, 0x00000000);
++   R_DPU(0x4018, p->out_addr);
++   R_DPU(0x401c, plane);
++   R_DPU(0x4020, w - 1);
++   R_DPU(0x4024, h - 1);
++   R_DPU(0x4028, 0x00000000);
++   R_DPU(0x402c, c - 1);
++   R_DPU(0x4030, ((c - 1) << 16) | 0x0f00);
++   R_DPU(0x4034, ((h - 1) << 16) | (w - 1));
++   R_DPU(0x4038, 0x00100012);
++   R_DPU(0x403c, 0x00000000);
++   R_DPU(0x4044, 0x00000000);
++   R_DPU(0x4048, 0x80000000);
++   R_DPU(0x404c, 0x7fffffff);
++   R_DPU(0x4050, 0x00000000);
++   R_DPU(0x4058, 0x80000000);
++   R_DPU(0x405c, 0x7fffffff);
++   R_DPU(0x4060, 0x00000903);
++   R_DPU(0x406c, 0x80000000);
++   R_DPU(0x4070, 0x7fffffff);
++   R_DPU(0x4074, 0x80000000);
++   R_DPU(0x4078, 0x7fffffff);
++   R_DPU(0x407c, 0x8002c0c0);          /* EW_CFG: ADD */
++   R_DPU(0x4080, -p->b_zp);            /* EW operand offset */
++   R_DPU(0x4084, p->b_cvt);            /* EW operand scale */
++   R_DPU(0x4088, 0x80000000);
++   R_DPU(0x408c, 0x7fffffff);
++   R_DPU(0x4090, 0x00000000);
++   R_DPU(0x4094, 0x00000000);
++   R_DPU(0x409c, 0x00000000);
++   R_DPU(0x40a4, 0x80000000);
++   R_DPU(0x40a8, 0x7fffffff);
++   R_DPU(0x40ac, p->out_zp);           /* OUT_CVT offset */
++   R_DPU(0x40b0, p->out_scale);        /* OUT_CVT scale */
++   R_DPU(0x40b4, p->out_shift);        /* OUT_CVT shift */
++   R_DPU(0x40b8, 0x00000000);          /* surface notch: tight surfaces */
++   R_DPU(0x40bc, 0x00000000);
++   R_DPU(0x40c0, 0x04440000);
++   R_DPU(0x40c8, 0x00000000);
++   R_DPU(0x40cc, 0x00000000);
++   R_DPU(0x40d0, 0x0040ffff);
++   for (uint32_t r = 0x4100; r <= 0x4120; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4130, 0x00000000);
++   for (uint32_t r = 0x4140; r <= 0x4154; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4160, 0x00000000);
++   R_DPU(0x4170, 0x00000000);
++   R_DPU(0x4174, 0x00000000);
++   R_DPU(0x4184, 0x00000000);
++   R_DPU(0x4188, 0x00000000);
++   R_DPU(0x418c, 0x00000000);
++   R_DPU(0x4190, 0x00000000);
++   R_DPU(0x4194, 0x00000000);
++
++   R_RDMA(0x500c, w - 1);
++   R_RDMA(0x5010, h - 1);
++   R_RDMA(0x5014, c - 1);
++   R_RDMA(0x5018, p->a_addr);          /* main operand */
++   R_RDMA(0x501c, 0x0000001a);
++   R_RDMA(0x5020, 0x00000000);
++   R_RDMA(0x5024, p->table_addr);      /* A coefficient record */
++   R_RDMA(0x5028, 0x00000000);
++   R_RDMA(0x502c, 0x00000000);
++   R_RDMA(0x5030, 0x00000000);
++   R_RDMA(0x5034, 0x40000044);
++   R_RDMA(0x5038, p->b_addr);          /* EW operand */
++   R_RDMA(0x5040, plane);              /* EW operand surface stride */
++   R_RDMA(0x5044, 0x00000009);
++   R_RDMA(0x5048, 0x00000000);
++   R_RDMA(0x504c, 0x00000000);
++   R_RDMA(0x5064, 0x00000000);
++   R_RDMA(0x506c, 0x00000000);
++   R_RDMA(0x5078, 0x00000000);
++   R_RDMA(0x507c, 0x00000000);
++
++   /* the unit OP_ENs every other RK3576 task writes */
++   R_DPU(0x4008, 0x1d);
++   R_RDMA(0x5008, 0x1d);
++
++#undef R_DPU
++#undef R_RDMA
++   return n;
++}
++
++#endif /* RKT_EW_H */
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index b677bd0..0eddf4b 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -483,6 +483,13 @@ find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
+          return operation;
+    }
+ 
++   /* the EW operand of an RK3576 ADD (rkt_ew.h) */
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
++      if (operation->ew_add && operation->add_tensor == (int)tensor_index)
++         return operation->ew_shadow;
++   }
++
+    return NULL;
+ }
+ 
+@@ -539,6 +546,125 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
+    return tensor->scales == NULL && tensor->zero_points == NULL;
+ }
+ 
++/* The tensor's zero point in the int8 domain the NPU computes in. */
++static int32_t
++rkt_ew_zp(const struct pipe_tensor *t)
++{
++   return t->is_signed ? t->zero_point : t->zero_point - 0x80;
++}
++
++/*
++ * RK3576 ADD on the NPU (rkt_ew.h): two operands of the output's own shape,
++ * no broadcast, no constants, per-tensor quantization, all three the same
++ * signedness.
++ *
++ * The vendor restrides surfaces whose pixel count is not a multiple of 4
++ * (75x75: 5625 -> 5628) with identity convolutions before the EW task; with
++ * Mesa's tight tensors the EW task reads them as they are, which is correct
++ * on the hardware. 1x1 (vector) ADDs stay on the CPU: in MoveNet's keypoint
++ * decoder they would only cut the CPU tail into NPU islands.
++ */
++static bool
++rkt_ew_add_supported(const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *a = operation->input_tensors[0];
++   struct pipe_tensor *b = operation->input_tensors[1];
++   struct pipe_tensor *o = operation->output_tensors[0];
++
++   if (operation->input_count != 2 ||
++       operation->output_count != 1)
++      return false;
++   if (a->resource != NULL || b->resource != NULL)
++      return false;
++   if (!tensor_quantization_supported(a) || !tensor_quantization_supported(b) ||
++       !tensor_quantization_supported(o))
++      return false;
++   if (!(a->scale > 0.0f) || !(b->scale > 0.0f) || !(o->scale > 0.0f))
++      return false;
++   for (unsigned d = 0; d < 4; d++) {
++      if (a->dims[d] != o->dims[d] || b->dims[d] != o->dims[d])
++         return false;
++   }
++   /* <= 4 channels would take the first-convolution input path in invoke */
++   if (o->dims[0] != 1 || o->dims[3] <= 4)
++      return false;
++   if (a->is_signed != o->is_signed || b->is_signed != o->is_signed)
++      return false;
++   if ((o->dims[1] * o->dims[2]) % 4 != 0 && (o->dims[1] < 2 || o->dims[2] < 2))
++      return false;
++
++   return true;
++}
++
++static void
++lower_add_rk3576(struct rkt_ml_subgraph *subgraph,
++                 const struct pipe_ml_operation *poperation,
++                 struct rkt_operation *operation)
++{
++   struct pipe_context *pcontext = subgraph->base.context;
++   struct rkt_screen *screen = rkt_screen(pcontext->screen);
++   const struct pipe_tensor *a = poperation->input_tensors[0];
++   const struct pipe_tensor *b = poperation->input_tensors[1];
++   const struct pipe_tensor *o = poperation->output_tensors[0];
++
++   /* the operand with the larger scale is the main one, so sB / sA <= 1 */
++   if (b->scale > a->scale) {
++      const struct pipe_tensor *t = a;
++      a = b;
++      b = t;
++   }
++
++   util_dynarray_init(&operation->tasks, NULL);
++   operation->soc = screen->soc;
++   operation->cbuf_banks = screen->cbuf_banks;
++   operation->cbuf_entries_per_bank = screen->cbuf_entries_per_bank;
++   operation->cbuf_bank_size = screen->cbuf_bank_size;
++   operation->ew_add = true;
++
++   operation->input_index = a->index;
++   operation->input_width = a->dims[1];
++   operation->input_height = a->dims[2];
++   operation->input_channels = a->dims[3];
++   operation->input_zero_point = rkt_ew_zp(a) + 0x80;
++   operation->input_scale = a->scale;
++   operation->add_tensor = b->index;
++
++   operation->output_index = o->index;
++   operation->output_width = o->dims[1];
++   operation->output_height = o->dims[2];
++   operation->output_channels = o->dims[3];
++   operation->output_zero_point = rkt_ew_zp(o) + 0x80;
++   operation->output_scale = o->scale;
++
++   operation->ew.width = o->dims[1];
++   operation->ew.height = o->dims[2];
++   operation->ew.channels = o->dims[3];
++   operation->ew.a_zp = rkt_ew_zp(a);
++   operation->ew.b_zp = rkt_ew_zp(b);
++   operation->ew.out_zp = rkt_ew_zp(o);
++   rkt_ew_add_quant(a->scale, b->scale, o->scale, &operation->ew.b_cvt,
++                    &operation->ew.out_scale, &operation->ew.out_shift);
++
++   /* the A coefficient record (0x5024) */
++   uint8_t table[RKT_EW_ADD_TABLE_BYTES];
++   rkt_ew_add_table(operation->ew.a_zp, table);
++   operation->biases = pipe_buffer_create(pcontext->screen, 0,
++                                          PIPE_USAGE_DEFAULT, sizeof(table));
++   pipe_buffer_write(pcontext, operation->biases, 0, sizeof(table), table);
++
++   /* invoke's view of operand B: same geometry, B's index and zero point */
++   operation->ew_shadow = calloc(1, sizeof(*operation->ew_shadow));
++   *operation->ew_shadow = *operation;
++   operation->ew_shadow->ew_add = false;
++   operation->ew_shadow->ew_shadow = NULL;
++   operation->ew_shadow->add_tensor = -1;
++   operation->ew_shadow->biases = NULL;
++   operation->ew_shadow->input_index = b->index;
++   operation->ew_shadow->input_zero_point = rkt_ew_zp(b) + 0x80;
++   operation->ew_shadow->input_scale = b->scale;
++   util_dynarray_init(&operation->ew_shadow->tasks, NULL);
++}
++
+ bool
+ rkt_ml_operation_supported(struct pipe_context *pcontext,
+                            const struct pipe_ml_operation *operation)
+@@ -566,6 +692,21 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+       break;
+    }
+    case PIPE_ML_OPERATION_TYPE_ADD:
++      /*
++       * Rocket has no standalone ADD: it fuses the addition into the DPU
++       * element-wise stage of the convolution producing input 0, which only
++       * the RK3588 encoder (fill_first_regcmd) programs. The RK3576 encoders
++       * write EW_CFG (0x407c on RK3576) as a constant bypass and never point
++       * the ERDMA at the second operand, so a fused ADD would silently return
++       * the bare convolution, and a standalone ADD (no producing convolution
++       * in the partition, e.g. ssdmobilenetv2/009) dereferenced NULL in
++       * rkt_ml_subgraph_create. On RK3576 an ADD runs as the DPU-only EW
++       * task the vendor compiler emits (rkt_ew.h).
++       */
++      if (rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576) {
++         supported = rkt_ew_add_supported(operation);
++         break;
++      }
+       supported = operation->input_tensors[0]->resource == NULL &&
+                   operation->input_tensors[1]->resource == NULL;
+       break;
+@@ -615,23 +756,45 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          break;
+       }
+       case PIPE_ML_OPERATION_TYPE_ADD: {
++         /* RK3576: a DPU-only element-wise task of its own (rkt_ew.h) */
++         if (rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576) {
++            lower_add_rk3576(subgraph, &poperations[i], &operation);
++            util_dynarray_append(&subgraph->operations, struct rkt_operation,
++                                 operation);
++            break;
++         }
++
+          /* Fuse tensor addition into convolution*/
+          struct rkt_operation *input_op_1 =
+             find_producer(subgraph, poperations[i].input_tensors[1]->index);
+          struct rkt_operation *input_op_2 =
+             find_producer(subgraph, poperations[i].input_tensors[0]->index);
+ 
+-         assert(input_op_1);
+-         assert(input_op_2);
+-
+-         if (input_op_1 == NULL) {
+-            /* Graph input */
+-            input_op_2->add_tensor = poperations[i].input_tensors[1]->index;
+-         } else {
+-            input_op_1->addition_input = true;
+-            input_op_2->add_tensor = input_op_1->output_index;
++         /*
++          * Both operands must come from convolutions in this subgraph: the
++          * addition is fused into input 0's producer, and an operand that is
++          * a subgraph input is never allocated nor uploaded (only an op's
++          * input_index is). Teflon claims ADD node by node, so a partition
++          * holding the ADD without its producers (a single-ADD model, or an
++          * unsupported op in between) reaches here; the asserts were
++          * compiled out in release builds and the code then wrote through
++          * NULL. Fail with a message instead.
++          */
++         if (input_op_1 == NULL || input_op_2 == NULL) {
++            fprintf(stderr,
++                    "rocket: ADD (tensors %u + %u -> %u) is not fed by two "
++                    "convolutions in this subgraph; standalone ADD is not "
++                    "implemented\n",
++                    poperations[i].input_tensors[0]->index,
++                    poperations[i].input_tensors[1]->index,
++                    poperations[i].output_tensors[0]->index);
++            rkt_ml_subgraph_destroy(pcontext, &subgraph->base);
++            return NULL;
+          }
+ 
++         input_op_1->addition_input = true;
++         input_op_2->add_tensor = input_op_1->output_index;
++
+          input_op_2->output_index = poperations[i].output_tensors[0]->index;
+          input_op_2->addition_offset =
+             0x80 - poperations[i].input_tensors[1]->zero_point -
+@@ -671,6 +834,8 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       }
+ 
+       create_tensor(subgraph, operation->input_index, input_size);
++      if (operation->ew_add)
++         create_tensor(subgraph, operation->add_tensor, input_size);
+    }
+ 
+    /* Create output tensors */
+@@ -688,7 +853,16 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+    /* Compile */
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+-      rkt_split_tasks(subgraph, operation);
++      if (operation->ew_add) {
++         /* one task, no CBUF: the DPU streams both operands from DRAM */
++         struct split_task task = {0};
++         task.output_width = operation->output_width;
++         task.output_height = operation->output_height;
++         task.output_channels = operation->output_channels;
++         task.output_channels_real = operation->output_channels;
++         util_dynarray_append(&operation->tasks, struct split_task, task);
++      } else
++         rkt_split_tasks(subgraph, operation);
+       compile_operation(subgraph, operation);
+    }
+ 
+@@ -1144,6 +1318,11 @@ static void
+ free_operation(struct rkt_operation *operation)
+ {
+    util_dynarray_fini(&operation->tasks);
++   if (operation->ew_shadow) {
++      util_dynarray_fini(&operation->ew_shadow->tasks);
++      free(operation->ew_shadow);
++      operation->ew_shadow = NULL;
++   }
+    pipe_resource_reference(&operation->regcmd, NULL);
+    pipe_resource_reference(&operation->weights, NULL);
+    pipe_resource_reference(&operation->biases, NULL);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index dd62a25..34038af 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -11,6 +11,7 @@
+ #include <util/u_dynarray.h>
+ 
+ #include "rkt_device.h"
++#include "rkt_ew.h"
+ 
+ // http://nvdla.org/hw/v1/ias/unit_description.html#convolution-buffer
+ // CBUF (convolution buffer) bank count and entries-per-bank differ by SoC and
+@@ -161,6 +162,17 @@ struct rkt_operation {
+ 
+    int add_tensor;
+ 
++   /*
++    * RK3576 element-wise ADD, one DPU-only task (rkt_ew.h). input_index is the
++    * main operand A (the larger scale), add_tensor the EW operand B, and ew
++    * holds the zero points and the CVT words; the addresses are filled in by
++    * the encoder. ew_shadow is what find_first_consumer() returns for B, so
++    * that invoke converts and uploads B like any other input.
++    */
++   bool ew_add;
++   struct rkt_ew_add ew;
++   struct rkt_operation *ew_shadow;
++
+    /* SoC + CBUF geometry, copied from the screen so the per-operation task
+     * splitter and register encoders can branch without a screen handle. */
+    enum rkt_soc soc;
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index ba0a395..1874199 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -2203,11 +2203,38 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
+    emit_raw(regs, 0x81, REG_PC_OPERATION_ENABLE, 0x1d);
+ }
+ 
++/*
++ * RK3576 element-wise ADD: one DPU-only task, both operands from DRAM
++ * (rkt_ew.h; vendor runtime capture ml_014, bit for bit).
++ */
++static void
++fill_regcmd_rk3576_ew_add(struct rkt_ml_subgraph *subgraph,
++                          const struct rkt_operation *operation,
++                          struct util_dynarray *regs)
++{
++   struct rkt_ew_add p = operation->ew;
++   uint64_t words[RKT_EW_ADD_MAX_REGS];
++
++   p.a_addr = rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
++   p.b_addr = rkt_get_tensor(subgraph, operation->add_tensor)->phys_addr;
++   p.out_addr = rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
++   p.table_addr = rkt_resource(operation->biases)->phys_addr;
++
++   unsigned n = rkt_ew_add_emit(&p, words);
++   for (unsigned i = 0; i < n; i++)
++      util_dynarray_append(regs, uint64_t, words[i]);
++}
++
+ void
+ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+                 const struct rkt_operation *operation,
+                 struct util_dynarray *regs, unsigned task_num)
+ {
++   if (operation->soc == RKT_SOC_RK3576 && operation->ew_add) {
++      fill_regcmd_rk3576_ew_add(subgraph, operation, regs);
++      return;
++   }
++
+    if (operation->soc == RKT_SOC_RK3576) {
+       /*
+        * RK3576 register map. The 224x224x3 first convolution uses the in_ch<=4
+-- 
+2.55.0
+

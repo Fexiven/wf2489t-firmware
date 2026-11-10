@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:11:48 +0100
+Subject: [PATCH 18/23] rocket: rk3576: fold PAD into the following convolution
+
+A PAD in front of a convolution cut the model into NPU/CPU partitions.
+The CNA pads with the input zero point, as PAD does, so a convolution
+reading a PAD of its subgraph reads the PAD's input instead, with the
+PAD added to its own padding as explicit padding (up to 7 per side
+together).
+
+rkt_ml_operations_filter() keeps a PAD only when every consumer is a
+claimed convolution of the same partition, so the PAD never has to run
+on its own.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c   | 115 +++++++++++++++++++++++++-
+ src/gallium/drivers/rocket/rkt_ml.h   |   7 ++
+ src/gallium/drivers/rocket/rkt_task.c |   8 +-
+ 3 files changed, 128 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 890f9ec..f67bf41 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -1001,6 +1001,39 @@ rkt_concat_supported(const struct pipe_ml_operation *operation)
+    return c == o->dims[3];
+ }
+ 
++/*
++ * PAD is claimed only to be folded into the convolutions that read it
++ * (explicit padding, rkt_ml_subgraph_create); rkt_ml_operations_filter()
++ * checks that every consumer is a claimed convolution in the same partition.
++ */
++static bool
++rkt_pad_supported(const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *i = operation->input_tensors[0];
++   struct pipe_tensor *o = operation->output_tensors[0];
++
++   if (operation->output_count != 1)
++      return false;
++   /* 4D only: the paddings tensor holds 4 pairs */
++   if (operation->input_tensors[1]->dims[2] != 4 ||
++       operation->input_tensors[1]->dims[3] != 2)
++      return false;
++   if (i->resource != NULL || !tensor_quantization_supported(i) ||
++       !tensor_quantization_supported(o))
++      return false;
++   if (i->scale != o->scale || i->zero_point != o->zero_point ||
++       i->is_signed != o->is_signed)
++      return false;
++   if (operation->pad.before_z || operation->pad.after_z || i->dims[0] != 1 ||
++       i->dims[3] <= 4)
++      return false;
++   /* the CNA pad fields: up to 7 per side together with the conv's own */
++   if (operation->pad.before_x > 4 || operation->pad.after_x > 4 ||
++       operation->pad.before_y > 4 || operation->pad.after_y > 4)
++      return false;
++   return true;
++}
++
+ /*
+  * Rocket applies no activation fused into an ADD, pooling or concatenation.
+  * Such an operation is still correct when the output's quantized range
+@@ -1130,6 +1163,10 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+       supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
+                   rkt_concat_supported(operation);
+       break;
++   case PIPE_ML_OPERATION_TYPE_PAD:
++      supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
++                  rkt_pad_supported(operation);
++      break;
+    default:
+       supported = false;
+    }
+@@ -1309,6 +1346,35 @@ drop_misplaced(struct rkt_ml_graph *g, bool *supported)
+       }
+    }
+ 
++   /*
++    * A PAD is folded into the convolutions reading it, so every consumer
++    * must be a claimed convolution of the same partition, reading it as
++    * its input 0.
++    */
++   for (int i = 0; i < n; i++) {
++      const struct pipe_tensor *out;
++      int consumers = 0;
++      bool ok = true;
++
++      if (!supported[i] || ops[i].type != PIPE_ML_OPERATION_TYPE_PAD)
++         continue;
++      out = ops[i].output_tensors[0];
++      for (int k = 0; k < n; k++) {
++         for (unsigned j = 0; j < ops[k].input_count; j++) {
++            if (ops[k].input_tensors[j] != out)
++               continue;
++            consumers++;
++            if (j != 0 || !supported[k] || g->partition[k] != g->partition[i] ||
++                ops[k].type != PIPE_ML_OPERATION_TYPE_CONVOLUTION)
++               ok = false;
++         }
++      }
++      if (!ok || !consumers) {
++         supported[i] = false;
++         changed = true;
++      }
++   }
++
+    /*
+     * Only the CPU's input conversion writes the tight first-convolution
+     * input (rkt_ml_subgraph_invoke). Inside one partition that tensor can
+@@ -1390,18 +1456,65 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       operation.add_tensor = -1;
+ 
+       switch (poperations[i].type) {
++      case PIPE_ML_OPERATION_TYPE_PAD:
++         /* folded into its consumers below */
++         break;
+       case PIPE_ML_OPERATION_TYPE_CONCATENATION:
+          lower_concat_rk3576(subgraph, &poperations[i], &operation);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+                               operation);
+          break;
+       case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
++         /*
++          * a convolution reading a PAD of this subgraph reads the PAD's
++          * input with the padding added to its own (explicit padding).
++          */
++         struct pipe_ml_operation padded;
++         struct pipe_tensor *padded_inputs[3];
++         const struct pipe_ml_operation *pad_op = NULL;
++         for (int j = 0; j < count; j++)
++            if (poperations[j].type == PIPE_ML_OPERATION_TYPE_PAD &&
++                poperations[j].output_tensors[0]->index ==
++                   poperations[i].input_tensors[0]->index)
++               pad_op = &poperations[j];
++         const struct pipe_ml_operation *cur = &poperations[i];
++         if (pad_op) {
++            padded = poperations[i];
++            for (unsigned k = 0; k < padded.input_count && k < 3; k++)
++               padded_inputs[k] = poperations[i].input_tensors[k];
++            padded_inputs[0] = pad_op->input_tensors[0];
++            padded.input_tensors = padded_inputs;
++            cur = &padded;
++         }
++
+          /* int8 tensors are lowered as offset uint8, see rkt_int8.h. */
+          struct rkt_int8_view view;
+          const struct pipe_ml_operation *pop =
+-            rkt_int8_view(pcontext, &poperations[i], &view);
++            rkt_int8_view(pcontext, cur, &view);
+          operation.int8 = pop != &poperations[i];
+          operation.in_signed = poperations[i].input_tensors[0]->is_signed;
++         if (pad_op) {
++            /*
++             * The convolution's own padding first (SAME, or none), then the
++             * PAD on top. Mesa's width is TFLite dim 1 (x), height dim 2 (y).
++             */
++            unsigned t, b, l, r;
++            struct rkt_operation geo = {0};
++            geo.padding_same = poperations[i].conv.padding_same;
++            geo.stride = poperations[i].conv.stride_x;
++            geo.weights_width = poperations[i].conv.weight_tensor->dims[1];
++            geo.weights_height = poperations[i].conv.weight_tensor->dims[2];
++            geo.input_width = poperations[i].input_tensors[0]->dims[1];
++            geo.input_height = poperations[i].input_tensors[0]->dims[2];
++            geo.output_width = poperations[i].output_tensors[0]->dims[1];
++            geo.output_height = poperations[i].output_tensors[0]->dims[2];
++            rkt_calc_explicit_padding(&geo, &t, &b, &l, &r);
++            operation.pad_explicit = true;
++            operation.pad_l = l + pad_op->pad.before_x;
++            operation.pad_r = r + pad_op->pad.after_x;
++            operation.pad_t = t + pad_op->pad.before_y;
++            operation.pad_b = b + pad_op->pad.after_y;
++         }
+          lower_convolution(subgraph, pop, &operation);
+          rkt_int8_view_fini(&view);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index f08de42..51e246c 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -237,6 +237,13 @@ struct rkt_operation {
+    unsigned *concat_in;
+    unsigned *concat_c;
+    struct rkt_operation *concat_shadow;
++
++   /*
++    * PAD folded into this convolution: explicit padding instead of
++    * padding_same (the PAD pads with the input zero point, as the CNA does).
++    */
++   bool pad_explicit;
++   unsigned pad_t, pad_b, pad_l, pad_r;
+ };
+ 
+ struct rkt_ml_subgraph {
+diff --git a/src/gallium/drivers/rocket/rkt_task.c b/src/gallium/drivers/rocket/rkt_task.c
+index 8b69663..e6e33c4 100644
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -83,7 +83,13 @@ calc_explicit_padding(const struct rkt_operation *operation,
+                       unsigned *pad_top, unsigned *pad_bottom,
+                       unsigned *pad_left, unsigned *pad_right)
+ {
+-   if (operation->padding_same && operation->weights_width > 1) {
++   if (operation->pad_explicit) {
++      /* a PAD folded into this convolution (rkt_ml.c) */
++      *pad_left = operation->pad_l;
++      *pad_right = operation->pad_r;
++      *pad_top = operation->pad_t;
++      *pad_bottom = operation->pad_b;
++   } else if (operation->padding_same && operation->weights_width > 1) {
+       /* Convert from implicit to explicit padding */
+       unsigned pad_along_width =
+          MAX2((operation->output_width - 1) * operation->stride +
+-- 
+2.55.0
+

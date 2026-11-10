@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:09:57 +0100
+Subject: [PATCH 14/23] rocket: rk3576: keep tight first-convolution inputs
+ within the CPU's reach
+
+A convolution that reads 4 or fewer channels (a non-depthwise one, or a
+depthwise one with one channel) takes its input in the tight NHWC layout
+of a first convolution, which only the CPU-side input conversion writes.
+Inside one partition such a tensor must therefore not be produced by
+another claimed operation, which would write it in the NC1HWC2 layout,
+nor be read by a claimed operation that expects that layout.
+
+Give such a convolution back to the CPU in rkt_ml_operations_filter()
+when another claimed operation of its partition writes its input or
+reads it in the other layout. The first convolution of a model reads the
+graph input and stays on the NPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c | 65 ++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 9ccf3f9..bcad3c3 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -920,6 +920,67 @@ drop_partitions_without_convolution(struct rkt_ml_graph *g, bool *supported)
+    return changed;
+ }
+ 
++/*
++ * A convolution that takes its input as the tight NHWC input of a first
++ * convolution: a non-depthwise one reading <= 4 channels, or a depthwise
++ * one reading one channel.
++ */
++static bool
++tight_small_input(const struct pipe_ml_operation *op)
++{
++   if (op->type != PIPE_ML_OPERATION_TYPE_CONVOLUTION ||
++       op->input_tensors[0]->dims[3] > 4)
++      return false;
++   return !op->conv.depthwise || op->input_tensors[0]->dims[3] == 1;
++}
++
++/*
++ * Rules about where a tensor is produced and consumed within a partition.
++ * Returns true if an operation was given back.
++ */
++static bool
++drop_misplaced(struct rkt_ml_graph *g, bool *supported)
++{
++   const struct pipe_ml_operation *ops = g->ops;
++   int n = g->count;
++   bool changed = false;
++
++   rkt_ml_graph_partition(g, supported);
++
++   /*
++    * Only the CPU's input conversion writes the tight first-convolution
++    * input (rkt_ml_subgraph_invoke). Inside one partition that tensor can
++    * therefore not come from another claimed operation (it would be
++    * written in the NC1HWC2 layout) nor feed a claimed operation that is
++    * not such a convolution. The first convolution of a model reads the
++    * graph input and keeps it.
++    */
++   for (int i = 0; i < n; i++) {
++      const struct pipe_tensor *t;
++
++      if (!supported[i] || !tight_small_input(&ops[i]))
++         continue;
++      t = ops[i].input_tensors[0];
++      for (int k = 0; k < n; k++) {
++         bool reads = false, writes = false;
++
++         if (k == i || !supported[k] || g->partition[k] != g->partition[i])
++            continue;
++         for (unsigned j = 0; j < ops[k].output_count; j++)
++            writes |= ops[k].output_tensors[j] == t;
++         for (unsigned j = 0; j < ops[k].input_count; j++)
++            reads |= ops[k].input_tensors[j] == t;
++         if (writes || (reads && !tight_small_input(&ops[k]))) {
++            supported[i] = false;
++            changed = true;
++            break;
++         }
++      }
++   }
++
++   return changed;
++}
++
+ /*
+  * RK3576 (rkt_create_context): graph-level rules on top of
+  * rkt_ml_operation_supported(). Giving an operation back changes the
+@@ -934,7 +995,9 @@ rkt_ml_operations_filter(struct pipe_context *pcontext,
+ 
+    rkt_ml_graph_init(&g, operations, count);
+    for (int pass = 0; pass < 8; pass++) {
+-      if (!drop_partitions_without_convolution(&g, supported))
++      bool changed = drop_misplaced(&g, supported);
++      changed |= drop_partitions_without_convolution(&g, supported);
++      if (!changed)
+          break;
+    }
+    rkt_ml_graph_fini(&g);
+-- 
+2.55.0
+

@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:58:11 +0100
+Subject: [PATCH 21/23] rocket: rk3576: CONCATENATION at any channel offset
+
+The zero-copy concatenation needed every input but the last to have a
+multiple of 16 channels, so YOLOX's three detection-head concatenations
+(4 + 1 + 80 channels) stayed on the CPU.
+
+Every input now starts at a 16-channel group of the concatenation's
+buffer. When the inputs are not all multiples of 16 (except the last),
+that buffer is an internal tensor of ALIGN(c_0, 16) + ALIGN(c_1, 16) +
+... channels, the producers still write their views of it, and a 1x1
+convolution with 0/1 weights packs the channels into the real output.
+The vendor compiler does the same for such offsets (DPU copies into a
+padded buffer and a convolution "restride"); the inputs and the output
+share their quantization (TFLite's int8 kernel requires it), so the
+packing convolution's requantization is an exact 1.0. It is a normal
+convolution for the two-core planner and the job batching. Only int8
+tensors take this path, as only they were tested.
+
+An input of <= 4 channels is claimed only when a claimed operation of
+the partition writes it: a subgraph input of that size would be uploaded
+in the tight first-convolution layout.
+
+count_tensors() now counts every concatenation input and accepts PAD,
+which reached its UNREACHABLE default.
+
+YOLOX: 13 -> 16 concatenations on the NPU, 16.4 -> 16.0 ms, outputs
+byte-identical; test models with 4 + 1 + 80, 24 + 40 + 8, 3 + 5 + 20 and
+1 + 17 + 2 + 30 channels, as graph outputs and feeding a 3x3
+convolution, are byte-identical to the CPU concatenation in one- and
+two-core mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c | 157 ++++++++++++++++++++++++++--
+ 1 file changed, 148 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index b81c30e..fc8e5e9 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -544,8 +544,13 @@ count_tensors(const struct pipe_ml_operation *poperations,
+       case PIPE_ML_OPERATION_TYPE_ADD:
+          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
+          break;
++      case PIPE_ML_OPERATION_TYPE_CONCATENATION:
++         for (unsigned k = 1; k < poperation->input_count; k++)
++            tensor_count = MAX2(tensor_count, poperation->input_tensors[k]->index);
++         break;
+       case PIPE_ML_OPERATION_TYPE_POOLING:
+       case PIPE_ML_OPERATION_TYPE_RESIZE:
++      case PIPE_ML_OPERATION_TYPE_PAD:
+          break;
+       default:
+          DBG("poperation->type %d\n", poperation->type);
+@@ -834,6 +839,95 @@ lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
+    }
+ }
+ 
++/*
++ * A concatenation whose inputs do not all start at a multiple of 16
++ * channels (except the last), such as YOLOX's 4 + 1 + 80 channel heads.
++ */
++static bool
++concat_needs_pack(const struct pipe_ml_operation *poperation)
++{
++   for (unsigned k = 0; k + 1 < poperation->input_count; k++)
++      if (poperation->input_tensors[k]->dims[3] % FEATURE_ATOMIC_SIZE)
++         return true;
++   return false;
++}
++
++/*
++ * The 1x1 convolution after a concatenation with a padded layout
++ * (lower_concat_rk3576): from the internal tensor padded_index, which holds
++ * input k at channel ALIGN(c_0, 16) + ... + ALIGN(c_k-1, 16), to the real
++ * output. Output channel o reads its input channel with weight 1 and every
++ * other channel with weight 0; input and output have the same quantization,
++ * so the requantization is an exact 1.0. This is how rknn-toolkit2 packs a
++ * concatenation at channel offsets that are not multiples of 16 (copy tasks
++ * into a padded buffer and a convolution "restride").
++ */
++static void
++lower_concat_pack_rk3576(struct rkt_ml_subgraph *subgraph,
++                         const struct pipe_ml_operation *poperation,
++                         unsigned padded_index, unsigned cpad,
++                         struct rkt_operation *operation)
++{
++   struct pipe_context *pcontext = subgraph->base.context;
++   struct pipe_tensor *o = poperation->output_tensors[0];
++   unsigned oc = o->dims[3];
++   struct pipe_tensor in = *o, w = {0}, b = {0};
++   struct pipe_tensor *inputs[3] = {&in, &w, &b};
++   struct pipe_ml_operation conv = {0};
++   uint8_t *wdata = calloc(oc, cpad);
++   int32_t *bdata = calloc(oc, sizeof(int32_t));
++   unsigned c0 = 0, g0 = 0;
++
++   for (unsigned k = 0; k < poperation->input_count; k++) {
++      unsigned c = poperation->input_tensors[k]->dims[3];
++      for (unsigned j = 0; j < c; j++)
++         wdata[(c0 + j) * cpad + g0 + j] = 1;
++      c0 += c;
++      g0 += ALIGN(c, FEATURE_ATOMIC_SIZE);
++   }
++
++   in.resource = NULL;
++   in.index = padded_index;
++   in.dims[3] = cpad;
++   w.dims[0] = oc;
++   w.dims[1] = w.dims[2] = 1;
++   w.dims[3] = cpad;
++   w.scale = 1.0f;
++   w.is_signed = o->is_signed;
++   w.resource = pipe_buffer_create_with_data(pcontext, 0, PIPE_USAGE_DEFAULT,
++                                             oc * cpad, wdata);
++   b.dims[0] = oc;
++   b.dims[1] = b.dims[2] = b.dims[3] = 1;
++   b.scale = o->scale;
++   b.is_signed = true;
++   b.resource = pipe_buffer_create_with_data(pcontext, 0, PIPE_USAGE_DEFAULT,
++                                             oc * sizeof(int32_t), bdata);
++   free(wdata);
++   free(bdata);
++
++   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
++   conv.input_tensors = inputs;
++   conv.input_count = 3;
++   conv.output_tensors = poperation->output_tensors;
++   conv.output_count = 1;
++   conv.conv.weight_tensor = &w;
++   conv.conv.bias_tensor = &b;
++   conv.conv.stride_x = conv.conv.stride_y = 1;
++   conv.conv.pointwise = true;
++   conv.conv.dilation_width_factor = conv.conv.dilation_height_factor = 1;
++
++   struct rkt_int8_view view;
++   const struct pipe_ml_operation *pop = rkt_int8_view(pcontext, &conv, &view);
++   operation->add_tensor = -1;
++   operation->int8 = pop != &conv;
++   operation->in_signed = in.is_signed;
++   lower_convolution(subgraph, pop, operation);
++   rkt_int8_view_fini(&view);
++
++   pipe_resource_reference(&w.resource, NULL);
++   pipe_resource_reference(&b.resource, NULL);
++}
++
+ static void
+ lower_concat_rk3576(struct rkt_ml_subgraph *subgraph,
+                     const struct pipe_ml_operation *poperation,
+@@ -857,6 +951,25 @@ lower_concat_rk3576(struct rkt_ml_subgraph *subgraph,
+    operation->output_zero_point = rkt_ew_zp(o) + 0x80;
+    operation->output_scale = o->scale;
+ 
++   /*
++    * Every input starts at a 16-channel group of the concatenation's buffer
++    * (place_concat_views). When an input other than the last has a channel
++    * count that is not a multiple of 16, that buffer is not the output's
++    * layout: it becomes an internal tensor of the padded channel count, and
++    * a 1x1 convolution after the concatenation packs its channels
++    * (lower_concat_pack_rk3576).
++    */
++   if (concat_needs_pack(poperation)) {
++      unsigned cpad = 0;
++      for (unsigned k = 0; k < n; k++)
++         cpad += ALIGN(poperation->input_tensors[k]->dims[3],
++                       FEATURE_ATOMIC_SIZE);
++      operation->output_index =
++         util_dynarray_num_elements(&subgraph->tensors, struct pipe_resource *);
++      util_dynarray_append(&subgraph->tensors, struct pipe_resource *, NULL);
++      operation->output_channels = cpad;
++   }
++
+    operation->concat_n = n;
+    operation->concat_in = calloc(n, sizeof(unsigned));
+    operation->concat_c = calloc(n, sizeof(unsigned));
+@@ -923,13 +1036,14 @@ place_concat_views(struct rkt_ml_subgraph *subgraph)
+          unsigned off = c0 / FEATURE_ATOMIC_SIZE * plane;
+          struct pipe_resource *parent = tensors[op->output_index];
+ 
+-         if (tensors[idx] || c0 % FEATURE_ATOMIC_SIZE) {
++         if (tensors[idx]) {
+             fprintf(stderr, "rocket: CONCAT -> t%u: input t%u cannot be "
+                     "placed in the output\n", op->output_index, idx);
+             return false;
+          }
+          tensors[idx] = rkt_resource_view(parent, off, parent->width0 - off);
+-         c0 += op->concat_c[k];
++         /* the next input starts at the next 16-channel group */
++         c0 += ALIGN(op->concat_c[k], FEATURE_ATOMIC_SIZE);
+       }
+    }
+    return true;
+@@ -963,11 +1077,15 @@ real_producers(struct rkt_ml_subgraph *subgraph, unsigned idx,
+  * that starts at a channel offset c0 with c0 % 16 == 0 is the byte range
+  * [c0 / 16 * plane, ...) of the output (plane = W * H * 16), so it becomes a
+  * view of the output BO and its producer writes straight into the concat.
++ * An input at any other channel offset still starts at a 16-channel group,
++ * and a 1x1 convolution packs the channels afterwards
++ * (lower_concat_pack_rk3576; int8 tensors only, as tested).
+  * Conditions: per-tensor quantization identical on all inputs and the output
+- * (no requantization), same batch / spatial size, every input except the
+- * last a multiple of 16 channels, more than 4 channels everywhere (<= 4 is
+- * the first-convolution input path). rkt_ml_operations_filter() makes sure
+- * that no tensor is an input of two claimed concatenations. Tensors of lower
++ * (no requantization; TFLite's int8 kernel requires it), same batch /
++ * spatial size, more than 4 output channels. rkt_ml_operations_filter()
++ * makes sure that no tensor is an input of two claimed concatenations and
++ * that an input of <= 4 channels (which would be uploaded in the tight
++ * first-convolution layout) is produced in the partition. Tensors of lower
+  * rank come with leading dimensions of 1, so axis 3 / -1 is their last axis.
+  */
+ static bool
+@@ -990,15 +1108,16 @@ rkt_concat_supported(const struct pipe_ml_operation *operation)
+           i->is_signed != o->is_signed)
+          return false;
+       if (i->dims[0] != 1 || i->dims[1] != o->dims[1] ||
+-          i->dims[2] != o->dims[2] || i->dims[3] <= 4)
+-         return false;
+-      if (k + 1 < operation->input_count && i->dims[3] % FEATURE_ATOMIC_SIZE)
++          i->dims[2] != o->dims[2] || !i->dims[3])
+          return false;
+       for (unsigned j = 0; j < k; j++)
+          if (operation->input_tensors[j]->index == i->index)
+             return false;
+       c += i->dims[3];
+    }
++   /* the packing convolution is only tested with int8 tensors */
++   if (concat_needs_pack(operation) && !o->is_signed)
++      return false;
+    return c == o->dims[3];
+ }
+ 
+@@ -1346,6 +1465,18 @@ drop_misplaced(struct rkt_ml_graph *g, bool *supported)
+                if (ops[i].input_tensors[j] == ops[k].input_tensors[l])
+                   ok = false;
+       }
++      /*
++       * An input of <= 4 channels that is not written by a claimed
++       * operation of the partition would be uploaded by invoke in the tight
++       * first-convolution layout, not into its 16-channel group.
++       */
++      for (unsigned j = 0; j < ops[i].input_count && ok; j++) {
++         int p = g->producer[i][j];
++         if (ops[i].input_tensors[j]->dims[3] <= 4 &&
++             (p < 0 || !supported[p] || g->partition[p] != g->partition[i] ||
++              ops[p].type == PIPE_ML_OPERATION_TYPE_PAD))
++            ok = false;
++      }
+       if (!ok) {
+          supported[i] = false;
+          changed = true;
+@@ -1488,6 +1619,14 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          lower_concat_rk3576(subgraph, &poperations[i], &operation);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+                               operation);
++         if (concat_needs_pack(&poperations[i])) {
++            struct rkt_operation pack = {0};
++            lower_concat_pack_rk3576(subgraph, &poperations[i],
++                                     operation.output_index,
++                                     operation.output_channels, &pack);
++            util_dynarray_append(&subgraph->operations, struct rkt_operation,
++                                 pack);
++         }
+          break;
+       case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
+          /*
+-- 
+2.55.0
+

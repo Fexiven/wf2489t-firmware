@@ -1,0 +1,583 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:10 +0100
+Subject: [PATCH 05/23] rocket: rk3576: signed int8 tensors and per-channel
+ scales
+
+Two independent bugs made every int8 layer about 99 % wrong:
+
+1. The driver assumed uint8 throughout (inputs fed as q - 0x80, weights
+   packed as w - 0x80, zero points 0..255). An int8 tensor arrives with
+   raw int8 bytes and a negative zero point, so the NPU got raw ^ 0x80.
+   Lower an int8 layer as its offset-uint8 twin instead (zero points
+   + 128, weights XOR 0x80, bias unchanged); signed graph inputs and
+   outputs are flipped on upload/readback. The NPU then receives exactly
+   the bytes the vendor runtime feeds it.
+
+2. Per-channel scales: the DPU computes ((MAC + A) * C >> s) followed by
+   OUT_CVT, with C the int16 in the coefficient record and s the low byte
+   of the word RDMA 0x5024 points at. The vendor writes C = Q14(wt_sc /
+   max wt_sc), the word 0x0E0E and OUT_CVT from max(wt_sc); a 4-bit C
+   with the word 0x1004 and OUT_CVT from the mean scale left every channel
+   off by max/mean. Write the vendor values (rkt_int8_fix_coefs) for
+   per-axis weights on RK3576.
+
+<= 4 channel int8 layers on the generic encoder keep raw int8 input with
+the CNA CVT bypassed and get a valid 0x5024 word. uint8 layers are
+unchanged (checked byte for byte with an offline harness running the real
+driver code).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/meson.build  |   1 +
+ src/gallium/drivers/rocket/rkt_int8.c   | 228 ++++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_int8.h   | 106 +++++++++++
+ src/gallium/drivers/rocket/rkt_ml.c     |  61 ++++++-
+ src/gallium/drivers/rocket/rkt_ml.h     |   8 +
+ src/gallium/drivers/rocket/rkt_regcmd.c |   3 +
+ 6 files changed, 399 insertions(+), 8 deletions(-)
+ create mode 100644 src/gallium/drivers/rocket/rkt_int8.c
+ create mode 100644 src/gallium/drivers/rocket/rkt_int8.h
+
+diff --git a/src/gallium/drivers/rocket/meson.build b/src/gallium/drivers/rocket/meson.build
+index f327154..03e75c0 100644
+--- a/src/gallium/drivers/rocket/meson.build
++++ b/src/gallium/drivers/rocket/meson.build
+@@ -12,6 +12,7 @@ rocket_registers = custom_target(
+ files_rocket = files(
+   'rkt_coefs.c',
+   'rkt_device.c',
++  'rkt_int8.c',
+   'rkt_ml.c',
+   'rkt_regcmd.c',
+   'rkt_task.c',
+diff --git a/src/gallium/drivers/rocket/rkt_int8.c b/src/gallium/drivers/rocket/rkt_int8.c
+new file mode 100644
+index 0000000..d3e9fdc
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_int8.c
+@@ -0,0 +1,228 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Signed int8 tensors as offset uint8, see rkt_int8.h.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "util/macros.h"
++#include "util/u_inlines.h"
++
++#include "rkt_coefs.h"
++#include "rkt_int8.h"
++#include "rkt_ml.h"
++#include "rkt_task.h"
++
++void
++rkt_int8_flip(void *data, unsigned n)
++{
++   uint8_t *p = data;
++   for (unsigned i = 0; i < n; i++)
++      p[i] ^= 0x80;
++}
++
++/*
++ * Copy *src into the next slot of the view, moved into the uint8 domain:
++ * zero point(s) + 128, no longer signed. Only ever called on the 8-bit
++ * activations and weights, never on the int32 bias.
++ */
++static struct pipe_tensor *
++shift_tensor(struct rkt_int8_view *view, struct pipe_tensor *src,
++             unsigned channels)
++{
++   if (!src || !src->is_signed || view->tensor_count >= ARRAY_SIZE(view->tensors))
++      return src;
++
++   unsigned i = view->tensor_count++;
++   struct pipe_tensor *t = &view->tensors[i];
++
++   *t = *src;
++   t->zero_point = src->zero_point + 128;
++   t->is_signed = false;
++   if (src->zero_points && channels) {
++      view->zero_points[i] = malloc(channels * sizeof(int));
++      for (unsigned c = 0; c < channels; c++)
++         view->zero_points[i][c] = src->zero_points[c] + 128;
++      t->zero_points = view->zero_points[i];
++   }
++   return t;
++}
++
++/* A signed 8-bit tensor anywhere but in a convolution's int32 bias. */
++static bool
++has_signed_8bit(const struct pipe_ml_operation *poperation)
++{
++   bool conv = poperation->type == PIPE_ML_OPERATION_TYPE_CONVOLUTION;
++
++   for (unsigned i = 0; i < (conv ? 1 : poperation->input_count); i++)
++      if (poperation->input_tensors[i] && poperation->input_tensors[i]->is_signed)
++         return true;
++   for (unsigned i = 0; i < poperation->output_count; i++)
++      if (poperation->output_tensors[i] && poperation->output_tensors[i]->is_signed)
++         return true;
++   return conv && poperation->conv.weight_tensor &&
++          poperation->conv.weight_tensor->is_signed;
++}
++
++const struct pipe_ml_operation *
++rkt_int8_view(struct pipe_context *pcontext,
++              const struct pipe_ml_operation *poperation,
++              struct rkt_int8_view *view)
++{
++   memset(view, 0, sizeof(*view));
++
++   if (!has_signed_8bit(poperation) ||
++       poperation->input_count > ARRAY_SIZE(view->in_ptrs) ||
++       poperation->output_count > ARRAY_SIZE(view->out_ptrs))
++      return poperation;
++
++   bool conv = poperation->type == PIPE_ML_OPERATION_TYPE_CONVOLUTION;
++   struct pipe_tensor *w = conv ? poperation->conv.weight_tensor : NULL;
++   unsigned n = w ? w->dims[0] * w->dims[1] * w->dims[2] * w->dims[3] : 0;
++
++   /* Signed weights we cannot rewrite (not 8 bit, no data): leave it all. */
++   if (w && w->is_signed &&
++       (!w->resource || pipe_buffer_size(w->resource) != n))
++      return poperation;
++
++   view->op = *poperation;
++   view->op.input_tensors = view->in_ptrs;
++   view->op.output_tensors = view->out_ptrs;
++
++   /*
++    * The bias of a convolution is input 2 (int32, zero point 0, scale
++    * in_scale * w_scale). It is the same number in both domains, so it keeps
++    * pointing at the original tensor, like any input other than the
++    * activations.
++    */
++   for (unsigned i = 0; i < poperation->input_count; i++) {
++      struct pipe_tensor *t = poperation->input_tensors[i];
++      bool activation = !conv || i == 0;
++      view->in_ptrs[i] = activation ? shift_tensor(view, t, 0) : t;
++   }
++   for (unsigned i = 0; i < poperation->output_count; i++)
++      view->out_ptrs[i] = shift_tensor(view, poperation->output_tensors[i], 0);
++
++   if (w && w->is_signed) {
++      unsigned oc = poperation->output_tensors[0]->dims[3];
++      struct pipe_transfer *transfer;
++      const uint8_t *src =
++         pipe_buffer_map(pcontext, w->resource, PIPE_MAP_READ, &transfer);
++      uint8_t *tmp = malloc(n);
++
++      memcpy(tmp, src, n);
++      pipe_buffer_unmap(pcontext, transfer);
++      rkt_int8_flip(tmp, n);
++      view->weights = pipe_buffer_create_with_data(pcontext, 0,
++                                                   PIPE_USAGE_DEFAULT, n, tmp);
++      free(tmp);
++
++      struct pipe_tensor *wv = shift_tensor(view, w, oc);
++      wv->resource = view->weights;
++      view->op.conv.weight_tensor = wv;
++      if (poperation->input_count > 1 && poperation->input_tensors[1] == w)
++         view->in_ptrs[1] = wv;
++   }
++
++   return &view->op;
++}
++
++void
++rkt_int8_view_fini(struct rkt_int8_view *view)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(view->zero_points); i++)
++      free(view->zero_points[i]);
++   pipe_resource_reference(&view->weights, NULL);
++   memset(view, 0, sizeof(*view));
++}
++
++bool
++rkt_int8_c_q14(const struct rkt_operation *operation,
++               const struct pipe_ml_operation *poperation)
++{
++   return operation->soc == RKT_SOC_RK3576 &&
++          poperation->conv.weight_tensor->scales != NULL;
++}
++
++void
++rkt_int8_fix_coefs(struct pipe_context *pcontext,
++                   const struct pipe_ml_operation *poperation,
++                   const struct rkt_operation *operation)
++{
++   /* rkt_fill_biases() numbers its dumps the same way. */
++   static int dump_idx = 0;
++
++   if (operation->soc != RKT_SOC_RK3576 || getenv("ROCKET_RK3588_SDP"))
++      return;
++   int idx = dump_idx++;
++
++   bool firstconv = rkt_rk3576_firstconv(operation);
++   bool op2_fix = operation->int8 && !operation->c_q14 && !firstconv &&
++                  operation->input_channels <= 4 && !operation->depthwise;
++   if (!operation->c_q14 && !op2_fix)
++      return;
++
++   bool dw = operation->depthwise;
++   unsigned oc_n = operation->output_channels;
++   unsigned table_bytes = rkt_coef_table_bytes(dw, oc_n);
++   unsigned op2_off = firstconv
++                         ? 0x100
++                         : table_bytes + (getenv("ROCKET_SCALE_OFF")
++                                             ? 0 : rkt_scale_table_bytes(oc_n));
++   unsigned size = pipe_buffer_size(operation->biases);
++   struct pipe_transfer *transfer;
++   uint8_t *b8 = pipe_buffer_map(pcontext, operation->biases, PIPE_MAP_WRITE,
++                                 &transfer);
++
++   if (operation->c_q14) {
++      const float *wsc = poperation->conv.weight_tensor->scales;
++      float max = 0.0f;
++      for (unsigned oc = 0; oc < oc_n; oc++)
++         max = MAX2(max, wsc[oc]);
++
++      unsigned padded = dw ? oc_n : ALIGN(oc_n, 8);
++      for (unsigned oc = 0; oc < padded; oc++) {
++         unsigned src = MIN2(oc, oc_n - 1);
++         unsigned g = oc / 8, i = oc % 8;
++         unsigned off = dw ? g * 48 + 32 + i * 2 : g * 64 + 48 + i * 2;
++         float q14 = max > 0.0f ? wsc[src] / max * 16384.0f : 0.0f;
++         int c = (int)(q14 + 0.5f);
++         if (off + 2 > table_bytes)
++            continue;
++         /*
++          * A channel whose scale is below 2^-15 of the largest (dead channels
++          * at 1e-6 in movenet's first conv) would get C = 0. The vendor writes
++          * 1 and scales A by q14 / 1 so that A * C still carries the bias at
++          * the right size.
++          */
++         if (c == 0 && q14 > 0.0f) {
++            c = 1;
++            int32_t *a = (int32_t *)(b8 + (dw ? g * 48 : g * 64) + i * 4);
++            *a = (int32_t)((double)*a * q14 + (*a >= 0 ? 0.5 : -0.5));
++         }
++         *(int16_t *)(b8 + off) = (int16_t)MIN2(c, 16384);
++      }
++   }
++
++   /*
++    * The second operand word. The first conv encoder points 0x5024 at
++    * +0x100, which is past the record table only for <= 32 channels.
++    */
++   if (op2_off >= table_bytes && op2_off + 4 <= size)
++      *(uint32_t *)(b8 + op2_off) = operation->c_q14 ? 0x0e0e : 0x1004;
++
++   if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++      rkt_dump_buffer(b8, "biases", 0, idx, 0, size);
++   pipe_buffer_unmap(pcontext, transfer);
++}
++
++bool
++rkt_int8_raw_input(const struct rkt_operation *operation)
++{
++   return operation->soc == RKT_SOC_RK3576 && !operation->depthwise &&
++          operation->input_channels <= 4 &&
++          !rkt_rk3576_firstconv(operation);
++}
+diff --git a/src/gallium/drivers/rocket/rkt_int8.h b/src/gallium/drivers/rocket/rkt_int8.h
+new file mode 100644
+index 0000000..d576b4d
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_int8.h
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef RKT_INT8_H
++#define RKT_INT8_H
++
++#include <stdbool.h>
++
++#include "pipe/p_state.h"
++
++/*
++ * Signed int8 (TFLite kTfLiteInt8) tensors.
++ *
++ * Everything below the frontend in this driver is written for asymmetric
++ * uint8: a tensor byte q is fed to the hardware as q - 0x80, zero points are
++ * 0..255, weights are packed as w - 0x80 and the read-back adds 0x80. An int8
++ * tensor (q_s, zp_s) is the same real number as the uint8 tensor
++ * (q_s + 128, zp_s + 128) with the same scale, and q_u - 0x80 == q_s is
++ * exactly the int8 byte the vendor runtime hands the NPU (captures: input,
++ * weights, CNA pad value 0x1084 and DPU output offset all equal the raw int8
++ * values). So an int8 layer is lowered as its offset-uint8 twin:
++ *
++ *  - rkt_int8_view(): a copy of the operation whose 8-bit signed tensors have
++ *    zero_point(s) + 128 and is_signed = false, and whose int8 weight buffer is
++ *    replaced by a copy with every byte XOR 0x80 (int8 -> offset uint8). The
++ *    int32 bias is the same number in both domains and is not touched.
++ *  - the subgraph input of a signed tensor is XOR 0x80'd before the usual
++ *    uint8 conversion, the output after it.
++ *
++ * Nothing changes for a model without signed tensors.
++ */
++
++struct rkt_int8_view {
++   struct pipe_ml_operation op;
++   struct pipe_tensor *in_ptrs[4];
++   struct pipe_tensor *out_ptrs[2];
++   struct pipe_tensor tensors[8];
++   unsigned tensor_count;
++   int *zero_points[8];
++   struct pipe_resource *weights;
++};
++
++/*
++ * Returns poperation itself when it has no signed 8-bit tensor (or the
++ * conversion is disabled), otherwise view->op. rkt_int8_view_fini() frees what
++ * the view allocated; call it once the operation is lowered.
++ */
++const struct pipe_ml_operation *
++rkt_int8_view(struct pipe_context *pcontext,
++              const struct pipe_ml_operation *poperation,
++              struct rkt_int8_view *view);
++
++void rkt_int8_view_fini(struct rkt_int8_view *view);
++
++/*
++ * Per-channel (per-axis) weight scales, i.e. every int8 TFLite conv.
++ *
++ * The DPU applies, per output channel (a model fitted to vendor runtime
++ * captures, which reproduces the vendor's outputs):
++ *
++ *    out = clamp(((MAC + A[oc]) * C[oc] >> s) * OUT_CVT_SCALE >> OUT_CVT_SHIFT
++ *                + offset)
++ *
++ * with C the int16 in the A/B/C (A/C for depthwise) record and s the low byte
++ * of the 16-bit word 0x5024 points at. The vendor writes C = Q14 of
++ * wt_sc[oc] / max(wt_sc), the word 0x0E0E (s = 14) and OUT_CVT from
++ * in_sc * max(wt_sc) / out_sc. C = 16 * wt_sc[oc] / max with the word 0x1004
++ * (s = 4) and OUT_CVT from the mean weight scale would leave every channel off
++ * by max/mean and quantised to 4 bits. Per-tensor layers (C = 16 everywhere)
++ * keep 0x1004.
++ *
++ * rkt_int8_c_q14() decides (RK3576, per-axis weights); lower_convolution()
++ * then takes the maximum scale
++ * for OUT_CVT and rkt_int8_fix_coefs() rewrites C and the word after
++ * rkt_fill_biases(). The first conv encoder drops its extra 4 bits of shift.
++ *
++ * rkt_int8_fix_coefs() also writes the 0x1004 word for a per-tensor int8 layer
++ * with <= 4 input channels on the generic encoder (yolox's first conv), where
++ * rkt_fill_biases() leaves it 0, i.e. C = 16 taken unshifted.
++ */
++struct rkt_operation;
++struct rkt_ml_subgraph;
++
++bool rkt_int8_c_q14(const struct rkt_operation *operation,
++                    const struct pipe_ml_operation *poperation);
++
++void rkt_int8_fix_coefs(struct pipe_context *pcontext,
++                        const struct pipe_ml_operation *poperation,
++                        const struct rkt_operation *operation);
++
++/*
++ * The RK3576 generic encoder takes a <= 4 channel, non-depthwise input
++ * (yolox's 3 channel first conv, micronet's 1 channel one) as a tight NHWC
++ * copy with the CNA CVT bypassed, so the bytes reach the MAC unchanged: such
++ * an int8 input has to stay int8 (as the vendor runtime feeds it: raw input,
++ * CVT 0x00010001, offsets 0). The first conv encoder (rkt_rk3576_firstconv) has
++ * its CVT subtract 128 and takes offset uint8 like everything else.
++ */
++bool rkt_int8_raw_input(const struct rkt_operation *operation);
++
++/* XOR 0x80 over n bytes, in place. */
++void rkt_int8_flip(void *data, unsigned n);
++
++#endif /* RKT_INT8_H */
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 0aa48c4..51d2e7c 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -15,6 +15,7 @@
+ #include "drm-uapi/rocket_accel.h"
+ 
+ #include "rkt_coefs.h"
++#include "rkt_int8.h"
+ #include "rkt_ml.h"
+ #include "rkt_regcmd.h"
+ #include "rkt_task.h"
+@@ -449,7 +450,15 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+     * a first-order requant (per-channel correction belongs in the weight-buffer
+     * tail, like the vendor, and is a TODO).
+     */
+-   if (poperation->conv.weight_tensor->scales) {
++   operation->c_q14 = rkt_int8_c_q14(operation, poperation);
++   if (operation->c_q14) {
++      /* Q14 per-channel C against the largest scale, see rkt_int8.h. */
++      unsigned n = poperation->output_tensors[0]->dims[3];
++      float max = 0.0f;
++      for (unsigned c = 0; c < n; c++)
++         max = MAX2(max, poperation->conv.weight_tensor->scales[c]);
++      operation->weights_scale = max;
++   } else if (poperation->conv.weight_tensor->scales) {
+       unsigned n = poperation->output_tensors[0]->dims[3];
+       float sum = 0.0f;
+       for (unsigned c = 0; c < n; c++)
+@@ -462,6 +471,7 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+    operation->weights = rkt_fill_weights(subgraph, poperation);
+    operation->biases =
+       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
++   rkt_int8_fix_coefs(subgraph->base.context, poperation, operation);
+ }
+ 
+ static struct rkt_operation *
+@@ -591,11 +601,18 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       operation.add_tensor = -1;
+ 
+       switch (poperations[i].type) {
+-      case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
+-         lower_convolution(subgraph, &poperations[i], &operation);
++      case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
++         /* int8 tensors are lowered as offset uint8, see rkt_int8.h. */
++         struct rkt_int8_view view;
++         const struct pipe_ml_operation *pop =
++            rkt_int8_view(pcontext, &poperations[i], &view);
++         operation.int8 = pop != &poperations[i];
++         lower_convolution(subgraph, pop, &operation);
++         rkt_int8_view_fini(&view);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+                               operation);
+          break;
++      }
+       case PIPE_ML_OPERATION_TYPE_ADD: {
+          /* Fuse tensor addition into convolution*/
+          struct rkt_operation *input_op_1 =
+@@ -616,7 +633,8 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+ 
+          input_op_2->output_index = poperations[i].output_tensors[0]->index;
+          input_op_2->addition_offset =
+-            0x80 - poperations[i].input_tensors[1]->zero_point;
++            0x80 - poperations[i].input_tensors[1]->zero_point -
++            (poperations[i].input_tensors[1]->is_signed ? 128 : 0);
+          input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
+ 
+          break;
+@@ -739,6 +757,24 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+ 
+       struct rkt_resource *input_tensor =
+          rkt_get_tensor(subgraph, operation->input_index);
++
++      /*
++       * A signed int8 input goes in as offset uint8, see rkt_int8.h, except
++       * where the hardware takes the bytes as they are (rkt_int8_raw_input).
++       */
++      void *input_data = inputs[i];
++      void *input_u8 = NULL;
++      bool i8_raw = is_signed && is_signed[i] &&
++                    rkt_int8_raw_input(operation);
++      if (is_signed && is_signed[i] && !i8_raw) {
++         unsigned n = operation->input_width * operation->input_height *
++                      input_channels;
++         input_u8 = malloc(n);
++         memcpy(input_u8, inputs[i], n);
++         rkt_int8_flip(input_u8, n);
++         input_data = input_u8;
++      }
++
+       if (output_channels == 1 && input_channels == 1 &&
+           !operation->addition_input && (operation->add_tensor == -1)) {
+          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
+@@ -760,7 +796,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                            input_channels;
+ 
+          if (stride == row) {
+-            memcpy(map, inputs[i], row * operation->input_height);
++            memcpy(map, input_data, row * operation->input_height);
+          } else {
+             /*
+              * The widened first-conv input. Every row keeps its real pixels and
+@@ -768,11 +804,12 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+              * window reads a real byte where the hardware would otherwise
+              * generate a pad of zero. See rkt_fc_width().
+              */
+-            const uint8_t *src = inputs[i];
++            const uint8_t *src = input_data;
+             for (unsigned y = 0; y < operation->input_height; y++) {
+                memcpy(map + y * stride, src + y * row, row);
+                memset(map + y * stride + row,
+-                      (uint8_t)operation->input_zero_point, stride - row);
++                      (uint8_t)(operation->input_zero_point ^
++                                (i8_raw ? 0x80 : 0)), stride - row);
+             }
+          }
+          pipe_buffer_unmap(pcontext, transfer_out);
+@@ -785,7 +822,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+          unsigned input_height = operation->input_height;
+          unsigned zero_point = operation->input_zero_point;
+          struct pipe_transfer *transfer_out;
+-         uint8_t(*input_in)[input_height][input_channels] = inputs[i];
++         uint8_t(*input_in)[input_height][input_channels] = input_data;
+          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
+                                         PIPE_MAP_WRITE, &transfer_out);
+ 
+@@ -833,6 +870,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+ 
+          pipe_buffer_unmap(pcontext, transfer_out);
+       }
++
++      free(input_u8);
+    }
+    DBG("Processed input\n");
+ 
+@@ -1086,6 +1125,12 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+          }
+       }
+ 
++      /* Offset uint8 back to int8, see rkt_int8.h. */
++      if (is_signed && is_signed[i])
++         rkt_int8_flip(outputs[i], operation->output_width *
++                                   operation->output_height *
++                                   operation->output_channels);
++
+       DBG("Converted data\n");
+ 
+       pipe_buffer_unmap(pcontext, transfer);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 3dcb124..81baf9b 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -120,6 +120,14 @@ struct rkt_operation {
+    struct pipe_resource *weights;
+    struct pipe_resource *biases;
+ 
++   /*
++    * Per-channel coefficients in the vendor's precision (rkt_int8.h): C is
++    * Q14 of wt_sc[oc] / max(wt_sc), the second operand word is 0x0E0E and
++    * OUT_CVT carries the maximum weight scale.
++    */
++   bool c_q14;
++   /* Lowered from signed int8 tensors through rkt_int8_view(). */
++   bool int8;
+    bool depthwise;
+    bool reuse_weights_cbuf;
+    unsigned truncate_bits;
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 5d576ec..7147d69 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -455,6 +455,9 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+       uint32_t sb = fui(conv_scale);
+       /* The generic path computes this then emits shift - 1; keep both. */
+       unsigned fc_shift = 127 + 31 - 32 - (sb >> 23) + 16 - 1 + 4;
++      /* Q14 C with its own >> 14 (rkt_int8.h): no extra 4 bits here. */
++      if (operation->c_q14)
++         fc_shift -= 4;
+       unsigned fc_scale = ((sb >> 9) & 0x7fff) + rkt_cvt_round(sb);
+       if (fc_scale > 0x7fff) {
+          fc_scale = 1 << 14;
+-- 
+2.55.0
+

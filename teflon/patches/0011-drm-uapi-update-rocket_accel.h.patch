@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:41:06 +0100
+Subject: [PATCH 11/23] drm-uapi: update rocket_accel.h
+
+Sync with the kernel's include/uapi/drm/rocket_accel.h from the rocket
+RK3576 series v16 plus its follow-up patches for per-core job submission
+and PPU tasks: DRM_IOCTL_ROCKET_GET_PARAM with DRM_ROCKET_PARAM_HW_VERSION,
+DRM_ROCKET_PARAM_NUM_CORES and DRM_ROCKET_PARAM_PPU_TASKS, and
+drm_rocket_job.core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/drm-uapi/rocket_accel.h | 160 +++++++++++++++++++++++++++-----
+ 1 file changed, 136 insertions(+), 24 deletions(-)
+
+diff --git a/include/drm-uapi/rocket_accel.h b/include/drm-uapi/rocket_accel.h
+index 14b2e12..ef868a2 100644
+--- a/include/drm-uapi/rocket_accel.h
++++ b/include/drm-uapi/rocket_accel.h
+@@ -15,31 +15,40 @@ extern "C" {
+ #define DRM_ROCKET_SUBMIT			0x01
+ #define DRM_ROCKET_PREP_BO			0x02
+ #define DRM_ROCKET_FINI_BO			0x03
++#define DRM_ROCKET_GET_PARAM			0x04
+ 
+ #define DRM_IOCTL_ROCKET_CREATE_BO		DRM_IOWR(DRM_COMMAND_BASE + DRM_ROCKET_CREATE_BO, struct drm_rocket_create_bo)
+ #define DRM_IOCTL_ROCKET_SUBMIT			DRM_IOW(DRM_COMMAND_BASE + DRM_ROCKET_SUBMIT, struct drm_rocket_submit)
+ #define DRM_IOCTL_ROCKET_PREP_BO		DRM_IOW(DRM_COMMAND_BASE + DRM_ROCKET_PREP_BO, struct drm_rocket_prep_bo)
+ #define DRM_IOCTL_ROCKET_FINI_BO		DRM_IOW(DRM_COMMAND_BASE + DRM_ROCKET_FINI_BO, struct drm_rocket_fini_bo)
++#define DRM_IOCTL_ROCKET_GET_PARAM		DRM_IOWR(DRM_COMMAND_BASE + DRM_ROCKET_GET_PARAM, struct drm_rocket_get_param)
+ 
+ /**
+  * struct drm_rocket_create_bo - ioctl argument for creating Rocket BOs.
+  *
+  */
+ struct drm_rocket_create_bo {
+-	/** Input: Size of the requested BO. */
++	/**
++	 * @size: Input: Size of the requested BO.
++	 */
+ 	__u32 size;
+ 
+-	/** Output: GEM handle for the BO. */
++	/**
++	 * @handle: Output: GEM handle for the BO.
++	 */
+ 	__u32 handle;
+ 
+ 	/**
+-	 * Output: DMA address for the BO in the NPU address space.  This address
+-	 * is private to the DRM fd and is valid for the lifetime of the GEM
+-	 * handle.
++	 * @dma_address: Output: DMA address for the BO in the NPU address
++	 * space.  This address is private to the DRM fd and is valid for
++	 * the lifetime of the GEM handle.
+ 	 */
+ 	__u64 dma_address;
+ 
+-	/** Output: Offset into the drm node to use for subsequent mmap call. */
++	/**
++	 * @offset: Output: Offset into the drm node to use for subsequent
++	 * mmap call.
++	 */
+ 	__u64 offset;
+ };
+ 
+@@ -50,13 +59,19 @@ struct drm_rocket_create_bo {
+  * synchronization.
+  */
+ struct drm_rocket_prep_bo {
+-	/** Input: GEM handle of the buffer object. */
++	/**
++	 * @handle: Input: GEM handle of the buffer object.
++	 */
+ 	__u32 handle;
+ 
+-	/** Reserved, must be zero. */
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
+ 	__u32 reserved;
+ 
+-	/** Input: Amount of time to wait for NPU jobs. */
++	/**
++	 * @timeout_ns: Input: Amount of time to wait for NPU jobs.
++	 */
+ 	__s64 timeout_ns;
+ };
+ 
+@@ -66,10 +81,14 @@ struct drm_rocket_prep_bo {
+  * Synchronize caches for NPU access.
+  */
+ struct drm_rocket_fini_bo {
+-	/** Input: GEM handle of the buffer object. */
++	/**
++	 * @handle: Input: GEM handle of the buffer object.
++	 */
+ 	__u32 handle;
+ 
+-	/** Reserved, must be zero. */
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
+ 	__u32 reserved;
+ };
+ 
+@@ -79,10 +98,15 @@ struct drm_rocket_fini_bo {
+  * A task is the smallest unit of work that can be run on the NPU.
+  */
+ struct drm_rocket_task {
+-	/** Input: DMA address to NPU mapping of register command buffer */
++	/**
++	 * @regcmd: Input: DMA address to NPU mapping of register command buffer
++	 */
+ 	__u32 regcmd;
+ 
+-	/** Input: Number of commands in the register command buffer */
++	/**
++	 * @regcmd_count: Input: Number of commands in the register command
++	 * buffer
++	 */
+ 	__u32 regcmd_count;
+ };
+ 
+@@ -94,26 +118,59 @@ struct drm_rocket_task {
+  * sequentially on the same core, to benefit from memory residency in SRAM.
+  */
+ struct drm_rocket_job {
+-	/** Input: Pointer to an array of struct drm_rocket_task. */
++	/**
++	 * @tasks: Input: Pointer to an array of struct drm_rocket_task.
++	 */
+ 	__u64 tasks;
+ 
+-	/** Input: Pointer to a u32 array of the BOs that are read by the job. */
++	/**
++	 * @in_bo_handles: Input: Pointer to a u32 array of the BOs that
++	 * are read by the job.
++	 */
+ 	__u64 in_bo_handles;
+ 
+-	/** Input: Pointer to a u32 array of the BOs that are written to by the job. */
++	/**
++	 * @out_bo_handles: Input: Pointer to a u32 array of the BOs that
++	 * are written to by the job.
++	 */
+ 	__u64 out_bo_handles;
+ 
+-	/** Input: Number of tasks passed in. */
++	/**
++	 * @task_count: Input: Number of tasks passed in.
++	 */
+ 	__u32 task_count;
+ 
+-	/** Input: Size in bytes of the structs in the @tasks field. */
++	/**
++	 * @task_struct_size: Input: Size in bytes of the structs in the
++	 * @tasks field.
++	 */
+ 	__u32 task_struct_size;
+ 
+-	/** Input: Number of input BO handles passed in (size is that times 4). */
++	/**
++	 * @in_bo_handle_count: Input: Number of input BO handles passed in
++	 * (size is that times 4).
++	 */
+ 	__u32 in_bo_handle_count;
+ 
+-	/** Input: Number of output BO handles passed in (size is that times 4). */
++	/**
++	 * @out_bo_handle_count: Input: Number of output BO handles passed in
++	 * (size is that times 4).
++	 */
+ 	__u32 out_bo_handle_count;
++
++	/**
++	 * @core: Input: 0 lets the kernel pick the core, as before. N > 0
++	 * runs the job on NPU core N - 1, for userspace that splits one layer
++	 * over several cores and has laid out each part for its core (the
++	 * RK3576's cores share one convolution buffer). Must be at most the
++	 * DRM_ROCKET_PARAM_NUM_CORES value.
++	 */
++	__u32 core;
++
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
++	__u32 reserved;
+ };
+ 
+ /**
+@@ -122,19 +179,74 @@ struct drm_rocket_job {
+  * The kernel will schedule the execution of these jobs in dependency order.
+  */
+ struct drm_rocket_submit {
+-	/** Input: Pointer to an array of struct drm_rocket_job. */
++	/**
++	 * @jobs: Input: Pointer to an array of struct drm_rocket_job.
++	 */
+ 	__u64 jobs;
+ 
+-	/** Input: Number of jobs passed in. */
++	/**
++	 * @job_count: Input: Number of jobs passed in.
++	 */
+ 	__u32 job_count;
+ 
+-	/** Input: Size in bytes of the structs in the @jobs field. */
++	/**
++	 * @job_struct_size: Input: Size in bytes of the structs in the
++	 * @jobs field.
++	 */
+ 	__u32 job_struct_size;
+ 
+-	/** Reserved, must be zero. */
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
+ 	__u64 reserved;
+ };
+ 
++/**
++ * enum drm_rocket_param - parameters for DRM_IOCTL_ROCKET_GET_PARAM
++ * @DRM_ROCKET_PARAM_HW_VERSION: an enum drm_rocket_hw_version value.
++ * @DRM_ROCKET_PARAM_NUM_CORES: the number of NPU cores a job can be pinned
++ *	to with &drm_rocket_job.core.
++ * @DRM_ROCKET_PARAM_PPU_TASKS: 1 if a task may end in the PPU, such as a
++ *	pooling task that uses only the PPU and its RDMA: the kernel completes
++ *	tasks on the PPU interrupt as well. Kernels without this parameter only
++ *	complete tasks that end in the DPU.
++ */
++enum drm_rocket_param {
++	DRM_ROCKET_PARAM_HW_VERSION = 0,
++	DRM_ROCKET_PARAM_NUM_CORES = 1,
++	DRM_ROCKET_PARAM_PPU_TASKS = 2,
++};
++
++/**
++ * enum drm_rocket_hw_version - the NPU, one value per DT compatible
++ * @DRM_ROCKET_HW_RK3588: "rockchip,rk3588-rknn-core"
++ * @DRM_ROCKET_HW_RK3576: "rockchip,rk3576-rknn-core"
++ */
++enum drm_rocket_hw_version {
++	DRM_ROCKET_HW_RK3588 = 1,
++	DRM_ROCKET_HW_RK3576 = 2,
++};
++
++/**
++ * struct drm_rocket_get_param - ioctl argument for querying a parameter.
++ */
++struct drm_rocket_get_param {
++	/**
++	 * @param: Input: an enum drm_rocket_param value.
++	 */
++	__u32 param;
++
++	/**
++	 * @reserved: Reserved, must be zero.
++	 */
++	__u32 reserved;
++
++	/**
++	 * @value: Output: the value of the parameter.
++	 */
++	__u64 value;
++};
++
+ #if defined(__cplusplus)
+ }
+ #endif
+-- 
+2.55.0
+

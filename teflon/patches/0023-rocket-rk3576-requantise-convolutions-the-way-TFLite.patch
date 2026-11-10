@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 13:24:11 +0100
+Subject: [PATCH 23/23] rocket: rk3576: requantise convolutions the way TFLite
+ does
+
+Measured on the board, bit for bit on every layer checked, the DPU output
+stage of a convolution is
+
+  u   = round_half_even((MAC + A[oc]) * C[oc] / 2^s)          (32 bit)
+  out = clamp(round_half_up(u * OUT_CVT_SCALE / 2^OUT_CVT_SHIFT) + offset)
+
+with s from the word RDMA 0x5024 points at and MAC + A equal to TFLite's
+int32 accumulator. TFLite rounds acc * M once (M = in_sc * wt_sc / out_sc
+in fp32). The encodings used so far, which are also the vendor
+runtime's, did not:
+
+ - per tensor: C = 16, s = 4 and a 15 bit OUT_CVT taken from M's mantissa,
+   i.e. M quantised to 15 bits;
+ - per channel: C = Q14 of wt_sc[oc] / max(wt_sc), so a channel with a
+   small scale got a C of a few counts. A dead channel (scale 1e-6) with a
+   large bias came out up to 13 off (EfficientDet 012/044/052), MoveNet's
+   depthwise layers 2-5 off; the vendor runtime gives the same results
+   (bit-identical on MoveNet 020, max 13 on EfficientDet 012);
+ - the word 0x1004 also clamps negative values to 0 before the offset,
+   which the lift worked around by adding out_zp / M, rounded, to A.
+
+Now C and OUT_CVT are chosen together: per tensor the 15 x 15 bit pair
+whose product is closest to M (most fp32 scales factor exactly), per
+channel C[oc] over the whole int16 range against the largest M with A[oc]
+scaled by the exact C over the rounded one, so the bias comes out right.
+s is the smallest shift that keeps u in 32 bits for any input (u wraps
+beyond that on the board) and goes into both bytes of the word, as the
+vendor's 0x0E0E; there is no lift and the offset takes the zero point.
+The regular and the first-conv encoder use it; the int8 per-tensor first
+conv takes the A/B/C records instead of the plain bias mode.
+
+Single layers of the 10 test models (1152 conv/depthwise and other ops):
+834 bit-exact against the TFLite CPU result instead of 493, 1150 within
+one step instead of 1140; the other two (MoveNet depthwise layers with
+channel scales below 2^-7 of the largest) are 2 off in under 0.01 % of
+the values. Full models: Inception V1 now matches (was max 3),
+MobileNetV1 max 4 (was 12), MobileNetV2 max 3 with 2 % of the values off
+by more than one (was 6 %), YOLOX max 9 (was 10). The generated small
+models: 894 of 894 within one step (was 892).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_coefs.c  |   6 +-
+ src/gallium/drivers/rocket/rkt_coefs.h  |   2 +-
+ src/gallium/drivers/rocket/rkt_int8.c   | 237 +++++++++++++++++++++++-
+ src/gallium/drivers/rocket/rkt_int8.h   |  42 +++++
+ src/gallium/drivers/rocket/rkt_ml.c     |   5 +-
+ src/gallium/drivers/rocket/rkt_ml.h     |   8 +
+ src/gallium/drivers/rocket/rkt_regcmd.c |  19 +-
+ 7 files changed, 310 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index b2e4b11..70f4623 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -828,7 +828,7 @@ calculate_weight_sum(const struct pipe_ml_operation *poperation, unsigned oc,
+ 
+ struct pipe_resource *
+ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+-                const struct pipe_ml_operation *poperation,
++                const struct pipe_ml_operation *poperation, bool rq_lift,
+                 unsigned *truncate_bits)
+ {
+    struct pipe_context *pcontext = subgraph->base.context;
+@@ -1119,6 +1119,8 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+                    */
+                   float bias = lift + rkt_out_round();
+ 
++                  if (!rq_lift)
++                     bias = 0.0f;
+                   if (mult > 0.0f && bias != 0.0f)
+                      a += (int64_t)(bias / mult + (bias > 0 ? 0.5f : -0.5f));
+                   a += rkt_a_bias();
+@@ -1222,7 +1224,7 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+              * ROCKET_NO_LIFT is the control: with it the negative half of a two
+              * sided output must come back flat at the output zero point.
+              */
+-            if (!getenv("ROCKET_NO_LIFT")) {
++            if (rq_lift && !getenv("ROCKET_NO_LIFT")) {
+                float in_sc = poperation->input_tensors[0]->scale;
+                float wt_sc = wscales ? wscales[oc]
+                                      : poperation->conv.weight_tensor->scale;
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.h b/src/gallium/drivers/rocket/rkt_coefs.h
+index 7c0f53f..9ce6024 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.h
++++ b/src/gallium/drivers/rocket/rkt_coefs.h
+@@ -16,7 +16,7 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+ 
+ struct pipe_resource *
+ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
+-                const struct pipe_ml_operation *poperation,
++                const struct pipe_ml_operation *poperation, bool rq_lift,
+                 unsigned *truncate_bits);
+ 
+ /*
+diff --git a/src/gallium/drivers/rocket/rkt_int8.c b/src/gallium/drivers/rocket/rkt_int8.c
+index ebd0031..55b0b1d 100644
+--- a/src/gallium/drivers/rocket/rkt_int8.c
++++ b/src/gallium/drivers/rocket/rkt_int8.c
+@@ -5,6 +5,7 @@
+  * Signed int8 tensors as offset uint8, see rkt_int8.h.
+  */
+ 
++#include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -155,7 +156,8 @@ rkt_int8_fix_coefs(struct pipe_context *pcontext,
+    /* rkt_fill_biases() numbers its dumps the same way. */
+    static int dump_idx = 0;
+ 
+-   if (operation->soc != RKT_SOC_RK3576 || getenv("ROCKET_RK3588_SDP"))
++   if (operation->soc != RKT_SOC_RK3576 || getenv("ROCKET_RK3588_SDP") ||
++       operation->rq_exact)
+       return;
+    int idx = dump_idx++;
+ 
+@@ -241,3 +243,236 @@ rkt_int8_raw_input(const struct rkt_operation *operation)
+       return operation->in_signed;
+    return true;
+ }
++
++/*
++ * C is an int16 (at most 32767); OUT_CVT_SCALE takes 15 bits (0x8000 and up
++ * gave garbage on the board).
++ */
++#define RQ_C_MAX     32767
++#define RQ_C_BITS    15
++#define RQ_CVT_BITS  15
++
++bool
++rkt_rq_exact(const struct rkt_operation *operation)
++{
++   return operation->soc == RKT_SOC_RK3576 && !operation->ew_add &&
++          operation->ops.kind == RKT_OPS_NONE &&
++          (operation->depthwise || operation->input_channels > 4 ||
++           rkt_rk3576_firstconv(operation));
++}
++
++/* the shift that puts m * 2^shift in [2^(bits - 1), 2^bits) */
++static int
++rq_norm_shift(double m, int bits)
++{
++   int e;
++
++   frexp(m, &e); /* m = f * 2^e, f in [0.5, 1) */
++   return bits - e;
++}
++
++/*
++ * Per-tensor: C (cbits) and cvt (RQ_CVT_BITS) with C * cvt / 2^shift closest
++ * to m. Returns the relative error.
++ */
++static double
++rq_pair(double m, unsigned *c_out, unsigned *cvt_out, unsigned *shift_out)
++{
++   int cbits = RQ_C_BITS;
++   int shift = rq_norm_shift(m, cbits + RQ_CVT_BITS - 1);
++   double t = ldexp(m, shift); /* in [2^(cbits + 13), 2^(cbits + 14)) */
++   double best = INFINITY;
++   unsigned bc = 1u << (cbits - 1), bv = 0;
++
++   for (unsigned c = 1u << (cbits - 1); c < (1u << cbits) && c <= RQ_C_MAX; c++) {
++      double v = nearbyint(t / c);
++      if (v < 1 || v >= (1u << RQ_CVT_BITS))
++         continue;
++      double err = fabs(c * v - t);
++      if (err < best) {
++         best = err;
++         bc = c;
++         bv = (unsigned)v;
++         if (err == 0)
++            break;
++      }
++   }
++   *c_out = bc;
++   *cvt_out = bv;
++   *shift_out = shift;
++   return best / t;
++}
++
++void
++rkt_rq_exact_coefs(struct pipe_context *pcontext,
++                   const struct pipe_ml_operation *poperation,
++                   struct rkt_operation *operation)
++{
++   /* rkt_fill_biases() numbers its dumps the same way. */
++   static int dump_idx = 0;
++
++   if (!operation->rq_exact)
++      return;
++   int idx = dump_idx++;
++
++   bool dw = operation->depthwise;
++   unsigned oc_n = operation->output_channels;
++   unsigned rec = dw ? 48 : 64, c_off = dw ? 32 : 48;
++   unsigned table_bytes = rkt_coef_table_bytes(dw, oc_n);
++   /* where the encoders point 0x5024: the first-conv encoder right after
++    * the record table, the regular one after the fp16 scale table too */
++   bool firstconv = rkt_rk3576_firstconv(operation);
++   unsigned op2_off = table_bytes + (firstconv || getenv("ROCKET_SCALE_OFF")
++                                        ? 0 : rkt_scale_table_bytes(oc_n));
++   unsigned size = pipe_buffer_size(operation->biases);
++   const float *wsc = poperation->conv.weight_tensor->scales;
++   float in_sc = poperation->input_tensors[0]->scale;
++   float out_sc = poperation->output_tensors[0]->scale;
++   unsigned padded = dw ? oc_n : ALIGN(oc_n, 8);
++   double *m = calloc(oc_n, sizeof(double));
++   int32_t *a_new = malloc(padded * sizeof(int32_t));
++   int16_t *c_new = malloc(padded * sizeof(int16_t));
++   double m_max = 0.0;
++   bool per_tensor = true;
++   unsigned cvt = 1, shift = 0;
++
++   /* the fp32 multiplier TFLite's kernels use: (in * w) / out */
++   for (unsigned oc = 0; oc < oc_n; oc++) {
++      float w = wsc ? wsc[oc] : poperation->conv.weight_tensor->scale;
++      m[oc] = (double)((in_sc * w) / out_sc);
++      m_max = MAX2(m_max, m[oc]);
++      per_tensor &= m[oc] == m[0];
++   }
++
++   if (per_tensor) {
++      unsigned c;
++      rq_pair(m[0], &c, &cvt, &shift);
++   } else {
++      /*
++       * OUT_CVT from the largest multiplier. Two candidates: the largest C
++       * at the top of the int16 range (the finest steps for the small
++       * channels), and the per-tensor pair of the largest multiplier (exact
++       * for every channel whose scale is a power-of-two fraction of it). The
++       * one with the smaller summed relative error of C wins.
++       */
++      unsigned cand_cvt[2], cand_shift[2], c0;
++      cand_shift[0] = rq_norm_shift(m_max, RQ_C_BITS + RQ_CVT_BITS);
++      cand_cvt[0] = (unsigned)ceil(ldexp(m_max, cand_shift[0]) / (RQ_C_MAX + 0.5));
++      while (cand_cvt[0] >= (1u << RQ_CVT_BITS)) {
++         cand_cvt[0] = (cand_cvt[0] + 1) / 2;
++         cand_shift[0]--;
++      }
++      rq_pair(m_max, &c0, &cand_cvt[1], &cand_shift[1]);
++      double best = INFINITY;
++      for (unsigned k = 0; k < 2; k++) {
++         double err = 0.0;
++         for (unsigned oc = 0; oc < oc_n; oc++) {
++            double x = ldexp(m[oc], cand_shift[k]) / cand_cvt[k];
++            double c = CLAMP(nearbyint(x), 1, RQ_C_MAX);
++            err += fabs(c - x) / x;
++         }
++         if (err < best) {
++            best = err;
++            cvt = cand_cvt[k];
++            shift = cand_shift[k];
++         }
++      }
++   }
++
++   struct pipe_transfer *transfer;
++   uint8_t *b8 = pipe_buffer_map(pcontext, operation->biases,
++                                 PIPE_MAP_READ | PIPE_MAP_WRITE, &transfer);
++
++   /*
++    * C[oc] = M[oc] * 2^shift / cvt rounded (at least 1), and A scaled by the
++    * exact C over the rounded one. Channels past oc_n repeat the last one, as
++    * rkt_fill_biases() lays them out.
++    */
++   for (unsigned oc = 0; oc < padded; oc++) {
++      unsigned src = MIN2(oc, oc_n - 1);
++      unsigned off = (oc / 8) * rec + (oc % 8) * 4;
++      unsigned soff = (src / 8) * rec + (src % 8) * 4;
++      double c_exact = ldexp(m[src], shift) / cvt;
++      long c = lround(c_exact);
++
++      if (off + 4 > table_bytes || soff + 4 > table_bytes)
++         continue;
++      c = CLAMP(c, 1, RQ_C_MAX);
++      int32_t a = *(int32_t *)(b8 + soff);
++      double a_x = nearbyint((double)a * c_exact / c);
++      c_new[oc] = (int16_t)c;
++      a_new[oc] = (int32_t)CLAMP(a_x, (double)INT32_MIN, (double)INT32_MAX);
++   }
++   for (unsigned oc = 0; oc < padded; oc++) {
++      unsigned off = (oc / 8) * rec + (oc % 8) * 4;
++      unsigned coff = (oc / 8) * rec + c_off + (oc % 8) * 2;
++
++      if (off + 4 > table_bytes || coff + 2 > table_bytes)
++         continue;
++      *(int32_t *)(b8 + off) = a_new[oc];
++      *(int16_t *)(b8 + coff) = c_new[oc];
++   }
++
++   /*
++    * u = (MAC + A) * C >> s is held in 32 bits (beyond that the board's
++    * results wrap), and MAC + A is TFLite's accumulator. Bound it for any
++    * input, |bias| + max|x - in_zp| * sum|w - wt_zp| per channel, and take
++    * the smallest s that keeps every channel's u in range. u keeps at least
++    * 2^14 steps per output step, so its rounding is at most 2^-15 of one.
++    */
++   unsigned kw = poperation->conv.weight_tensor->dims[1];
++   unsigned kh = poperation->conv.weight_tensor->dims[2];
++   unsigned ic_n = poperation->input_tensors[0]->dims[3];
++   unsigned xmax = MAX2(operation->input_zero_point,
++                        255 - operation->input_zero_point);
++   const int *wzp = poperation->conv.weight_tensor->zero_points;
++   struct pipe_transfer *btransfer, *wtransfer;
++   const int32_t *bias =
++      poperation->conv.bias_tensor
++         ? pipe_buffer_map(pcontext, poperation->conv.bias_tensor->resource,
++                           PIPE_MAP_READ, &btransfer)
++         : NULL;
++   const uint8_t *w8 = pipe_buffer_map(pcontext,
++                                       poperation->conv.weight_tensor->resource,
++                                       PIPE_MAP_READ, &wtransfer);
++   unsigned s1 = 0;
++   for (unsigned oc = 0; oc < oc_n; oc++) {
++      int zw = wzp ? wzp[oc] : poperation->conv.weight_tensor->zero_point;
++      double wsum = 0.0;
++      for (unsigned t = 0; t < kw * kh; t++) {
++         if (dw) {
++            wsum += abs((int)w8[t * ic_n + oc] - zw);
++         } else {
++            for (unsigned ic = 0; ic < ic_n; ic++)
++               wsum += abs((int)w8[(oc * kw * kh + t) * ic_n + ic] - zw);
++         }
++      }
++      double bound = (bias ? fabs((double)bias[oc]) : 0.0) + xmax * wsum;
++      double c = (double)c_new[oc];
++      while (bound * c >= ldexp(1.0, 31 + s1) - 1)
++         s1++;
++   }
++   pipe_buffer_unmap(pcontext, wtransfer);
++   if (bias)
++      pipe_buffer_unmap(pcontext, btransfer);
++   s1 = MIN2(s1, shift);
++
++   /*
++    * The second operand word: the stage 1 shift in both bytes, as the vendor
++    * writes 0x0E0E. A different high byte (0x1004) clamps negative results
++    * to 0 before the offset.
++    */
++   if (op2_off + 4 <= size)
++      *(uint32_t *)(b8 + op2_off) = (s1 << 8) | s1;
++
++   operation->rq_cvt = cvt;
++   operation->rq_shift = shift - s1;
++
++   if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++      rkt_dump_buffer(b8, "biases", 0, idx, 0, size);
++   pipe_buffer_unmap(pcontext, transfer);
++
++   free(m);
++   free(a_new);
++   free(c_new);
++}
+diff --git a/src/gallium/drivers/rocket/rkt_int8.h b/src/gallium/drivers/rocket/rkt_int8.h
+index d576b4d..e13d8b6 100644
+--- a/src/gallium/drivers/rocket/rkt_int8.h
++++ b/src/gallium/drivers/rocket/rkt_int8.h
+@@ -90,6 +90,48 @@ void rkt_int8_fix_coefs(struct pipe_context *pcontext,
+                         const struct pipe_ml_operation *poperation,
+                         const struct rkt_operation *operation);
+ 
++/*
++ * Requantisation as TFLite does it (RK3576 regular and first-conv encoders).
++ *
++ * Measured on the board, bit for bit on every layer checked, the DPU output
++ * stage is
++ *
++ *    u   = round_half_even((MAC + A[oc]) * C[oc] / 2^s)      (u: 32 bits)
++ *    out = clamp(round_half_up(u * OUT_CVT_SCALE / 2^OUT_CVT_SHIFT) + offset)
++ *
++ * with s from the word 0x5024 points at (both bytes; the vendor writes
++ * 0x0E0E) and MAC + A equal to TFLite's int32 accumulator. TFLite rounds
++ * acc * M[oc] once, M = in_sc * wt_sc[oc] / out_sc in fp32. The encodings
++ * used before (C = 16 with the word 0x1004 per tensor, C = Q14 of
++ * wt_sc / max with 0x0E0E per channel, a 15 bit OUT_CVT from the mantissa)
++ * quantise M to 15 bits, round twice, and on per-channel layers give a
++ * channel with a small scale a C of a few counts: a dead channel (scale
++ * 1e-6) with a large bias came out up to 13 off, as with the vendor runtime.
++ * The word 0x1004 also clamps negative values to 0 before the offset, which
++ * the lift (rkt_out_lift) worked around by adding out_zp / M to A rounded to
++ * an integer.
++ *
++ * Here:
++ *  - per tensor: the C (15 bit) and OUT_CVT (15 bit) pair whose product is
++ *    closest to M; most fp32 scales factor exactly, the rest are within
++ *    about 2^-27;
++ *  - per channel: OUT_CVT from the largest M, C[oc] the rest of M[oc] over
++ *    the int16 range; A[oc] is scaled by the exact C over the rounded one, so
++ *    the bias comes out right and only the MAC sees the rounding of C;
++ *  - s the smallest shift that keeps u in 32 bits for any input (the board's
++ *    u wraps beyond), written into both bytes of the word;
++ *  - no lift, the offset takes the output zero point directly.
++ *
++ * rkt_rq_exact() decides (lower_convolution(), before rkt_fill_biases(),
++ * which then folds no lift into A), rkt_rq_exact_coefs() rewrites C, A and the
++ * word after it and sets rq_cvt/rq_shift for the encoders.
++ */
++bool rkt_rq_exact(const struct rkt_operation *operation);
++
++void rkt_rq_exact_coefs(struct pipe_context *pcontext,
++                        const struct pipe_ml_operation *poperation,
++                        struct rkt_operation *operation);
++
+ /*
+  * The RK3576 generic encoder takes a <= 4 channel, non-depthwise input
+  * (yolox's 3 channel first conv, micronet's 1 channel one) as a tight NHWC
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 40f4f34..be3ae72 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -480,10 +480,13 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
+       operation->weights_scale = poperation->conv.weight_tensor->scale;
+    }
+ 
++   operation->rq_exact = rkt_rq_exact(operation);
+    operation->weights = rkt_fill_weights(subgraph, poperation);
+    operation->biases =
+-      rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
++      rkt_fill_biases(subgraph, poperation, !operation->rq_exact,
++                      &operation->truncate_bits);
+    rkt_int8_fix_coefs(subgraph->base.context, poperation, operation);
++   rkt_rq_exact_coefs(subgraph->base.context, poperation, operation);
+ }
+ 
+ static struct rkt_operation *
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index edd77f5..09be7ca 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -143,6 +143,14 @@ struct rkt_operation {
+     * OUT_CVT carries the maximum weight scale.
+     */
+    bool c_q14;
++   /*
++    * TFLite's requantisation (rkt_rq_exact(), rkt_int8.h): C and OUT_CVT
++    * chosen together, no lift folded into A. rq_cvt and rq_shift are the
++    * OUT_CVT scale and shift.
++    */
++   bool rq_exact;
++   uint16_t rq_cvt;
++   uint8_t rq_shift;
+    /* Lowered from signed int8 tensors through rkt_int8_view(). */
+    bool int8;
+    /* the activation input is a signed int8 tensor (int8 on) */
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 6666e7f..12e8799 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -413,7 +413,8 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4038, 0x00120080);
+    R_DPU(0x403c, 0x00000000);
+    /* the vendor's per-tensor plain bias mode, see rkt_fc_pt114() */
+-   bool fc_pt114 = !operation->c_q14 && rkt_fc_pt114(operation->int8);
++   bool fc_pt114 = !operation->c_q14 && !operation->rq_exact &&
++                   rkt_fc_pt114(operation->int8);
+    R_DPU(0x4044, fc_pt114 ? 0x00000000 : 0x00000001);
+    R_DPU(0x4048, 0x80000000);
+    R_DPU(0x404c, 0x7fffffff);
+@@ -506,7 +507,12 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+       if (fc_scale < (1 << 14))
+          fc_scale |= (1 << 14);
+       int32_t fc_off = (int32_t)task->output_zero_point - 0x80 -
+-                       rkt_out_lift_act(task->output_zero_point, operation->relu);
++                       (operation->rq_exact ? 0 :
++                        rkt_out_lift_act(task->output_zero_point, operation->relu));
++      if (operation->rq_exact) {
++         fc_scale = operation->rq_cvt;
++         fc_shift = operation->rq_shift;
++      }
+ 
+       /*
+        * ROCKET_FC_CVT_DOWN, the same trade the generic path makes.
+@@ -827,7 +833,10 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    if (cvt_scale < (1 << 14))
+       cvt_scale |= (1 << 14);
+    int32_t out_offset = (int32_t)task->output_zero_point - 0x80 -
+-                        rkt_out_lift_act(task->output_zero_point, operation->relu);
++                        (operation->rq_exact ? 0 :
++                         rkt_out_lift_act(task->output_zero_point, operation->relu));
++   if (operation->rq_exact)
++      cvt_scale = operation->rq_cvt;
+    /*
+     * ROCKET_CVT_DOWN=T: the OUT_CVT does (temp * cvt_scale) >> shift in (apparently)
+     * signed int32; with cvt_scale ~2^15 and the relu'd accumulator up to ~2^18 the
+@@ -1379,7 +1388,9 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+        */
+       const char *abs_s = getenv("ROCKET_OUT_SHIFT_ABS");
+       uint32_t shift_val =
+-         abs_s ? (uint32_t)atoi(abs_s) : (shift - 1 + rkt_out_shift_add());
++         abs_s ? (uint32_t)atoi(abs_s)
++               : operation->rq_exact ? operation->rq_shift
++                                     : (shift - 1 + rkt_out_shift_add());
+       fprintf(stderr,
+               "rocket: OUT_CVT computed_shift=%d scale=0x%x -> emitting shift=%u\n",
+               (int)shift - 1, cvt_scale, shift_val);
+-- 
+2.55.0
+

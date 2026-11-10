@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:11:15 +0100
+Subject: [PATCH 17/23] rocket: rk3576: zero-copy CONCATENATION along the
+ channels
+
+In the NPU's NC1HWC2 layout a concatenation input that starts at a
+channel offset that is a multiple of 16 is a byte range of the output.
+Make each such input a view of the output BO (rkt_resource_view), so its
+producer writes straight into the concatenation and nothing runs for the
+concatenation itself. All inputs and the output need the same
+quantization and spatial size, and every input but the last a multiple
+of 16 channels.
+
+Jobs and invokes that depend on a concatenation output depend on the
+producers of its inputs; the two-core planner passes the row ranges of
+the concatenation's consumers through to them.
+
+As a tensor can only be a view of one output, rkt_ml_operations_filter()
+claims a tensor as the input of at most one concatenation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_device.c |  47 ++++
+ src/gallium/drivers/rocket/rkt_device.h |  10 +
+ src/gallium/drivers/rocket/rkt_mc.c     |  30 ++-
+ src/gallium/drivers/rocket/rkt_ml.c     | 276 ++++++++++++++++++++++--
+ src/gallium/drivers/rocket/rkt_ml.h     |  11 +
+ src/gallium/drivers/rocket/rkt_ops.h    |   6 +
+ 6 files changed, 359 insertions(+), 21 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+index 0d366d1..e035a8f 100644
+--- a/src/gallium/drivers/rocket/rkt_device.c
++++ b/src/gallium/drivers/rocket/rkt_device.c
+@@ -120,6 +120,19 @@ rkt_buffer_map(struct pipe_context *pctx,
+    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
+    assert(ret != -1);
+ 
++   if (rsc->parent) {
++      /* a view: the parent's mapping, moved by the view offset */
++      struct rkt_resource *par = rkt_resource(rsc->parent);
++      if (!par->cpu_map) {
++         uint8_t *map = os_mmap(NULL, rsc->parent->width0, PROT_READ | PROT_WRITE,
++                                MAP_SHARED, screen->fd, par->fake_offset);
++         assert(map != MAP_FAILED);
++         par->cpu_map = map;
++      }
++      *out_transfer = transfer;
++      return par->cpu_map + rsc->view_offset + box->x;
++   }
++
+    /*
+     * Map once and keep the mapping: a fresh mmap per map (never unmapped)
+     * leaked one VMA per invoke and page-faulted the whole BO in again every
+@@ -238,6 +251,34 @@ free_rsc:
+    return NULL;
+ }
+ 
++struct pipe_resource *
++rkt_resource_view(struct pipe_resource *parent, unsigned offset, unsigned size)
++{
++   struct rkt_resource *par = rkt_resource(parent);
++   struct rkt_resource *rsc;
++
++   /* a view of a view is a view of the BO */
++   if (par->parent) {
++      offset += par->view_offset;
++      parent = par->parent;
++      par = rkt_resource(parent);
++   }
++   rsc = rzalloc(NULL, struct rkt_resource);
++   if (!rsc)
++      return NULL;
++   assert(offset + size <= parent->width0);
++   rsc->base = *parent;
++   rsc->base.width0 = size;
++   pipe_reference_init(&rsc->base.reference, 1);
++   rsc->handle = par->handle;
++   rsc->phys_addr = par->phys_addr + offset;
++   rsc->fake_offset = par->fake_offset;
++   rsc->bo_size = size;
++   rsc->view_offset = offset;
++   pipe_resource_reference(&rsc->parent, parent);
++   return &rsc->base;
++}
++
+ static void
+ rkt_resource_destroy(struct pipe_screen *pscreen,
+                      struct pipe_resource *prsc)
+@@ -247,6 +288,12 @@ rkt_resource_destroy(struct pipe_screen *pscreen,
+    struct drm_gem_close arg = {0};
+    int ret;
+ 
++   if (rsc->parent) {
++      pipe_resource_reference(&rsc->parent, NULL);
++      ralloc_free(rsc);
++      return;
++   }
++
+    if (rsc->cpu_map)
+       os_munmap(rsc->cpu_map, prsc->width0);
+ 
+diff --git a/src/gallium/drivers/rocket/rkt_device.h b/src/gallium/drivers/rocket/rkt_device.h
+index d6945d5..a08e2bd 100644
+--- a/src/gallium/drivers/rocket/rkt_device.h
++++ b/src/gallium/drivers/rocket/rkt_device.h
+@@ -84,8 +84,18 @@ struct rkt_resource {
+ 
+    /* CPU mapping, made on the first map and kept until the BO is freed */
+    uint8_t *cpu_map;
++   /*
++    * a view (rkt_resource_view) is a byte range of another BO, e.g. a
++    * CONCATENATION input that its producer writes straight into the concat
++    * output. Same handle, phys_addr moved by view_offset.
++    */
++   struct pipe_resource *parent;
++   uint32_t view_offset;
+ };
+ 
++struct pipe_resource *rkt_resource_view(struct pipe_resource *parent,
++                                        unsigned offset, unsigned size);
++
+ static inline struct rkt_resource *
+ rkt_resource(struct pipe_resource *p)
+ {
+diff --git a/src/gallium/drivers/rocket/rkt_mc.c b/src/gallium/drivers/rocket/rkt_mc.c
+index 9e760d7..10213e3 100644
+--- a/src/gallium/drivers/rocket/rkt_mc.c
++++ b/src/gallium/drivers/rocket/rkt_mc.c
+@@ -31,6 +31,7 @@
+ #include "rkt_task.h"
+ 
+ #define MC_TGT_CNA 0x0201
++#define RKT_MC_MAX_IN 16
+ /* fewest output rows per core worth splitting */
+ #define MC_MIN_ROWS 4
+ /* halo rows (in percent of the rows) and recomputed MACs an operation may
+@@ -118,8 +119,8 @@ rkt_mc_in_rows(const struct rkt_operation *operation, unsigned r0, unsigned r1,
+       *lo = *hi = 0;
+       return;
+    }
+-   if (operation->ew_add) {
+-      /* element-wise: the same rows */
++   if (operation->ew_add || operation->ops.kind == RKT_OPS_CONCAT) {
++      /* element-wise, or a zero-copy concatenation: the same rows */
+       *lo = r0;
+       *hi = r1;
+       return;
+@@ -244,14 +245,32 @@ rkt_mc_plan(struct rkt_ml_subgraph *subgraph)
+          op->mc_planned = true;
+       }
+ 
++      if (op->ops.kind == RKT_OPS_CONCAT) {
++         /*
++          * A zero-copy concatenation computes nothing; the rows its
++          * consumers on core c read are the rows its producers write there.
++          */
++         for (unsigned c = 0; c < 2; c++) {
++            r[c][0] = need[i][c][0];
++            r[c][1] = need[i][c][1];
++         }
++         op->mc_planned = true;
++      }
++
+       for (unsigned c = 0; c < 2; c++) {
+          op->mc_r0[c] = r[c][0];
+          op->mc_r1[c] = r[c][1];
+       }
+ 
+       /* what this operation's core c part reads from its producers */
+-      int inputs[2] = {op->input_index, op->add_tensor};
+-      for (unsigned k = 0; k < 2; k++) {
++      int inputs[RKT_MC_MAX_IN] = {op->input_index, op->add_tensor};
++      unsigned ninputs = 2;
++      if (op->ops.kind == RKT_OPS_CONCAT) {
++         ninputs = MIN2(op->concat_n, RKT_MC_MAX_IN);
++         for (unsigned k = 0; k < ninputs; k++)
++            inputs[k] = op->concat_in[k];
++      }
++      for (unsigned k = 0; k < ninputs; k++) {
+          if (inputs[k] < 0)
+             continue;
+          for (int j = i - 1; j >= 0; j--) {
+@@ -259,7 +278,8 @@ rkt_mc_plan(struct rkt_ml_subgraph *subgraph)
+                continue;
+             for (unsigned c = 0; c < 2; c++) {
+                unsigned lo, hi;
+-               if (k == 1) {
++               if (k >= 1) {
++                  /* the EW operand of an ADD, or a concatenation input */
+                   lo = r[c][0];
+                   hi = r[c][1];
+                } else {
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 15a12c8..890f9ec 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -53,7 +53,8 @@ create_tensor(struct rkt_ml_subgraph *subgraph, unsigned idx,
+    struct pipe_resource *res = tensors[idx];
+ 
+    if (res != NULL) {
+-      assert(size == pipe_buffer_size(res));
++      /* a concatenation input is a view, sized to the end of its BO */
++      assert(size == pipe_buffer_size(res) || rkt_resource(res)->parent);
+       return;
+    }
+ 
+@@ -500,6 +501,14 @@ find_first_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
+          return operation->ew_shadow;
+    }
+ 
++   /* a concatenation input (written into its view of the output) */
++   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
++                          operation) {
++      for (unsigned k = 0; k < operation->concat_n; k++)
++         if (operation->concat_in[k] == tensor_index)
++            return &operation->concat_shadow[k];
++   }
++
+    return NULL;
+ }
+ 
+@@ -824,6 +833,174 @@ lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
+    }
+ }
+ 
++static void
++lower_concat_rk3576(struct rkt_ml_subgraph *subgraph,
++                    const struct pipe_ml_operation *poperation,
++                    struct rkt_operation *operation)
++{
++   struct rkt_screen *screen = rkt_screen(subgraph->base.context->screen);
++   const struct pipe_tensor *o = poperation->output_tensors[0];
++   unsigned n = poperation->input_count;
++
++   util_dynarray_init(&operation->tasks, NULL);
++   operation->soc = screen->soc;
++   operation->cbuf_banks = screen->cbuf_banks;
++   operation->cbuf_entries_per_bank = screen->cbuf_entries_per_bank;
++   operation->cbuf_bank_size = screen->cbuf_bank_size;
++   operation->ops.kind = RKT_OPS_CONCAT;
++
++   operation->output_index = o->index;
++   operation->output_width = o->dims[1];
++   operation->output_height = o->dims[2];
++   operation->output_channels = o->dims[3];
++   operation->output_zero_point = rkt_ew_zp(o) + 0x80;
++   operation->output_scale = o->scale;
++
++   operation->concat_n = n;
++   operation->concat_in = calloc(n, sizeof(unsigned));
++   operation->concat_c = calloc(n, sizeof(unsigned));
++   operation->concat_shadow = calloc(n, sizeof(struct rkt_operation));
++   for (unsigned k = 0; k < n; k++) {
++      const struct pipe_tensor *i = poperation->input_tensors[k];
++      struct rkt_operation *sh = &operation->concat_shadow[k];
++
++      operation->concat_in[k] = i->index;
++      operation->concat_c[k] = i->dims[3];
++
++      /* invoke's view of input k: an operation reading just that tensor */
++      sh->soc = screen->soc;
++      sh->add_tensor = -1;
++      sh->ops.kind = RKT_OPS_CONCAT;
++      sh->input_index = i->index;
++      sh->input_width = i->dims[1];
++      sh->input_height = i->dims[2];
++      sh->input_channels = i->dims[3];
++      sh->input_zero_point = rkt_ew_zp(i) + 0x80;
++      sh->input_scale = i->scale;
++      sh->output_index = o->index;
++      sh->output_width = i->dims[1];
++      sh->output_height = i->dims[2];
++      sh->output_channels = i->dims[3];
++      sh->output_zero_point = sh->input_zero_point;
++      sh->output_scale = i->scale;
++   }
++   /* the operation itself reads input 0, like its shadow */
++   operation->add_tensor = -1;
++   operation->input_index = operation->concat_shadow[0].input_index;
++   operation->input_width = operation->concat_shadow[0].input_width;
++   operation->input_height = operation->concat_shadow[0].input_height;
++   operation->input_channels = operation->concat_shadow[0].input_channels;
++   operation->input_zero_point = operation->concat_shadow[0].input_zero_point;
++   operation->input_scale = operation->concat_shadow[0].input_scale;
++}
++
++/*
++ * make the inputs of every CONCATENATION views of its output, the
++ * last concatenation first, so that a concat feeding another one is itself a
++ * view of the outer output already when its inputs are placed. Returns false
++ * if an input already has a buffer (Teflon should have refused the concat).
++ */
++static bool
++place_concat_views(struct rkt_ml_subgraph *subgraph)
++{
++   unsigned n = util_dynarray_num_elements(&subgraph->operations,
++                                           struct rkt_operation);
++   struct rkt_operation *ops = util_dynarray_begin(&subgraph->operations);
++   struct pipe_resource **tensors = util_dynarray_begin(&subgraph->tensors);
++
++   for (int i = (int)n - 1; i >= 0; i--) {
++      struct rkt_operation *op = &ops[i];
++      unsigned plane, c0 = 0;
++
++      if (op->ops.kind != RKT_OPS_CONCAT)
++         continue;
++      if (!tensors[op->output_index])
++         create_tensor(subgraph, op->output_index, calc_raw_output_size(op));
++      plane = op->output_width * op->output_height * FEATURE_ATOMIC_SIZE;
++      for (unsigned k = 0; k < op->concat_n; k++) {
++         unsigned idx = op->concat_in[k];
++         unsigned off = c0 / FEATURE_ATOMIC_SIZE * plane;
++         struct pipe_resource *parent = tensors[op->output_index];
++
++         if (tensors[idx] || c0 % FEATURE_ATOMIC_SIZE) {
++            fprintf(stderr, "rocket: CONCAT -> t%u: input t%u cannot be "
++                    "placed in the output\n", op->output_index, idx);
++            return false;
++         }
++         tensors[idx] = rkt_resource_view(parent, off, parent->width0 - off);
++         c0 += op->concat_c[k];
++      }
++   }
++   return true;
++}
++
++/*
++ * the operations that write the tensor: its producer, or for a
++ * concatenation output the producers of its inputs (recursively). A
++ * subgraph input has none.
++ */
++static unsigned
++real_producers(struct rkt_ml_subgraph *subgraph, unsigned idx,
++               struct rkt_operation **out, unsigned max)
++{
++   struct rkt_operation *p = find_producer(subgraph, idx);
++   unsigned n = 0;
++
++   if (!p)
++      return 0;
++   if (p->ops.kind != RKT_OPS_CONCAT) {
++      out[0] = p;
++      return 1;
++   }
++   for (unsigned k = 0; k < p->concat_n && n < max; k++)
++      n += real_producers(subgraph, p->concat_in[k], out + n, max - n);
++   return n;
++}
++
++/*
++ * CONCATENATION along the channels, zero copy. In NC1HWC2 an input
++ * that starts at a channel offset c0 with c0 % 16 == 0 is the byte range
++ * [c0 / 16 * plane, ...) of the output (plane = W * H * 16), so it becomes a
++ * view of the output BO and its producer writes straight into the concat.
++ * Conditions: per-tensor quantization identical on all inputs and the output
++ * (no requantization), same batch / spatial size, every input except the
++ * last a multiple of 16 channels, more than 4 channels everywhere (<= 4 is
++ * the first-convolution input path). rkt_ml_operations_filter() makes sure
++ * that no tensor is an input of two claimed concatenations. Tensors of lower
++ * rank come with leading dimensions of 1, so axis 3 / -1 is their last axis.
++ */
++static bool
++rkt_concat_supported(const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *o = operation->output_tensors[0];
++   unsigned c = 0;
++
++   if (operation->output_count != 1 ||
++       operation->input_count < 2 || operation->input_count > 16 ||
++       !(operation->conc.axis == 3 || operation->conc.axis == -1))
++      return false;
++   if (!tensor_quantization_supported(o) || o->dims[0] != 1 || o->dims[3] <= 4)
++      return false;
++   for (unsigned k = 0; k < operation->input_count; k++) {
++      struct pipe_tensor *i = operation->input_tensors[k];
++      if (i->resource != NULL || !tensor_quantization_supported(i))
++         return false;
++      if (i->scale != o->scale || i->zero_point != o->zero_point ||
++          i->is_signed != o->is_signed)
++         return false;
++      if (i->dims[0] != 1 || i->dims[1] != o->dims[1] ||
++          i->dims[2] != o->dims[2] || i->dims[3] <= 4)
++         return false;
++      if (k + 1 < operation->input_count && i->dims[3] % FEATURE_ATOMIC_SIZE)
++         return false;
++      for (unsigned j = 0; j < k; j++)
++         if (operation->input_tensors[j]->index == i->index)
++            return false;
++      c += i->dims[3];
++   }
++   return c == o->dims[3];
++}
++
+ /*
+  * Rocket applies no activation fused into an ADD, pooling or concatenation.
+  * Such an operation is still correct when the output's quantized range
+@@ -949,6 +1126,10 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+       supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
+                   rkt_ops_resize_supported(operation);
+       break;
++   case PIPE_ML_OPERATION_TYPE_CONCATENATION:
++      supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
++                  rkt_concat_supported(operation);
++      break;
+    default:
+       supported = false;
+    }
+@@ -1105,6 +1286,29 @@ drop_misplaced(struct rkt_ml_graph *g, bool *supported)
+ 
+    rkt_ml_graph_partition(g, supported);
+ 
++   /*
++    * A concatenation makes its inputs views of its output (lower_concat_rk3576),
++    * so a tensor can be the input of one claimed concatenation only.
++    */
++   for (int i = 0; i < n; i++) {
++      bool ok = true;
++
++      if (!supported[i] || ops[i].type != PIPE_ML_OPERATION_TYPE_CONCATENATION)
++         continue;
++      for (int k = 0; k < i && ok; k++) {
++         if (!supported[k] || ops[k].type != PIPE_ML_OPERATION_TYPE_CONCATENATION)
++            continue;
++         for (unsigned j = 0; j < ops[i].input_count; j++)
++            for (unsigned l = 0; l < ops[k].input_count; l++)
++               if (ops[i].input_tensors[j] == ops[k].input_tensors[l])
++                  ok = false;
++      }
++      if (!ok) {
++         supported[i] = false;
++         changed = true;
++      }
++   }
++
+    /*
+     * Only the CPU's input conversion writes the tight first-convolution
+     * input (rkt_ml_subgraph_invoke). Inside one partition that tensor can
+@@ -1186,6 +1390,11 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       operation.add_tensor = -1;
+ 
+       switch (poperations[i].type) {
++      case PIPE_ML_OPERATION_TYPE_CONCATENATION:
++         lower_concat_rk3576(subgraph, &poperations[i], &operation);
++         util_dynarray_append(&subgraph->operations, struct rkt_operation,
++                              operation);
++         break;
+       case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
+          /* int8 tensors are lowered as offset uint8, see rkt_int8.h. */
+          struct rkt_int8_view view;
+@@ -1260,6 +1469,12 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       }
+    }
+ 
++   /* concatenation inputs become views of the outputs first */
++   if (!place_concat_views(subgraph)) {
++      rkt_ml_subgraph_destroy(pcontext, &subgraph->base);
++      return NULL;
++   }
++
+    /* Create input tensors */
+    enum rkt_soc soc = rkt_screen(subgraph->base.context->screen)->soc;
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+@@ -1349,6 +1564,9 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          task.output_channels = operation->output_channels;
+          task.output_channels_real = operation->output_channels;
+          util_dynarray_append(&operation->tasks, struct split_task, task);
++      } else if (operation->ops.kind == RKT_OPS_CONCAT) {
++         /* zero copy, nothing to run */
++         continue;
+       } else if (operation->ops.kind != RKT_OPS_NONE) {
+          /* PPU pool = one task; 2x resize = one task per group */
+          unsigned n = operation->ops.kind == RKT_OPS_RESIZE
+@@ -1536,17 +1754,25 @@ rkt_batch_jobs(struct rkt_ml_subgraph *subgraph, struct util_dynarray *jobs)
+           * there: the producer's job has to be pushed first, and the work
+           * already in this core's job must not wait for it.
+           */
+-         uint32_t deps[4];
++         uint32_t deps[2 * 64];
+          unsigned ndeps = 0;
+          for (unsigned k = 0; k < num_inputs; k++) {
+-            struct rkt_operation *p = find_producer(subgraph, inputs[k]);
++            /*
++             * the producers of a zero-copy concatenation output are the
++             * producers of its inputs (its views), with the same rows.
++             */
++            struct rkt_operation *prods[64];
++            unsigned nprods = real_producers(subgraph, inputs[k], prods, 64);
+             uint32_t t_h = rkt_get_tensor(subgraph, inputs[k])->handle;
+-            unsigned lo, hi;
+ 
+-            if (!p) {
++            if (!nprods) {
+                deps[ndeps++] = t_h; /* written by the CPU, no fence */
+                continue;
+             }
++            for (unsigned q = 0; q < nprods; q++) {
++            struct rkt_operation *p = prods[q];
++            unsigned lo, hi;
++
+             if (k == 1)
+                lo = op->mc_r0[core], hi = op->mc_r1[core];
+             else
+@@ -1570,7 +1796,9 @@ rkt_batch_jobs(struct rkt_ml_subgraph *subgraph, struct util_dynarray *jobs)
+                if (!rkt_handle_has(&ob->in, h))
+                   rkt_bjob_close(&bjobs, open, core, jobs, pin);
+             }
+-            deps[ndeps++] = h;
++            if (ndeps < ARRAY_SIZE(deps))
++               deps[ndeps++] = h;
++            }
+          }
+ 
+          if (open[core] < 0) {
+@@ -1879,7 +2107,7 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                           operation) {
+       unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
+       /* + up to two sync BOs of two-core producers (rkt_mc.c) */
+-      uint32_t *in_bo_handles = calloc(num_inputs + 2, sizeof(uint32_t));
++      uint32_t *in_bo_handles = calloc(num_inputs + 2 * 64, sizeof(uint32_t));
+       uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+ 
+       in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
+@@ -1893,10 +2121,14 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+        * jobs only and its sync BO with the core 0 ones, so wait for both.
+        */
+       for (unsigned k = 0, n = num_inputs; k < n; k++) {
+-         struct rkt_operation *producer = find_producer(
+-            subgraph, k ? operation->add_tensor : operation->input_index);
+-         if (producer && producer->mc_sync)
+-            in_bo_handles[num_inputs++] = rkt_resource(producer->mc_sync)->handle;
++         /* through a zero-copy concatenation to its producers */
++         struct rkt_operation *prods[64];
++         unsigned np = real_producers(
++            subgraph, k ? operation->add_tensor : operation->input_index,
++            prods, 64);
++         for (unsigned q = 0; q < np; q++)
++            if (prods[q]->mc_sync)
++               in_bo_handles[num_inputs++] = rkt_resource(prods[q]->mc_sync)->handle;
+       }
+ 
+       out_bo_handles[0] =
+@@ -2061,11 +2293,18 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+       uint8_t(*output_out)[operation->output_width][operation->output_channels];
+ 
+       /* a two-core producer: its core 0 half is fenced on the sync BO */
+-      if (operation->mc_sync) {
+-         struct pipe_transfer *sync_transfer = NULL;
+-         pipe_buffer_map(pcontext, operation->mc_sync, PIPE_MAP_READ,
+-                         &sync_transfer);
+-         pipe_buffer_unmap(pcontext, sync_transfer);
++      {
++         /* a concatenation output has the producers of its inputs */
++         struct rkt_operation *prods[64];
++         unsigned np = real_producers(subgraph, output_idxs[i], prods, 64);
++         for (unsigned q = 0; q < np; q++) {
++            if (!prods[q]->mc_sync)
++               continue;
++            struct pipe_transfer *sync_transfer = NULL;
++            pipe_buffer_map(pcontext, prods[q]->mc_sync, PIPE_MAP_READ,
++                            &sync_transfer);
++            pipe_buffer_unmap(pcontext, sync_transfer);
++         }
+       }
+ 
+       DBG("Before pipe_buffer_map\n");
+@@ -2127,6 +2366,11 @@ static void
+ free_operation(struct rkt_operation *operation)
+ {
+    util_dynarray_fini(&operation->tasks);
++   free(operation->concat_in);
++   free(operation->concat_c);
++   free(operation->concat_shadow);
++   operation->concat_in = operation->concat_c = NULL;
++   operation->concat_shadow = NULL;
+    if (operation->ew_shadow) {
+       util_dynarray_fini(&operation->ew_shadow->tasks);
+       free(operation->ew_shadow);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index eb96496..f08de42 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -226,6 +226,17 @@ struct rkt_operation {
+ 
+    /* invoke scratch (rkt_batch_jobs): the job each core's tasks went to */
+    int batch_job[2];
++
++   /*
++    * CONCATENATION (ops.kind == RKT_OPS_CONCAT): the input tensors and
++    * their channel counts; concat_shadow[i] is what find_first_consumer()
++    * returns for input i (as ew_shadow for the ADD), so that invoke uploads
++    * a subgraph input straight into its view.
++    */
++   unsigned concat_n;
++   unsigned *concat_in;
++   unsigned *concat_c;
++   struct rkt_operation *concat_shadow;
+ };
+ 
+ struct rkt_ml_subgraph {
+diff --git a/src/gallium/drivers/rocket/rkt_ops.h b/src/gallium/drivers/rocket/rkt_ops.h
+index de87d00..71daa07 100644
+--- a/src/gallium/drivers/rocket/rkt_ops.h
++++ b/src/gallium/drivers/rocket/rkt_ops.h
+@@ -37,6 +37,12 @@ enum rkt_ops_kind {
+    RKT_OPS_NONE = 0,
+    RKT_OPS_MAXPOOL,
+    RKT_OPS_RESIZE,
++   /*
++    * CONCATENATION along the channels, zero copy: every input tensor is
++    * a view (rkt_resource_view) of the output at its channel offset, so the
++    * producers write straight into the concat output. No tasks.
++    */
++   RKT_OPS_CONCAT,
+ };
+ 
+ struct rkt_ops_params {
+-- 
+2.55.0
+

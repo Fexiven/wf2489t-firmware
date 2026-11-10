@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:07:12 +0100
+Subject: [PATCH 10/23] teflon,rocket: check fused activations and resize modes
+ before claiming an op
+
+Teflon dropped the fused activation of ADD, pooling and concatenation and
+the align_corners and half_pixel_centers flags of RESIZE_NEAREST_NEIGHBOR,
+so a driver could not tell an operation it implements from one it does
+not. Add pipe_ml_operation::fused_activation and ::resize and have
+Teflon fill them in; drivers that do not look at them are unchanged.
+
+Rocket applies no fused activation to these operations and implements
+only the asymmetric mapping with floor rounding for RESIZE. Claim an ADD,
+pooling or concatenation with a fused RELU or RELU6 only when the
+output's quantized range already is the clamp (the lowest code is 0.0
+and, for RELU6, the highest at most 6.0), as in EfficientDet-Lite's
+BiFPN, where saturation does the RELU6, and leave a RESIZE with either
+flag set to the CPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c       | 47 +++++++++++++++++++++++
+ src/gallium/frontends/teflon/tfl_device.c | 36 ++++++++++++++++-
+ src/gallium/include/pipe/p_state.h        | 31 +++++++++++++++
+ 3 files changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index eb8cb46..f2b894c 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -666,12 +666,59 @@ lower_add_rk3576(struct rkt_ml_subgraph *subgraph,
+    util_dynarray_init(&operation->ew_shadow->tasks, NULL);
+ }
+ 
++/*
++ * Rocket applies no activation fused into an ADD, pooling or concatenation.
++ * Such an operation is still correct when the output's quantized range
++ * already is the clamp: the lowest code is 0.0 and, for RELU6, the highest
++ * is at most 6.0, as in EfficientDet-Lite's BiFPN, where saturation does
++ * the RELU6.
++ */
++static bool
++fused_activation_implied(const struct pipe_ml_operation *operation)
++{
++   const struct pipe_tensor *o = operation->output_tensors[0];
++   int qmin = o->is_signed ? INT8_MIN : 0;
++   int qmax = o->is_signed ? INT8_MAX : UINT8_MAX;
++
++   if (operation->fused_activation == PIPE_ML_ACTIVATION_NONE)
++      return true;
++   if (o->scales || o->zero_points || !(o->scale > 0.0f) ||
++       o->zero_point != qmin)
++      return false;
++
++   switch (operation->fused_activation) {
++   case PIPE_ML_ACTIVATION_RELU:
++      return true;
++   case PIPE_ML_ACTIVATION_RELU6:
++      return (qmax - o->zero_point) * o->scale <= 6.0f;
++   default:
++      return false;
++   }
++}
++
+ bool
+ rkt_ml_operation_supported(struct pipe_context *pcontext,
+                            const struct pipe_ml_operation *operation)
+ {
+    bool supported = false;
+ 
++   switch (operation->type) {
++   case PIPE_ML_OPERATION_TYPE_ADD:
++   case PIPE_ML_OPERATION_TYPE_POOLING:
++   case PIPE_ML_OPERATION_TYPE_CONCATENATION:
++      if (!fused_activation_implied(operation))
++         return false;
++      break;
++   case PIPE_ML_OPERATION_TYPE_RESIZE:
++      /* only the asymmetric mapping with floor rounding */
++      if (operation->resize.align_corners ||
++          operation->resize.half_pixel_centers)
++         return false;
++      break;
++   default:
++      break;
++   }
++
+    switch (operation->type) {
+    case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
+       struct pipe_tensor *input_tensor = operation->input_tensors[0];
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index 5cd21dc..b698a26 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -95,6 +95,27 @@ create_resource(struct pipe_context *context, TfLiteTensor tensor)
+    return pipe_buffer_create_with_data(context, 0, PIPE_USAGE_DEFAULT, size * bytes, tensor.data.data);
+ }
+ 
++static enum pipe_ml_activation
++ml_activation(TfLiteFusedActivation activation)
++{
++   switch (activation) {
++   case kTfLiteActRelu:
++      return PIPE_ML_ACTIVATION_RELU;
++   case kTfLiteActReluN1To1:
++      return PIPE_ML_ACTIVATION_RELU_N1_TO_1;
++   case kTfLiteActRelu6:
++      return PIPE_ML_ACTIVATION_RELU6;
++   case kTfLiteActTanh:
++      return PIPE_ML_ACTIVATION_TANH;
++   case kTfLiteActSignBit:
++      return PIPE_ML_ACTIVATION_SIGN_BIT;
++   case kTfLiteActSigmoid:
++      return PIPE_ML_ACTIVATION_SIGMOID;
++   default:
++      return PIPE_ML_ACTIVATION_NONE;
++   }
++}
++
+ static bool
+ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLiteNode *node, TfLiteRegistration *node_registration, struct pipe_ml_operation *operation)
+ {
+@@ -173,6 +194,7 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       TfLitePoolParams *params = node->builtin_data;
+ 
+       operation->type = PIPE_ML_OPERATION_TYPE_POOLING;
++      operation->fused_activation = ml_activation(params->activation);
+ 
+       /* Skip setting operation->pooling.type for PIPE_ML_POOLING_TYPE_AVG==0 */
+       operation->pooling.filter_height = params->filter_height;
+@@ -182,14 +204,20 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       operation->pooling.padding_same = params->padding == kTfLitePaddingSame;
+       break;
+    }
+-   case kTfLiteBuiltinAdd:
++   case kTfLiteBuiltinAdd: {
++      TfLiteAddParams *params = node->builtin_data;
++
+       operation->type = PIPE_ML_OPERATION_TYPE_ADD;
++      if (params)
++         operation->fused_activation = ml_activation(params->activation);
+       break;
++   }
+    case kTfLiteBuiltinConcatenation: {
+       TfLiteConcatenationParams *params = node->builtin_data;
+ 
+       operation->type = PIPE_ML_OPERATION_TYPE_CONCATENATION;
+       operation->conc.axis = params->axis;
++      operation->fused_activation = ml_activation(params->activation);
+       break;
+    }
+    case kTfLiteBuiltinSplit:
+@@ -270,7 +298,13 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
+       break;
+    }
+    case kTfLiteBuiltinResizeNearestNeighbor: {
++      TfLiteResizeNearestNeighborParams *params = node->builtin_data;
++
+       operation->type = PIPE_ML_OPERATION_TYPE_RESIZE;
++      if (params) {
++         operation->resize.align_corners = params->align_corners;
++         operation->resize.half_pixel_centers = params->half_pixel_centers;
++      }
+       break;
+    }
+    default:
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index f9b9174..ee7cb4f 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1063,6 +1063,19 @@ enum pipe_ml_pooling_type {
+    PIPE_ML_POOLING_TYPE_MAX,
+ };
+ 
++/**
++ * Activation function fused into a pipe_ml_operation.
++ */
++enum pipe_ml_activation {
++   PIPE_ML_ACTIVATION_NONE,
++   PIPE_ML_ACTIVATION_RELU,
++   PIPE_ML_ACTIVATION_RELU_N1_TO_1,
++   PIPE_ML_ACTIVATION_RELU6,
++   PIPE_ML_ACTIVATION_TANH,
++   PIPE_ML_ACTIVATION_SIGN_BIT,
++   PIPE_ML_ACTIVATION_SIGMOID,
++};
++
+ /**
+  * Information about a single operation inside a ML subgraph.
+  */
+@@ -1085,6 +1098,12 @@ struct pipe_ml_operation
+    struct pipe_tensor **output_tensors;
+    unsigned output_count;
+ 
++   /**
++    * Activation fused into an ADD, POOLING or CONCATENATION operation, to be
++    * applied to the output.
++    */
++   enum pipe_ml_activation fused_activation;
++
+    union {
+       struct {
+          /**
+@@ -1240,6 +1259,18 @@ struct pipe_ml_operation
+          int end[4];
+          int strides[4];
+       } slice;
++
++      struct {
++         /**
++          * Whether the corner pixels of input and output are aligned.
++          */
++         bool align_corners;
++
++         /**
++          * Whether pixel centers are at half-integer coordinates.
++          */
++         bool half_pixel_centers;
++      } resize;
+    };
+ };
+ 
+-- 
+2.55.0
+

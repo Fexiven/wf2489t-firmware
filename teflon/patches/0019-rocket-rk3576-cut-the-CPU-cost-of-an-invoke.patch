@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:11 +0100
+Subject: [PATCH 19/23] rocket: rk3576: cut the CPU cost of an invoke
+
+ - NHWC <-> NC1HWC2 conversion walked pixel by pixel, so the host tensor
+   is read or written strictly sequentially and each 16-byte group is one
+   NEON load, XOR and store; signed inputs no longer need a flipped copy.
+ - A subgraph input BO is only read by the NPU and fully rewritten on
+   every invoke, so it is mapped write-only unsynchronized and the
+   PREP_BO wait and cache invalidate are skipped (the FINI_BO clean at
+   unmap stays).
+ - The submit jobs of a subgraph are the same on every invoke; build them
+   once and keep them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_device.c |  10 +-
+ src/gallium/drivers/rocket/rkt_ml.c     | 115 +++++++---------
+ src/gallium/drivers/rocket/rkt_ml.h     |   4 +
+ src/gallium/drivers/rocket/rkt_ovh.h    | 173 ++++++++++++++++++++++++
+ 4 files changed, 235 insertions(+), 67 deletions(-)
+ create mode 100644 src/gallium/drivers/rocket/rkt_ovh.h
+
+diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+index e035a8f..cb47ede 100644
+--- a/src/gallium/drivers/rocket/rkt_device.c
++++ b/src/gallium/drivers/rocket/rkt_device.c
+@@ -117,8 +117,12 @@ rkt_buffer_map(struct pipe_context *pctx,
+    arg.handle = rsc->handle;
+    arg.timeout_ns = INT64_MAX;
+ 
+-   ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
+-   assert(ret != -1);
++   /* write-only unsynchronized maps skip PREP_BO (rkt_ovh.h) */
++   if ((usage & (PIPE_MAP_READ | PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED)) !=
++       (PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED)) {
++      ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_PREP_BO, &arg);
++      assert(ret != -1);
++   }
+ 
+    if (rsc->parent) {
+       /* a view: the parent's mapping, moved by the view offset */
+@@ -161,7 +165,7 @@ rkt_buffer_unmap(struct pipe_context *pctx,
+ 
+    arg.handle = rsrc->handle;
+ 
+-   if (transfer->usage == PIPE_MAP_WRITE) {
++   if (transfer->usage & PIPE_MAP_WRITE) {
+       ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_FINI_BO, &arg);
+       assert(ret >= 0);
+    }
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index f67bf41..d8cebfb 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -20,6 +20,7 @@
+ #include "rkt_regcmd.h"
+ #include "rkt_task.h"
+ #include "rkt_mc.h"
++#include "rkt_ovh.h"
+ 
+ void
+ rkt_dump_buffer(const uint8_t *ptr, char *name, int operation_nr,
+@@ -1956,6 +1957,17 @@ rkt_batch_jobs(struct rkt_ml_subgraph *subgraph, struct util_dynarray *jobs)
+    util_dynarray_fini(&bjobs);
+ }
+ 
++static void
++rkt_ovh_free_jobs(struct util_dynarray *jobs)
++{
++   util_dynarray_foreach (jobs, struct drm_rocket_job, job) {
++      free((void *)job->in_bo_handles);
++      free((void *)job->out_bo_handles);
++      free((void *)job->tasks);
++   }
++   util_dynarray_fini(jobs);
++}
++
+ void
+ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                        struct pipe_ml_subgraph *psubgraph,
+@@ -1985,9 +1997,14 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+        */
+       void *input_data = inputs[i];
+       void *input_u8 = NULL;
+-      bool i8_raw = is_signed && is_signed[i] &&
+-                    rkt_int8_raw_input(operation);
+-      if (is_signed && is_signed[i] && !i8_raw) {
++      bool i8_raw = is_signed && is_signed[i] && rkt_int8_raw_input(operation);
++      bool fast_in = input_channels > 1 &&
++                     !(output_channels == 1 && input_channels == 1 &&
++                       !operation->addition_input &&
++                       (operation->add_tensor == -1)) &&
++                     !(screen->soc == RKT_SOC_RK3576 && !operation->depthwise &&
++                       input_channels <= 4);
++      if (is_signed && is_signed[i] && !i8_raw && !fast_in) {
+          unsigned n = operation->input_width * operation->input_height *
+                       input_channels;
+          input_u8 = malloc(n);
+@@ -2010,7 +2027,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+           */
+          struct pipe_transfer *transfer_out;
+          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
+-                                        PIPE_MAP_WRITE, &transfer_out);
++                                        rkt_ovh_in_map_usage(),
++                                        &transfer_out);
+ 
+          unsigned row = operation->input_width * input_channels;
+          unsigned stride = rkt_fc_width(operation->input_width) *
+@@ -2045,7 +2063,8 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+          struct pipe_transfer *transfer_out;
+          uint8_t(*input_in)[input_height][input_channels] = input_data;
+          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
+-                                        PIPE_MAP_WRITE, &transfer_out);
++                                        rkt_ovh_in_map_usage(),
++                                        &transfer_out);
+ 
+          DBG("Converting data\n");
+ 
+@@ -2055,7 +2074,15 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+           * convert to signed. The DMA unit seems to be able to convert from
+           * unsigned to signed though.
+           */
+-         if (input_channels == 1) {
++         if (fast_in) {
++            /* int8 flipped to offset uint8 then -0x80 = the bytes as they are */
++            bool flip = is_signed && is_signed[i];
++            rkt_ovh_nhwc_to_nc1hwc2(map, input_data,
++                                    input_width * input_height,
++                                    input_channels, flip ? 0x00 : 0x80,
++                                    (uint8_t)(zero_point - 0x80));
++         } else {
++            /* one channel (fast_in covers every other count) */
+             unsigned n = 0;
+             for (int x = 0; x < input_width; x++) {
+                for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
+@@ -2065,37 +2092,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                      map[n++] = zero_point;
+                }
+             }
+-         } else {
+-            /*
+-             * NHWC -> NC1HWC2, - 0x80, the same element order as
+-             * map[((u * W + x) * H + y) * 16 + c] = in[x][y][u * 16 + c],
+-             * walked in source order so the loads are sequential.
+-             */
+-            const unsigned full = input_channels / FEATURE_ATOMIC_SIZE;
+-            const unsigned rest = input_channels % FEATURE_ATOMIC_SIZE;
+-            const size_t plane = (size_t)input_width * input_height *
+-                                 FEATURE_ATOMIC_SIZE;
+-            const uint8_t *src = input_data;
+-            const uint8_t pad = zero_point - 0x80;
+-            (void)input_in;
+-
+-            for (unsigned p = 0; p < input_width * input_height; p++) {
+-               const uint8_t *s = src + (size_t)p * input_channels;
+-               uint8_t *d = map + (size_t)p * FEATURE_ATOMIC_SIZE;
+-               unsigned u;
+-               for (u = 0; u < full; u++) {
+-                  for (unsigned c = 0; c < FEATURE_ATOMIC_SIZE; c++)
+-                     d[c] = s[c] ^ 0x80;
+-                  s += FEATURE_ATOMIC_SIZE;
+-                  d += plane;
+-               }
+-               if (rest) {
+-                  for (unsigned c = 0; c < rest; c++)
+-                     d[c] = s[c] ^ 0x80;
+-                  for (unsigned c = rest; c < FEATURE_ATOMIC_SIZE; c++)
+-                     d[c] = pad;
+-               }
+-            }
+          }
+ 
+          if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
+@@ -2116,6 +2112,15 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+    struct util_dynarray jobs = {0};
+    util_dynarray_init(&jobs, NULL);
+ 
++   /*
++    * The jobs of a subgraph are the same on every invoke, so they are built
++    * once and kept (rkt_ml_subgraph.ovh_jobs).
++    */
++   if (subgraph->ovh_jobs_valid) {
++      jobs = subgraph->ovh_jobs;
++      goto submit_jobs;
++   }
++
+    if (subgraph->graph_regcmd) {
+       /*
+        * RK3576: dispatch the ENTIRE graph as ONE PC job (vendor model). All tasks
+@@ -2349,6 +2354,10 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+                j->core = 1;
+    }
+ 
++   subgraph->ovh_jobs = jobs;
++   subgraph->ovh_jobs_valid = true;
++
++submit_jobs:;
+    struct drm_rocket_submit submit = {0};
+    submit.job_struct_size = sizeof(struct drm_rocket_job);
+    submit.jobs = (uint64_t)util_dynarray_begin(&jobs);
+@@ -2373,12 +2382,6 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+    ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit);
+    assert(ret == 0);
+ 
+-   util_dynarray_foreach (&jobs, struct drm_rocket_job, job) {
+-      free((void *)job->in_bo_handles);
+-      free((void *)job->out_bo_handles);
+-      free((void *)job->tasks);
+-   }
+-   util_dynarray_fini(&jobs);
+ 
+    DBG("Submitted graph\n");
+ }
+@@ -2434,37 +2437,19 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+          rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
+ 
+       /*
+-       * NC1HWC2 (16 channel atoms) -> NHWC, + 0x80. Written destination
+-       * order so the stores are sequential and the inner loop is a 16 byte
+-       * vector op; the int8 flip of rkt_int8.h (another ^ 0x80) is folded in.
++       * NC1HWC2 (16 channel atoms) -> NHWC, + 0x80; the int8 flip of
++       * rkt_int8.h (another ^ 0x80) is folded in.
+        */
+       {
+          const unsigned ow = operation->output_width;
+          const unsigned ohh = operation->output_height;
+          const unsigned oc = operation->output_channels;
+-         const unsigned full = oc / FEATURE_ATOMIC_SIZE;
+-         const unsigned rest = oc % FEATURE_ATOMIC_SIZE;
+-         const size_t plane = (size_t)ohh * ow * FEATURE_ATOMIC_SIZE;
+          const uint8_t flip =
+             (is_signed && is_signed[i]) ? 0 : 0x80;
+-         const uint8_t *src = raw_output;
+-         uint8_t *dst = outputs[i];
+          (void)output_in;
+          (void)output_out;
+ 
+-         for (unsigned p = 0; p < ohh * ow; p++) {
+-            const uint8_t *s = src + (size_t)p * FEATURE_ATOMIC_SIZE;
+-            uint8_t *d = dst + (size_t)p * oc;
+-            unsigned g;
+-            for (g = 0; g < full; g++) {
+-               for (unsigned c = 0; c < FEATURE_ATOMIC_SIZE; c++)
+-                  d[c] = s[c] ^ flip;
+-               s += plane;
+-               d += FEATURE_ATOMIC_SIZE;
+-            }
+-            for (unsigned c = 0; c < rest; c++)
+-               d[c] = s[c] ^ flip;
+-         }
++         rkt_ovh_nc1hwc2_to_nhwc(outputs[i], raw_output, ohh * ow, oc, flip);
+       }
+ 
+       DBG("Converted data\n");
+@@ -2506,6 +2491,8 @@ rkt_ml_subgraph_destroy(struct pipe_context *context,
+    util_dynarray_fini(&subgraph->operations);
+ 
+    pipe_resource_reference(&subgraph->graph_regcmd, NULL);
++   if (subgraph->ovh_jobs_valid)
++      rkt_ovh_free_jobs(&subgraph->ovh_jobs);
+ 
+    util_dynarray_foreach (&subgraph->tensors, struct pipe_resource *, tensor)
+       if (tensor)
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 51e246c..edd77f5 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -262,6 +262,10 @@ struct rkt_ml_subgraph {
+    struct pipe_resource *graph_regcmd;
+    unsigned graph_task_count;
+    unsigned graph_stride_amount; /* uniform per-task regcmd u64 count (== stride) */
++
++   /* the submit jobs, built on the first invoke */
++   struct util_dynarray ovh_jobs; /* drm_rocket_job */
++   bool ovh_jobs_valid;
+ };
+ 
+ bool
+diff --git a/src/gallium/drivers/rocket/rkt_ovh.h b/src/gallium/drivers/rocket/rkt_ovh.h
+new file mode 100644
+index 0000000..dab89d4
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_ovh.h
+@@ -0,0 +1,173 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * The CPU side of a partition boundary.
++ *
++ * NHWC <-> NC1HWC2 (16-channel groups, tight planes: pixel p of group u at
++ * (u * pixels + p) * 16) conversion, walked pixel by pixel so the host tensor
++ * is read (input) or written (output) strictly sequentially and every 16-byte
++ * group is one NEON load + XOR + store. A group-major walk would read the
++ * host tensor once per group with a stride of C bytes, about 2x slower on the
++ * Cortex-A72.
++ */
++
++#ifndef RKT_OVH_H
++#define RKT_OVH_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "pipe/p_defines.h"
++
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
++
++/*
++ * A subgraph input BO is only read by the NPU and the CPU overwrites it on
++ * every invoke, so mapping it needs neither a fence wait (the previous invoke
++ * has finished by the time its outputs were read) nor the CPU cache
++ * invalidate of PREP_BO, which cost about 0.17 us per KB (yolox: 1 ms an
++ * inference). rkt_buffer_map skips PREP_BO for such maps; the FINI_BO clean
++ * at unmap stays.
++ */
++static inline unsigned
++rkt_ovh_in_map_usage(void)
++{
++   return PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED;
++}
++
++/* d[16] = s[0..n) ^ xm, then pad up to 16 */
++static inline void
++rkt_ovh_in_tail(uint8_t *d, const uint8_t *s, unsigned n, uint8_t xm,
++                uint8_t pad)
++{
++   unsigned c = 0;
++   for (; c < n; c++)
++      d[c] = s[c] ^ xm;
++   for (; c < 16; c++)
++      d[c] = pad;
++}
++
++/*
++ * Host NHWC (pixels x channels) -> NPU NC1HWC2, every byte XORed with xm, the
++ * channels past the last real one of the last group set to pad.
++ */
++static inline void
++rkt_ovh_nhwc_to_nc1hwc2(uint8_t *dst, const uint8_t *src, unsigned pixels,
++                        unsigned channels, uint8_t xm, uint8_t pad)
++{
++   const unsigned full = channels / 16, rest = channels % 16;
++   const size_t plane = (size_t)pixels * 16;
++
++#if defined(__aarch64__)
++   const uint8x16_t x = vdupq_n_u8(xm);
++   uint8x16_t tsel = vdupq_n_u8(0), tpad = vdupq_n_u8(pad);
++   if (rest) {
++      uint8_t m[16];
++      for (unsigned c = 0; c < 16; c++)
++         m[c] = c < rest ? 0xff : 0;
++      tsel = vld1q_u8(m);
++   }
++
++   if (full == 4 && !rest) {
++      for (unsigned p = 0; p < pixels; p++) {
++         uint8x16x4_t v = vld1q_u8_x4(src + (size_t)p * 64);
++         uint8_t *d = dst + (size_t)p * 16;
++         vst1q_u8(d, veorq_u8(v.val[0], x));
++         vst1q_u8(d + plane, veorq_u8(v.val[1], x));
++         vst1q_u8(d + 2 * plane, veorq_u8(v.val[2], x));
++         vst1q_u8(d + 3 * plane, veorq_u8(v.val[3], x));
++      }
++      return;
++   }
++   if (full == 2 && !rest) {
++      for (unsigned p = 0; p < pixels; p++) {
++         uint8x16x2_t v = vld1q_u8_x2(src + (size_t)p * 32);
++         uint8_t *d = dst + (size_t)p * 16;
++         vst1q_u8(d, veorq_u8(v.val[0], x));
++         vst1q_u8(d + plane, veorq_u8(v.val[1], x));
++      }
++      return;
++   }
++
++   for (unsigned p = 0; p < pixels; p++) {
++      const uint8_t *s = src + (size_t)p * channels;
++      uint8_t *d = dst + (size_t)p * 16;
++      for (unsigned u = 0; u < full; u++, s += 16, d += plane)
++         vst1q_u8(d, veorq_u8(vld1q_u8(s), x));
++      if (rest) {
++         if (s + 16 <= src + (size_t)pixels * channels) {
++            /* the 16-byte load runs into the next pixel, still in bounds */
++            uint8x16_t v = veorq_u8(vld1q_u8(s), x);
++            vst1q_u8(d, vbslq_u8(tsel, v, tpad));
++         } else {
++            rkt_ovh_in_tail(d, s, rest, xm, pad);
++         }
++      }
++   }
++#else
++   const uint64_t x64 = 0x0101010101010101ull * xm;
++   for (unsigned p = 0; p < pixels; p++) {
++      const uint8_t *s = src + (size_t)p * channels;
++      uint8_t *d = dst + (size_t)p * 16;
++      for (unsigned u = 0; u < full; u++, s += 16, d += plane) {
++         uint64_t a, b;
++         memcpy(&a, s, 8);
++         memcpy(&b, s + 8, 8);
++         a ^= x64;
++         b ^= x64;
++         memcpy(d, &a, 8);
++         memcpy(d + 8, &b, 8);
++      }
++      if (rest)
++         rkt_ovh_in_tail(d, s, rest, xm, pad);
++   }
++#endif
++}
++
++/* NPU NC1HWC2 -> host NHWC (pixels x channels), every byte XORed with xm. */
++static inline void
++rkt_ovh_nc1hwc2_to_nhwc(uint8_t *dst, const uint8_t *src, unsigned pixels,
++                        unsigned channels, uint8_t xm)
++{
++   const unsigned full = channels / 16, rest = channels % 16;
++   const size_t plane = (size_t)pixels * 16;
++
++#if defined(__aarch64__)
++   const uint8x16_t x = vdupq_n_u8(xm);
++   for (unsigned p = 0; p < pixels; p++) {
++      const uint8_t *s = src + (size_t)p * 16;
++      uint8_t *d = dst + (size_t)p * channels;
++      for (unsigned u = 0; u < full; u++, s += plane, d += 16)
++         vst1q_u8(d, veorq_u8(vld1q_u8(s), x));
++      if (rest) {
++         if (d + 16 <= dst + (size_t)pixels * channels) {
++            /*
++             * The 16-byte store runs into the next pixels, which are written
++             * after this one, so the extra bytes are overwritten.
++             */
++            vst1q_u8(d, veorq_u8(vld1q_u8(s), x));
++         } else {
++            for (unsigned c = 0; c < rest; c++)
++               d[c] = s[c] ^ xm;
++         }
++      }
++   }
++#else
++   for (unsigned p = 0; p < pixels; p++) {
++      const uint8_t *s = src + (size_t)p * 16;
++      uint8_t *d = dst + (size_t)p * channels;
++      for (unsigned u = 0; u < full; u++, s += plane, d += 16)
++         for (unsigned c = 0; c < 16; c++)
++            d[c] = s[c] ^ xm;
++      for (unsigned c = 0; c < rest; c++)
++         d[c] = s[c] ^ xm;
++   }
++#endif
++}
++
++#endif
+-- 
+2.55.0
+

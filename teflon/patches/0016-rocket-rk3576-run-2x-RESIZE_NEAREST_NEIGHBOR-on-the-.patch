@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:46:06 +0100
+Subject: [PATCH 16/23] rocket: rk3576: run 2x RESIZE_NEAREST_NEIGHBOR on the
+ DPU
+
+Run a 2x nearest neighbour resize (align_corners = half_pixel_centers =
+false) as one DPU + DPU RDMA task per 16-channel group in the DPU's
+upsample mode, as the vendor compiler emits it.
+
+After the upsample tasks the DPU keeps some state that no register write
+of the following tasks resets: the second convolution after a resize
+wrote its last few pixels from a stale part of its output buffer. A
+small element-wise task on a scratch surface after the resize clears it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_ml.c     |  45 +++++++--
+ src/gallium/drivers/rocket/rkt_ml.h     |   5 +-
+ src/gallium/drivers/rocket/rkt_ops.h    | 121 +++++++++++++++++++++++-
+ src/gallium/drivers/rocket/rkt_regcmd.c |  34 ++++++-
+ 4 files changed, 194 insertions(+), 11 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 308e746..15a12c8 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -535,6 +535,7 @@ count_tensors(const struct pipe_ml_operation *poperations,
+          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
+          break;
+       case PIPE_ML_OPERATION_TYPE_POOLING:
++      case PIPE_ML_OPERATION_TYPE_RESIZE:
+          break;
+       default:
+          DBG("poperation->type %d\n", poperation->type);
+@@ -751,6 +752,18 @@ rkt_ops_pool_supported(struct rkt_screen *screen,
+    return true;
+ }
+ 
++static bool
++rkt_ops_resize_supported(const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *i = operation->input_tensors[0];
++   struct pipe_tensor *o = operation->output_tensors[0];
++
++   /* align_corners and half_pixel_centers: rkt_ml_operation_supported() */
++   if (!rkt_ops_io_ok(operation))
++      return false;
++   return o->dims[1] == 2 * i->dims[1] && o->dims[1] <= 128;
++}
++
+ static void
+ lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
+                  const struct pipe_ml_operation *poperation,
+@@ -800,6 +813,14 @@ lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
+                        poperation->pooling.padding_same, &p->pad_l, &p->pad_r);
+       rkt_ops_pool_dim(p->in_h, p->out_h, p->kh, p->sy,
+                        poperation->pooling.padding_same, &p->pad_t, &p->pad_b);
++   } else {
++      p->kind = RKT_OPS_RESIZE;
++      /* scratch for the flush task: the EW table, then a 4x4x16 surface */
++      uint8_t table[RKT_EW_ADD_TABLE_BYTES];
++      rkt_ew_add_table(0, table);
++      operation->biases = pipe_buffer_create(pcontext->screen, 0,
++                                             PIPE_USAGE_DEFAULT, 4096);
++      pipe_buffer_write(pcontext, operation->biases, 0, sizeof(table), table);
+    }
+ }
+ 
+@@ -924,6 +945,10 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+                   rkt_ops_pool_supported(rkt_screen(pcontext->screen),
+                                          operation);
+       break;
++   case PIPE_ML_OPERATION_TYPE_RESIZE:
++      supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
++                  rkt_ops_resize_supported(operation);
++      break;
+    default:
+       supported = false;
+    }
+@@ -1223,6 +1248,7 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          break;
+       }
+       case PIPE_ML_OPERATION_TYPE_POOLING:
++      case PIPE_ML_OPERATION_TYPE_RESIZE:
+          /* rkt_ops.h */
+          lower_ops_rk3576(subgraph, &poperations[i], &operation);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+@@ -1324,13 +1350,18 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          task.output_channels_real = operation->output_channels;
+          util_dynarray_append(&operation->tasks, struct split_task, task);
+       } else if (operation->ops.kind != RKT_OPS_NONE) {
+-         /* PPU pool = one task */
+-         struct split_task task = {0};
+-         task.output_width = operation->output_width;
+-         task.output_height = operation->output_height;
+-         task.output_channels = operation->output_channels;
+-         task.output_channels_real = operation->output_channels;
+-         util_dynarray_append(&operation->tasks, struct split_task, task);
++         /* PPU pool = one task; 2x resize = one task per group */
++         unsigned n = operation->ops.kind == RKT_OPS_RESIZE
++                         ? operation->ops.groups + 1 : 1;
++         for (unsigned t = 0; t < n; t++) {
++            struct split_task task = {0};
++            task.num = t;
++            task.output_width = operation->output_width;
++            task.output_height = operation->output_height;
++            task.output_channels = operation->output_channels;
++            task.output_channels_real = operation->output_channels;
++            util_dynarray_append(&operation->tasks, struct split_task, task);
++         }
+       } else
+          rkt_split_tasks(subgraph, operation);
+       compile_operation(subgraph, operation);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 5f5da10..eb96496 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -191,7 +191,10 @@ struct rkt_operation {
+    struct rkt_ew_add ew;
+    struct rkt_operation *ew_shadow;
+ 
+-   /* MAX_POOL_2D as a PPU task. ops.kind != RKT_OPS_NONE. */
++   /*
++    * MAX_POOL_2D as a PPU task, 2x RESIZE_NEAREST as
++    * DPU-only tasks (one per 16-channel group). ops.kind != RKT_OPS_NONE.
++    */
+    struct rkt_ops_params ops;
+ 
+    /* SoC + CBUF geometry, copied from the screen so the per-operation task
+diff --git a/src/gallium/drivers/rocket/rkt_ops.h b/src/gallium/drivers/rocket/rkt_ops.h
+index 957c92b..de87d00 100644
+--- a/src/gallium/drivers/rocket/rkt_ops.h
++++ b/src/gallium/drivers/rocket/rkt_ops.h
+@@ -6,9 +6,12 @@
+  * 2.3.2, target rk3576) emits them:
+  *
+  *   MAX_POOL_2D              one PPU + PPU RDMA task (enable mask 0x60)
++ *   RESIZE_NEAREST_NEIGHBOR  2x: one DPU + DPU RDMA task per 16-channel group
++ *                            (enable mask 0x18, EW bypass, DPU upsample mode)
+  *
+  * The register values are reproduced from the vendor's .rknn for
+- * maxpool 40/20/10/5 x 64/32/128/24/8 ch, 3x3 s2, 2x2 s2, 5x5 s1, 3x3 s1.
++ * maxpool 40/20/10/5 x 64/32/128/24/8 ch, 3x3 s2, 2x2 s2, 5x5 s1, 3x3 s1 and
++ * resize 5->10, 10->20 (8/24/32/48/64 ch), 20->40, 40->80, 13->26, 26->52.
+  * The only deliberate differences: surface strides are Mesa's tight planes
+  * (the vendor rounds every plane up to a multiple of 4 pixels), and the
+  * per-unit OP_ENs Mesa's RK3576 streams end with replace the vendor's PC
+@@ -33,6 +36,7 @@
+ enum rkt_ops_kind {
+    RKT_OPS_NONE = 0,
+    RKT_OPS_MAXPOOL,
++   RKT_OPS_RESIZE,
+ };
+ 
+ struct rkt_ops_params {
+@@ -117,4 +121,119 @@ rkt_ops_pool_emit(const struct rkt_ops_params *p, uint64_t *out)
+    return n;
+ }
+ 
++/*
++ * RESIZE_NEAREST_NEIGHBOR 2x (align_corners = half_pixel_centers = false),
++ * one task per 16-channel group; in/out addresses already point at the
++ * group's plane. Differs from the EW ADD stream (rkt_ew_add_emit) in the
++ * cube words and 0x4038/44/50, 0x5014/1c/34/44/48 (vendor constants of the
++ * upsample mode) and 0x407c = EW bypass.
++ */
++static inline unsigned
++rkt_ops_resize_emit(const struct rkt_ops_params *p, uint64_t *out)
++{
++   unsigned n = 0;
++   /* ow: written row width, ls: row pitch */
++   unsigned ow = p->out_w, ls = p->out_w, ih = p->in_h;
++   uint32_t open = RKT_OPS_OPEN;
++
++#define R_DPU(reg, val)  out[n++] = rkt_ew_word(0x1001, (reg), (uint32_t)(val))
++#define R_RDMA(reg, val) out[n++] = rkt_ew_word(0x2001, (reg), (uint32_t)(val))
++
++   R_DPU(0x4004, 0x0000000e);
++   R_RDMA(0x5004, 0x0000000e);
++
++   R_DPU(0x400c, 0x00000005);
++   R_DPU(0x4010, 0x00000000);
++   R_DPU(0x4014, 0x00000000);
++   R_DPU(0x4018, p->out_addr);
++   /*
++    * The vendor's value: the row pitch. In the DPU upsample mode 0x401c is
++    * part of the output addressing (the output plane there makes the resize
++    * itself wrong), and with it the DPU write path is left in a state that
++    * corrupts the last ~3 output pixels of the second convolution after a
++    * multi-group resize (pixel p gets the data of pixel p-128 or p-1, across
++    * job boundaries). The flush task after the resize clears it.
++    */
++   R_DPU(0x401c, ls);
++   R_DPU(0x4020, ow - 1);
++   R_DPU(0x4024, ih - 1);
++   R_DPU(0x4028, (ls << 16) | ls);
++   R_DPU(0x402c, 0x0000000f);
++   R_DPU(0x4030, 0x000f0700);
++   R_DPU(0x4034, ((ih - 1) << 16) | (ow - 1));
++   R_DPU(0x4038, 0x00000053);
++   R_DPU(0x403c, 0x00000000);
++   R_DPU(0x4044, 0x00000002);
++   R_DPU(0x4048, 0x80000000);
++   R_DPU(0x404c, 0x7fffffff);
++   R_DPU(0x4050, 0x00020111);
++   R_DPU(0x4058, 0x80000000);
++   R_DPU(0x405c, 0x7fffffff);
++   R_DPU(0x4060, 0x00000903);
++   R_DPU(0x406c, 0x80000000);
++   R_DPU(0x4070, 0x7fffffff);
++   R_DPU(0x4074, 0x80000000);
++   R_DPU(0x4078, 0x7fffffff);
++   R_DPU(0x407c, 0x010041c1);          /* EW_CFG: bypass */
++   R_DPU(0x4080, 0x00000000);
++   R_DPU(0x4084, 0x00000001);
++   R_DPU(0x4088, 0x80000000);
++   R_DPU(0x408c, 0x7fffffff);
++   R_DPU(0x4090, 0x00000000);
++   R_DPU(0x4094, 0x00000000);
++   R_DPU(0x409c, 0x00000000);
++   R_DPU(0x40a4, 0x80000000);
++   R_DPU(0x40a8, 0x7fffffff);
++   R_DPU(0x40ac, 0x00000000);
++   R_DPU(0x40b0, 0x00010001);          /* OUT_CVT: identity */
++   R_DPU(0x40b4, 0x00000000);
++   R_DPU(0x40b8, (ow + 3) & ~3u);
++   R_DPU(0x40bc, 0x00000000);
++   R_DPU(0x40c0, 0x04440000);
++   R_DPU(0x40c8, 0x00000000);
++   R_DPU(0x40cc, 0x00000000);
++   R_DPU(0x40d0, 0x0040ffff);
++   for (uint32_t r = 0x4100; r <= 0x4120; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4130, 0x00000000);
++   for (uint32_t r = 0x4140; r <= 0x4154; r += 4)
++      R_DPU(r, 0x00000000);
++   R_DPU(0x4160, 0x00000000);
++   R_DPU(0x4170, 0x00000000);
++   R_DPU(0x4174, 0x00000000);
++   R_DPU(0x4184, 0x00000000);
++   R_DPU(0x4188, 0x00000000);
++   R_DPU(0x418c, 0x00000000);
++   R_DPU(0x4190, 0x00000000);
++   R_DPU(0x4194, 0x00000000);
++
++   R_RDMA(0x500c, p->in_w - 1);
++   R_RDMA(0x5010, p->in_h - 1);
++   R_RDMA(0x5014, 0x00000003);
++   R_RDMA(0x5018, p->in_addr);
++   R_RDMA(0x501c, 0x00000000);
++   R_RDMA(0x5020, 0x00000000);
++   R_RDMA(0x5024, 0x00000000);
++   R_RDMA(0x5028, 0x00000000);
++   R_RDMA(0x502c, 0x00000000);
++   R_RDMA(0x5030, 0x00000000);
++   R_RDMA(0x5034, 0x00000001);
++   R_RDMA(0x5038, 0x00000000);
++   R_RDMA(0x5040, 0x00000000);
++   R_RDMA(0x5044, 0x00020009);
++   R_RDMA(0x5048, 0x00001249);
++   R_RDMA(0x504c, 0x00000000);         /* input notch: tight planes */
++   R_RDMA(0x5064, 0x00000000);
++   R_RDMA(0x506c, 0x00000000);
++   R_RDMA(0x5078, 0x00000000);
++   R_RDMA(0x507c, 0x00000000);
++
++   R_DPU(0x4008, open);
++   R_RDMA(0x5008, open);
++
++#undef R_DPU
++#undef R_RDMA
++   return n;
++}
++
+ #endif /* RKT_OPS_H */
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 64e530c..836727e 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -2279,14 +2279,44 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+    }
+ 
+    if (operation->soc == RKT_SOC_RK3576 && operation->ops.kind != RKT_OPS_NONE) {
+-      /* rkt_ops.h: PPU max pool */
++      /* rkt_ops.h: PPU max pool / DPU 2x nearest resize */
+       struct rkt_ops_params p = operation->ops;
+       uint64_t words[RKT_OPS_MAX_REGS];
+       unsigned n;
+ 
+       p.in_addr = rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
+       p.out_addr = rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
+-      n = rkt_ops_pool_emit(&p, words);
++      if (p.kind == RKT_OPS_RESIZE && task_num == p.groups) {
++         /*
++          * The flush task that ends every resize: out = a + a on a 4x4x16
++          * scratch surface. After the upsample tasks the DPU keeps some state
++          * that no register write of the following tasks resets: the
++          * convolution two tasks later would write its last few pixels from a
++          * stale part of its output buffer. An EW task in between clears it.
++          */
++         struct rkt_ew_add e = {0};
++         uint32_t base = rkt_resource(operation->biases)->phys_addr;
++         e.width = e.height = 4;
++         e.channels = 16;
++         e.table_addr = base;
++         e.a_addr = e.b_addr = base + 1024;
++         e.out_addr = base + 2048;
++         e.b_cvt = (1u << 16) | 0x4000;
++         e.out_scale = (1u << 16) | 0x4000;
++         e.out_shift = 14;
++         n = rkt_ew_add_emit(&e, words);
++         for (unsigned i = 0; i < n; i++)
++            util_dynarray_append(regs, uint64_t, words[i]);
++         return;
++      }
++      if (p.kind == RKT_OPS_RESIZE) {
++         /* task_num = 16-channel group, tight planes */
++         p.in_addr += task_num * p.in_w * p.in_h * 16;
++         p.out_addr += task_num * p.out_w * p.out_h * 16;
++         n = rkt_ops_resize_emit(&p, words);
++      } else {
++         n = rkt_ops_pool_emit(&p, words);
++      }
+       for (unsigned i = 0; i < n; i++)
+          util_dynarray_append(regs, uint64_t, words[i]);
+       return;
+-- 
+2.55.0
+

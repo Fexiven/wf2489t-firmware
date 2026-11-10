@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:11 +0100
+Subject: [PATCH 06/23] rocket: rk3576: vendor first-conv modes for 1- and
+ 3-channel convolutions
+
+A <= 4 channel layer that was not exactly "3 channels, 32 outputs, 3x3,
+stride 2" went through the generic encoder, while its input and weights
+were uploaded and packed the first-conv way. The CNA then read far past
+both buffers: standalone the job faulted and hung the NPU (YOLOX 001,
+MicroNet 000); inside a graph it read the following tensors (MoveNet
+Thunder 005, YOLOX).
+
+Route every 1- or 3-channel, square 3/5/7, stride 1/2, non-depthwise conv
+through the first-conv encoder with the vendor's mode for that shape
+(derived from 3 runtime captures and 31 compiled int8 layers):
+
+ - ic = 3: mode 6 when ow % 16 == 0, else mode 2; ic = 1: mode 2 with
+   bit 13 clear (0x20008002);
+ - 0x1014 = (sy << 3) | sx, 0x107c = ic - 1, 0x1064 = (1 << ic) - 1 in
+   mode 2;
+ - CNA output channels padded to 16, weights in groups of 32 outputs;
+ - mode 6 width fields for widths that are not a multiple of 16.
+
+int8 first convolutions run as the vendor runtime runs them: the raw
+int8 input with the CNA CVT bypassed, and for per-tensor weights the
+plain int32 bias mode (0x501c = 0x114). Offset uint8 through the CVT
+only worked at aligned widths; YOLOX's 418 wide first conv timed out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_coefs.c  | 37 ++++++++--
+ src/gallium/drivers/rocket/rkt_int8.c   | 25 +++++--
+ src/gallium/drivers/rocket/rkt_ml.c     |  1 +
+ src/gallium/drivers/rocket/rkt_ml.h     | 90 +++++++++++++++++++++++--
+ src/gallium/drivers/rocket/rkt_regcmd.c | 68 +++++++++++++------
+ src/gallium/drivers/rocket/rkt_task.c   |  5 +-
+ 6 files changed, 189 insertions(+), 37 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index 1a47a9b..384b757 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -132,6 +132,17 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+                                       poperation->conv.stride_x,
+                                       poperation->output_tensors[0]->dims[1],
+                                       false);
++   /*
++    * a layer in the vendor's first-conv modes (rkt_fc_any_shape)
++    * has its output channels padded to 16 in the weight buffer, in groups of
++    * 32 (both modes); see the packing below.
++    */
++   bool fc_any = is_rk3576_firstconv &&
++                 rkt_fc_any_shape(input_channels_real, weights_width,
++                                  weights_height, poperation->conv.stride_x,
++                                  false);
++   unsigned fc_ocp = fc_any ? rkt_fc_oc_pad(output_channels_real)
++                            : output_channels_real;
+ 
+    /*
+     * RK3576 pointwise (1x1) conv uses a compact [oc][ic] weight buffer of
+@@ -167,11 +178,11 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+                               weights_width == 1 && weights_height == 1;
+ 
+    if (fc_mode2)
+-      weights_size = weights_width * weights_height * output_channels_real * 4;
++      weights_size = weights_width * weights_height * fc_ocp * 4;
+    else if (is_rk3576_firstconv)
+       /* kh * ALIGN(kw, 4) lanes of 4 per output channel */
+       weights_size = weights_height * ALIGN(weights_width, 4) *
+-                     output_channels_real * 4;
++                     fc_ocp * 4;
+    else if (is_rk3576_pointwise)
+       /*
+        * PADDED TO THE FEATURE ATOM, not cut at the real channel count. The CNA
+@@ -386,11 +397,29 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+        * tap major, then output channel, then the four ARGB lanes; no unused
+        * fourth kx slot as mode 6 has.
+        */
++      /*
++       * both modes come in groups of 32 output channels over the
++       * count padded to 16 (rknn-toolkit2 2.3.2 buffers of the compiled
++       * 12/16/24/56/64 output layers, and the runtime capture of micronet's
++       * 276 -> 288 one-channel layer: 10368 of 10368 bytes):
++       *
++       *   mode 2: [oc / 32][ky][kx][oc % 32][4 lanes]
++       *   mode 6: [oc / 32][ky][oc % 32][ALIGN(kw, 4) kx slots][4 lanes]
++       *
++       * the last group holding ocp - 32 * (oc / 32) channels. At 32 outputs
++       * mode 2 is the old [ky][kx][oc][4]. The padded channels keep pad.
++       * One input channel fills lane 0; lanes 1..3 keep pad.
++       */
+       if (fc_mode2) {
++         unsigned taps = weights_width * weights_height;
+          for (int ky = 0; ky < weights_width; ky++)
+             for (int kx = 0; kx < weights_height; kx++)
+                for (unsigned oc = 0; oc < oc_n; oc++) {
+-                  unsigned base = ((ky * weights_height + kx) * oc_n + oc) * 4;
++                  unsigned g0 = fc_any ? oc / 32 * 32 : 0;
++                  unsigned gn = fc_any ? MIN2(32, fc_ocp - g0) : oc_n;
++                  unsigned base = (g0 * taps +
++                                   (ky * weights_height + kx) * gn +
++                                   (oc - g0)) * 4;
+ 
+                   for (unsigned ic = 0; ic < 3; ic++)
+                      weights_out[base + ic] =
+@@ -413,7 +442,7 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+       for (int ky = 0; ky < weights_width; ky++) {
+          for (unsigned oc = 0; oc < oc_n; oc++) {
+             for (int kx = 0; kx < weights_height; kx++) {
+-               unsigned grp = MIN2(32, oc_n - (oc / 32) * 32);
++               unsigned grp = MIN2(32, fc_ocp - (oc / 32) * 32);
+                unsigned base = (oc / 32) * 32 * weights_width * slots * 4 +
+                                ky * grp * slots * 4 + (oc % 32) * slots * 4 + kx * 4;
+ 
+diff --git a/src/gallium/drivers/rocket/rkt_int8.c b/src/gallium/drivers/rocket/rkt_int8.c
+index d3e9fdc..ebd0031 100644
+--- a/src/gallium/drivers/rocket/rkt_int8.c
++++ b/src/gallium/drivers/rocket/rkt_int8.c
+@@ -162,14 +162,18 @@ rkt_int8_fix_coefs(struct pipe_context *pcontext,
+    bool firstconv = rkt_rk3576_firstconv(operation);
+    bool op2_fix = operation->int8 && !operation->c_q14 && !firstconv &&
+                   operation->input_channels <= 4 && !operation->depthwise;
+-   if (!operation->c_q14 && !op2_fix)
++   bool pt114 = firstconv && !operation->c_q14 && !operation->depthwise &&
++                rkt_fc_pt114(operation->int8);
++   if (!operation->c_q14 && !op2_fix && !pt114)
+       return;
+ 
+    bool dw = operation->depthwise;
+    unsigned oc_n = operation->output_channels;
+    unsigned table_bytes = rkt_coef_table_bytes(dw, oc_n);
++   /* where the first-conv encoder points 0x5024: past the oc-sized table
++    * (0x100 at 32 outputs) */
+    unsigned op2_off = firstconv
+-                         ? 0x100
++                         ? table_bytes
+                          : table_bytes + (getenv("ROCKET_SCALE_OFF")
+                                              ? 0 : rkt_scale_table_bytes(oc_n));
+    unsigned size = pipe_buffer_size(operation->biases);
+@@ -177,6 +181,13 @@ rkt_int8_fix_coefs(struct pipe_context *pcontext,
+    uint8_t *b8 = pipe_buffer_map(pcontext, operation->biases, PIPE_MAP_WRITE,
+                                  &transfer);
+ 
++   /* plain int32 bias array for the 0x114 mode, see rkt_fc_pt114() */
++   if (pt114) {
++      unsigned off = rkt_fc_pt114_off(table_bytes);
++      for (unsigned oc = 0; oc < oc_n && off + 4 * (oc + 1) <= size; oc++)
++         memcpy(b8 + off + 4 * oc, b8 + (oc / 8) * 64 + (oc % 8) * 4, 4);
++   }
++
+    if (operation->c_q14) {
+       const float *wsc = poperation->conv.weight_tensor->scales;
+       float max = 0.0f;
+@@ -222,7 +233,11 @@ rkt_int8_fix_coefs(struct pipe_context *pcontext,
+ bool
+ rkt_int8_raw_input(const struct rkt_operation *operation)
+ {
+-   return operation->soc == RKT_SOC_RK3576 && !operation->depthwise &&
+-          operation->input_channels <= 4 &&
+-          !rkt_rk3576_firstconv(operation);
++   if (operation->soc != RKT_SOC_RK3576 || operation->depthwise ||
++       operation->input_channels > 4)
++      return false;
++   /* the first conv takes raw int8 too, see rkt_fc_pt114() */
++   if (rkt_rk3576_firstconv(operation))
++      return operation->in_signed;
++   return true;
+ }
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 51d2e7c..b677bd0 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -607,6 +607,7 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          const struct pipe_ml_operation *pop =
+             rkt_int8_view(pcontext, &poperations[i], &view);
+          operation.int8 = pop != &poperations[i];
++         operation.in_signed = poperations[i].input_tensors[0]->is_signed;
+          lower_convolution(subgraph, pop, &operation);
+          rkt_int8_view_fini(&view);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 81baf9b..dd62a25 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -128,6 +128,8 @@ struct rkt_operation {
+    bool c_q14;
+    /* Lowered from signed int8 tensors through rkt_int8_view(). */
+    bool int8;
++   /* the activation input is a signed int8 tensor (int8 on) */
++   bool in_signed;
+    bool depthwise;
+    bool reuse_weights_cbuf;
+    unsigned truncate_bits;
+@@ -253,13 +255,73 @@ rkt_fc_width(unsigned input_width)
+  * The register that differs besides the encoding is 0x1064, which the
+  * vendor runtime sets at load time: 0x7 in mode 2, 0x777 in mode 6.
+  */
++/*
++ * The vendor's first-conv modes for any 1 or 3 channel input
++ * (rknn-toolkit2 2.3.2 rk3576, 30 compiled int8 layers + the runtime captures
++ * of yolox 001, micronet 000 and movenet lightning 005):
++ *
++ *   ic 3: mode 6 when output_width % 16 == 0, else mode 2, for every output
++ *         count (12, 16, 24, 56, 64, 276 seen), kernel (3, 5, 7) and stride
++ *         (1, 2), SAME or VALID.
++ *   ic 1: always mode 2 with 0x100c bit 13 clear (0x20008002), even at
++ *         ow % 16 == 0 (micronet's 32x32x1 -> 276, 3x3 s1).
++ *
++ * The CNA side counts the output channels padded to 16 (0x101c, 0x1024 low;
++ * yolox's 12 -> 16, micronet's 276 -> 288, movenet thunder's 56 -> 64), the
++ * CORE/DPU/RDMA side the real count. The weights come in groups of 32 output
++ * channels (the last one holding the rest of the padded count), in both modes.
++ *
++ * These layers must not go through the generic encoder: its CNA would be
++ * told a generic weight size while the first-conv input and weight buffers
++ * are much shorter, and the DMA would run past them.
++ */
++
++/*
++ * A signed int8 input of a first conv goes to the NPU as the raw int8 bytes
++ * with the CNA CVT bypassed (0x1048 = 9, 0x104c = 0x1050 = 0x00010001, lane
++ * offsets 0) and 0x1070 = zp * 0x010101, as librknnrt programs it for every
++ * int8 first conv. Offset uint8 through CVT -128 is only right at aligned
++ * widths.
++ *
++ * A per-tensor int8 first conv uses the vendor's plain int32 bias mode (RDMA
++ * 0x501c = 0x114, DPU 0x4044 = 0, 0x4050 = 0x80021011, OUT_CVT shift without
++ * the +4 of the A/B/C records with C = 16). The int32 values are the A of the
++ * records, written as a plain array at rkt_fc_pt114_off() inside the bias
++ * buffer. uint8 first convs keep the records.
++ */
++static inline bool
++rkt_fc_pt114(bool int8)
++{
++   return int8;
++}
++
++static inline unsigned
++rkt_fc_pt114_off(unsigned table_bytes)
++{
++   return table_bytes + 0x100;
++}
++
++static inline bool
++rkt_fc_any_shape(unsigned ic, unsigned kw, unsigned kh, unsigned stride,
++                 bool depthwise)
++{
++   return !depthwise && (ic == 1 || ic == 3) && kw == kh &&
++          (kw == 3 || kw == 5 || kw == 7) && (stride == 1 || stride == 2);
++}
++
++/* the output channel count the CNA and the first-conv weight buffer use */
++static inline unsigned
++rkt_fc_oc_pad(unsigned oc)
++{
++   return align(oc, 16);
++}
++
+ static inline bool
+ rkt_fc_mode2_shape(unsigned ic, unsigned oc, unsigned kw, unsigned kh,
+                    unsigned stride, unsigned ow, bool depthwise)
+ {
+-   if (depthwise || ic != 3 || oc != 32 || kw != 3 || kh != 3 || stride != 2)
+-      return false;
+-   return ow % 16 != 0;
++   return rkt_fc_any_shape(ic, kw, kh, stride, depthwise) &&
++          (ic == 1 || ow % 16 != 0);
+ }
+ 
+ static inline bool
+@@ -276,16 +338,32 @@ rkt_fc_mode2(const struct rkt_operation *operation)
+ /*
+  * CBUF entries one first-conv input row takes (0x103c high, 0x1044 low in
+  * mode 6, 0x1028 high / span, the window rule in rkt_task.c). Mode 2:
+- * ALIGN(w, 16) / 16. Mode 6: DIV_ROUND_UP(w, 16) + 1 (15 at 224, 21 at 320).
++ * ALIGN(w, 16) / 16. Mode 6, over 46 compiled widths (8 to 418, SAME and
++ * VALID, stride 1 and 2):
++ *
++ *   0x118c high = (w + pad_right) / 16, 0x118c low = (w - 1) / 16,
++ *   eps (0x103c, 0x1044 low, 0x1028 high / span) = 0x118c high + 1
+  */
+ static inline unsigned
+-rkt_fc_eps(const struct rkt_operation *operation)
++rkt_fc_m6_hi(unsigned w, unsigned pad_right)
++{
++   return (w + pad_right) / 16;
++}
++
++static inline unsigned
++rkt_fc_m6_lo(unsigned w, unsigned pad_right)
++{
++   return (w - 1) / 16;
++}
++
++static inline unsigned
++rkt_fc_eps(const struct rkt_operation *operation, unsigned pad_right)
+ {
+    unsigned w = operation->input_width;
+ 
+    if (rkt_fc_mode2(operation))
+       return align(w, 16) / 16;
+-   return DIV_ROUND_UP(w, 16) + 1;
++   return rkt_fc_m6_hi(w, pad_right) + 1;
+ }
+ 
+ /*
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 7147d69..ba0a395 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -13,6 +13,7 @@
+ #include "rkt_ml.h"
+ #include "rkt_registers.h"
+ #include "rkt_task.h"
++#include "rkt_int8.h"
+ 
+ /*
+  * RK3576 OUT_CVT extra right-shift, a board-debug knob for the normal encoder.
+@@ -187,7 +188,16 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    unsigned fc_kh = operation->weights_height;
+    unsigned fc_oc = task->output_channels_real;
+    unsigned m6_kbytes = fc_kh * ALIGN(fc_kw, 4) * 4;
+-   unsigned fc_eps = rkt_fc_eps(operation);
++   unsigned fc_eps = rkt_fc_eps(operation, task->pad_right);
++   /*
++    * See rkt_fc_any_shape(): the CNA counts the output channels
++    * padded to 16 (0x101c, 0x1024), the CORE/DPU/RDMA the real ones; the
++    * stride is (sy << 3) | sx in 0x1014 (0x9 at stride 1); one input channel
++    * runs mode 2 with 0x100c bit 13 clear and 0x1064 = 1; the input row is
++    * ALIGN(w, 16) * ic bytes.
++    */
++   unsigned fc_ic = operation->input_channels;
++   unsigned fc_ocp = rkt_fc_oc_pad(fc_oc);
+    uint32_t fc_1064 = 0;
+    for (unsigned i = 0; i < fc_kw && i < 8; i++)
+       fc_1064 |= 0x7u << (4 * i);
+@@ -205,13 +215,13 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_RDMA(0x5004, sptr);
+ 
+    /* CNA config block. */
+-   R_CNA(0x100c, m2 ? 0x2000a002 : 0x2000a006);
++   R_CNA(0x100c, m2 ? (fc_ic == 1 ? 0x20008002 : 0x2000a002) : 0x2000a006);
+    R_CNA(0x1010, 0x00000fff);
+-   R_CNA(0x1014, 0x00000012);   /* stride (2,2) */
++   R_CNA(0x1014, (operation->stride << 3) | operation->stride);
+    R_CNA(0x1018, 0x40000000 | (banks << 8) | banks);
+-   R_CNA(0x101c, m2 ? m2_kbytes * operation->output_channels : fc_oc * m6_kbytes);
++   R_CNA(0x101c, (m2 ? m2_kbytes : m6_kbytes) * fc_ocp);
+    R_CNA(0x1020, m2 ? m2_kbytes : m6_kbytes);
+-   R_CNA(0x1024, ((fc_kh - 1) << 24) | ((fc_kw - 1) << 16) | (fc_oc - 1));
++   R_CNA(0x1024, ((fc_kh - 1) << 24) | ((fc_kw - 1) << 16) | (fc_ocp - 1));
+    if (m2)
+       R_CNA(0x1028, (((m2_a / 16) * win_i) << 16) | (operation->input_channels - 1));
+    else
+@@ -230,7 +240,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+     */
+    unsigned fc_w = rkt_fc_width(operation->input_width);
+    unsigned fc_h = win_i;
+-   unsigned fc_units = fc_w * 3 / FEATURE_ATOMIC_SIZE;
++   unsigned fc_units = fc_w * fc_ic / FEATURE_ATOMIC_SIZE;
+    unsigned in_w = operation->input_width;
+    R_CNA(0x102c, ((in_w - 1) << 16) | (fc_h - 1));
+    R_CNA(0x1030, ((m2 ? 2 * m2_kbytes : 2 * m6_kbytes) << 16) | (fc_ow - 1));
+@@ -239,9 +249,18 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x103c, fc_eps << 16);
+    R_CNA(0x1040, banks == 5 ? 0x14000000 : 0x10000000);   /* CBUF_CON0 -- matches the vendor runtime capture */
+    R_CNA(0x1044, m2 ? (m2_a << 16) | m2_a : (in_w << 16) | fc_eps);
+-   R_CNA(0x1048, 0x000e38e0);
+-   R_CNA(0x104c, 0x40004000);   /* CVT (quant) */
+-   R_CNA(0x1050, 0x00014000);
++   /*
++    * Raw int8 input, CVT bypassed as the vendor runtime does. The
++    * mode 6 right edge pad 0x1070 then carries the int8 zero point in each
++    * lane (0x00f2f2f2 for a zero point of -14). The vendor writes
++    * zp * 0x010101, whose upper lanes come out one lower, and 0 at aligned
++    * widths with zp -1, which leaves its own right column off by up to 7.
++    */
++   bool fc_raw = rkt_int8_raw_input(operation);
++   int32_t fc_zps = (int32_t)task->input_zero_point - 0x80;
++   R_CNA(0x1048, fc_raw ? 0x00000009 : 0x000e38e0);
++   R_CNA(0x104c, fc_raw ? 0x00010001 : 0x40004000);   /* CVT (quant) */
++   R_CNA(0x1050, fc_raw ? 0x00010001 : 0x00014000);
+    /*
+     * The three per-lane CVT values, one per ARGB colour lane. The generic path
+     * writes zero in all three and bypasses the CVT; this path enables it and
+@@ -265,7 +284,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+     * moves, they are the width-axis pad.
+     */
+    {
+-      uint32_t lane = rkt_env_u32("ROCKET_FC_LANE_OFF", 0xffffff80);
++      uint32_t lane = rkt_env_u32("ROCKET_FC_LANE_OFF", fc_raw ? 0 : 0xffffff80);
+       R_CNA(0x1054, lane);
+       R_CNA(0x1058, lane);
+       R_CNA(0x105c, lane);
+@@ -293,18 +312,21 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+     * together with the addresses and nothing else: one 7 nibble per kernel
+     * column in mode 6 (0x777 for 3x3), (1 << ic) - 1 in mode 2 (0x7 for RGB).
+     */
+-   R_CNA(0x1064, m2 ? 0x00000007 : fc_1064);
++   R_CNA(0x1064, m2 ? (1u << fc_ic) - 1 : fc_1064);
+    R_CNA(0x1068, 0x00000000);
+    R_CNA(0x106c, 0x00000000);
+    {
+       /* mode 6 right edge pad: the raw input zero point per lane */
+       uint32_t zr = task->input_zero_point & 0xff;
+-      R_CNA(0x1070, m2 ? m2_pv : (zr << 16) | (zr << 8) | zr);
++      R_CNA(0x1070, m2 ? m2_pv
++                       : fc_raw ? ((uint32_t)fc_zps & 0xff) * 0x010101
++                       : (zr << 16) | (zr << 8) | zr);
+    }
+    R_CNA(0x1074, 0x00000000);
+    R_CNA(0x1078, rkt_env_u32("ROCKET_FC_1078",
+                              ((fc_units - 1) << 16) | (fc_h - 1)));
+-   R_CNA(0x107c, 0x00000002);
++   /* input channels - 1 (0 for one channel) */
++   R_CNA(0x107c, fc_ic - 1);
+    /*
+     * The PADDING register, derived rather than hardcoded.
+     *
+@@ -367,8 +389,8 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x1144, 0x00000000);
+    R_CNA(0x118c, rkt_env_u32("ROCKET_FC_118C",
+                              m2 ? ((m2_a / 16 - 1) << 16) | (m2_a / 16 - 1)
+-                                : (DIV_ROUND_UP(in_w, 16) << 16) |
+-                                  (DIV_ROUND_UP(in_w, 16) - 1)));
++                                : (rkt_fc_m6_hi(in_w, task->pad_right) << 16) |
++                                  rkt_fc_m6_lo(in_w, task->pad_right)));
+ 
+    /* CORE. */
+    R_CORE(0x3018, 0x10000081); /* MISC/MAC cfg (first-conv in_ch=3) */
+@@ -390,10 +412,12 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4034, ((win_o - 1) << 16) | (fc_ow - 1));
+    R_DPU(0x4038, 0x00120080);
+    R_DPU(0x403c, 0x00000000);
+-   R_DPU(0x4044, 0x00000001);
++   /* the vendor's per-tensor plain bias mode, see rkt_fc_pt114() */
++   bool fc_pt114 = !operation->c_q14 && rkt_fc_pt114(operation->int8);
++   R_DPU(0x4044, fc_pt114 ? 0x00000000 : 0x00000001);
+    R_DPU(0x4048, 0x80000000);
+    R_DPU(0x404c, 0x7fffffff);
+-   R_DPU(0x4050, 0x80011111);
++   R_DPU(0x4050, fc_pt114 ? 0x80021011 : 0x80011111);
+    R_DPU(0x4058, 0x80000000);
+    R_DPU(0x405c, 0x7fffffff);
+    R_DPU(0x4060, 0x00000903);
+@@ -456,7 +480,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+       /* The generic path computes this then emits shift - 1; keep both. */
+       unsigned fc_shift = 127 + 31 - 32 - (sb >> 23) + 16 - 1 + 4;
+       /* Q14 C with its own >> 14 (rkt_int8.h): no extra 4 bits here. */
+-      if (operation->c_q14)
++      if (operation->c_q14 || fc_pt114)
+          fc_shift -= 4;
+       unsigned fc_scale = ((sb >> 9) & 0x7fff) + rkt_cvt_round(sb);
+       if (fc_scale > 0x7fff) {
+@@ -523,11 +547,13 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_RDMA(0x5010, win_o - 1);
+    R_RDMA(0x5014, fc_oc - 1); /* out_ch-1 */
+    R_RDMA(0x5018, 0x00000000);
+-   R_RDMA(0x501c, 0x00000710);
+-   R_RDMA(0x5020, bias_addr);          /* bias (BS) base addr */
++   unsigned fc_pt_off = rkt_fc_pt114_off(rkt_coef_table_bytes(false, fc_oc));
++   R_RDMA(0x501c, fc_pt114 ? 0x00000114 : 0x00000710);
++   R_RDMA(0x5020, bias_addr + (fc_pt114 ? fc_pt_off : 0));  /* bias (BS) base addr */
+    /* bias second buffer: +0x100 per board at 32 outputs, i.e. right after
+     * the oc-sized coefficient table, see above */
+-   R_RDMA(0x5024, bias_addr + rkt_coef_table_bytes(false, fc_oc));
++   R_RDMA(0x5024, bias_addr + (fc_pt114 ? fc_pt_off + ALIGN(fc_oc * 4, 0x100)
++                                         : rkt_coef_table_bytes(false, fc_oc)));
+    R_RDMA(0x5028, 0x00000000);
+    R_RDMA(0x502c, 0x00000000);
+    R_RDMA(0x5030, 0x00000000);
+diff --git a/src/gallium/drivers/rocket/rkt_task.c b/src/gallium/drivers/rocket/rkt_task.c
+index 337873d..507ed43 100644
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -258,6 +258,9 @@ rkt_rk3576_firstconv(const struct rkt_operation *operation)
+    if (operation->soc != RKT_SOC_RK3576 || operation->depthwise ||
+        operation->input_channels > 4)
+       return false;
++   if (rkt_fc_any_shape(operation->input_channels, operation->weights_width,
++                        operation->weights_height, operation->stride, false))
++      return true;
+    return operation->input_width == 224 ||
+           (operation->input_channels == 3 && operation->output_channels == 32 &&
+            operation->weights_width == 3 && operation->weights_height == 3 &&
+@@ -348,7 +351,7 @@ rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
+ 
+    if (fc) {
+       unsigned fc_w = rkt_fc_width(in_w);
+-      eps = rkt_fc_eps(operation);
++      eps = rkt_fc_eps(operation, pad_right);
+       line_in = fc_w * operation->input_channels;
+    } else {
+       eps = rkt_entries_per_slice(in_w, gc);
+-- 
+2.55.0
+

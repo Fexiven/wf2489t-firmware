@@ -2,6 +2,7 @@
 # The apt repository (flat, signed) for the tablet, in out/repo:
 #   wf2489t                  board support + kiosk (package/)
 #   linux-image-wf2489t ...  kernel and Wi-Fi driver (make kernel)
+#   mesa-teflon-rk3576       Mesa Teflon delegate for the NPU (teflon/)
 #   aic8800-firmware         Radxa, pinned
 #   touchkio                 Home Assistant kiosk app, pinned
 # Signed with the key in $WF2489T_SIGNING_KEY (armored secret key) if set;
@@ -11,6 +12,7 @@ cd "$(dirname "$0")/.."
 ls out/kernel/linux-image-wf2489t_*.deb >/dev/null 2>&1 || { echo "no kernel packages, run: make kernel"; exit 1; }
 rm -rf out/repo && mkdir -p out/repo build/dl
 sh package/build.sh
+sh teflon/build.sh
 cp out/kernel/linux-image-*.deb out/kernel/aic8800-sdio-modules-*.deb out/repo/
 
 # fetch NAME URL SHA256

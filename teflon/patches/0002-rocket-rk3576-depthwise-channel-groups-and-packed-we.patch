@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:10 +0100
+Subject: [PATCH 02/23] rocket: rk3576: depthwise channel groups and packed
+ weight groups
+
+The depthwise weight buffer is laid out in groups of 64 channels. The
+last group was padded to 64 channels instead of being packed to
+ALIGN(C, 16) as the vendor does: with 96 channels 2304 bytes were written
+into a 1728 byte buffer and the CNA read the wrong weights for channels
+64..95 (144 channels: 3456 bytes into 2880). Every depthwise layer whose
+channel count is not a multiple of 64 was wrong (SSD-MobileNetV2 layers
+004, 007, 011).
+
+ - rkt_coefs.c: pack the last group to ALIGN(gc, 16) channels; the CNA
+   is told that count (0x101c, 0x1020, 0x1030).
+ - rkt_task.c: a depthwise layer with more than 64 channels whose input,
+   counted at ALIGN(C, 64) channels, does not fit the 5120 entry ring is
+   split into channel groups like rknn-toolkit2 2.3.2 does (the largest
+   multiple of 64 whose whole input fits, else 64; the last group takes
+   the rest). Each group gets its own row windows, banks and ring.
+ - rkt_regcmd.c: per group 0x1110 += c0*k*k*2, 0x5020 += c0/8*48, 0x5024
+   fixed; 0x1038 bit 31 clear on the first window of each group (new
+   weights).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_coefs.c  | 16 ++++-
+ src/gallium/drivers/rocket/rkt_ml.h     | 10 +++
+ src/gallium/drivers/rocket/rkt_regcmd.c | 37 ++++++++---
+ src/gallium/drivers/rocket/rkt_task.c   | 83 ++++++++++++++++++++++---
+ 4 files changed, 126 insertions(+), 20 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index 06f3769..f717883 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -269,15 +269,25 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+             unsigned pos = y * weights_height + x;
+ 
+             for (unsigned c0 = 0; c0 < channels; c0 += group) {
++               /*
++                * The last group is packed to its own channel count rounded
++                * up to 16, so its spatial blocks are closer together than a
++                * whole group's. Every group before it is whole, so where it
++                * starts does not change.
++                */
++               unsigned gch = MIN2(ALIGN(group, FEATURE_ATOMIC_SIZE),
++                                   ALIGN(channels - c0, FEATURE_ATOMIC_SIZE));
++               unsigned gblock = DIV_ROUND_UP(gch, 2) * 4;
+                uint8_t *blk =
+-                  weights_out + (c0 / group) * gsize + pos * block;
++                  weights_out + (c0 / group) * gsize + pos * gblock;
+                unsigned n = 0;
+ 
+-               for (unsigned g = 0; g < DIV_ROUND_UP(group, 2); g++) {
++               for (unsigned g = 0; g < DIV_ROUND_UP(gch, 2); g++) {
+                   for (unsigned s = 0; s < 2; s++) {
+                      unsigned c = c0 + g * 2 + s;
+                      blk[n++] =
+-                        c < channels ? weights_in[0][y][x][c] - 0x80 : pad;
++                        c < MIN2(channels, c0 + group)
++                           ? weights_in[0][y][x][c] - 0x80 : pad;
+                   }
+                   blk[n++] = zplane;
+                   blk[n++] = zplane;
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 98f3e2f..5290c6b 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -80,6 +80,16 @@ struct split_task {
+    unsigned cbuf_wr;
+    unsigned cbuf_rd;
+ 
++   /*
++    * RK3576 depthwise channel group (rkt_dw_group_size): this task computes
++    * channels [dw_c0, dw_c0 + input_channels_real) of the layer. Its input and
++    * output offsets already include the group; the encoder moves the weight
++    * (0x1110) and coefficient (0x5020) pointers by dw_c0.
++    */
++   bool dw_group;
++   bool dw_group_first;   /* first row window of the group: new weights */
++   unsigned dw_c0;
++
+    unsigned output_width;
+    unsigned output_height;
+    unsigned output_channels;
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index c5a219b..c13e98c 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -662,7 +662,7 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+     * ROCKET_PW_WBPK=1 drops the doubling for a pointwise only.
+     */
+    bool pw1 = !dw && k == 1;
+-   unsigned wbpk = dw ? (k * k * ic / 8)
++   unsigned wbpk = dw ? (k * k * ALIGN(ic, FEATURE_ATOMIC_SIZE) / 8)
+                       : (ic_pad * k * k *
+                          (pw1 && getenv("ROCKET_PW_WBPK") ? 1 : 2));
+    /* k_word tracks the kernel extent: per-byte = (k-1) (k=3 -> 0x0202, k=5 ->
+@@ -700,6 +700,20 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+       rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
+       task->output_offset;
+    uint32_t bias_addr = rkt_resource(operation->biases)->phys_addr;
++   /*
++    * Depthwise channel group (rkt_dw_group_size): the group's weights start
++    * dw_c0 * k * k * 2 bytes in (every group before it is a whole 64 channel
++    * weight group), and its coefficient records dw_c0 / 8 * 48 bytes in. The
++    * vendor moves 0x1110 by 0x480 and 0x5020 by 0x180 per 64 channels at k3,
++    * and leaves 0x5024 where it is.
++    */
++   uint32_t coef_addr = bias_addr;
++   if (task->dw_group) {
++      weight_addr += task->dw_c0 * k * k * 2;
++      coef_addr += task->dw_c0 / 8 * 48;
++   }
++   /* the depthwise weight count the CNA is told: the packed last group */
++   unsigned dw_wch = dw ? ALIGN(oc, FEATURE_ATOMIC_SIZE) : oc;
+ 
+    /* Requant (same math the legacy path uses), placed at the RK3576 offsets. */
+    float conv_scale =
+@@ -888,8 +902,8 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+                      : getenv("ROCKET_OC_ATOM") ? ALIGN(oc, FEATURE_ATOMIC_SIZE)
+                                                 : ALIGN(oc, 2);
+ 
+-   R_CNA(0x101c, dw ? (oc * k * k * 2) : (ic_pad * oc_pad * k * k));
+-   R_CNA(0x1020, (dw ? oc : ic_pad) * k * k);
++   R_CNA(0x101c, dw ? (dw_wch * k * k * 2) : (ic_pad * oc_pad * k * k));
++   R_CNA(0x1020, (dw ? dw_wch : ic_pad) * k * k);
+    R_CNA(0x1024, (k_word << 16) | (dw ? 1 : (oc_pad - 1)));
+    /*
+     * The vendor pads the WEIGHT side of a regular conv to 16 input channels
+@@ -902,7 +916,13 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x102c, ((inw - 1) << 16) | (win_irows - 1));
+    R_CNA(0x1030, (wbpk << 16) | (ow - 1));
+    R_CNA(0x1034, ow * win_orows - 1);
+-   R_CNA(0x1038, 0x07 | (wnum > 0 ? 0x80000000 : 0));
++   /*
++    * Bit 31 is clear on the first task of the layer and, with depthwise
++    * channel groups, on the first task of every group, where the weights
++    * change (vendor: 0x7 there, 0x80000007 on the group's later windows).
++    */
++   R_CNA(0x1038, 0x07 | (wnum > 0 && !(task->dw_group && task->dw_group_first)
++                            ? 0x80000000 : 0));
+    R_CNA(0x103c, (surf << 16) | reuse);
+    /* CBUF_CON0: stride-2 captures (conv0 and this conv) use 0x10000000, not the
+     * generic-path 0x14000000 (the 0x04000000 bit is a stride-1 artifact). */
+@@ -1303,7 +1323,7 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+       /* deliberately NOT setting 0x5024 (no float-surface second buffer) */
+    } else {
+       R_RDMA(0x501c, dw ? 0x0510 : 0x0710);
+-      R_RDMA(0x5020, bias_addr);
++      R_RDMA(0x5020, coef_addr);
+       /* Second SDP operand points just past the per-channel record table and
+        * the fp16 scale table; it lands in the zeroed pad of the bias bo. The
+        * record table is DIV_ROUND_UP(oc,8)*64 bytes for a regular conv and
+@@ -1332,9 +1352,10 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+        * out with, so this pointer is computed from the same expression instead
+        * of repeating the regular conv's arithmetic here.
+        */
+-      R_RDMA(0x5024, bias_addr + rkt_coef_table_bytes(dw, oc) +
+-                     (getenv("ROCKET_SCALE_OFF") ? 0
+-                                                 : rkt_scale_table_bytes(oc)));
++      R_RDMA(0x5024, bias_addr +
++                     rkt_coef_table_bytes(dw, operation->output_channels) +
++                     (getenv("ROCKET_SCALE_OFF")
++                         ? 0 : rkt_scale_table_bytes(operation->output_channels)));
+    }
+    R_RDMA(0x5028, 0x00000000);
+    R_RDMA(0x502c, 0x00000000);
+diff --git a/src/gallium/drivers/rocket/rkt_task.c b/src/gallium/drivers/rocket/rkt_task.c
+index dab894a..bc54636 100644
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -288,15 +288,54 @@ rkt_rk3576_firstconv(const struct rkt_operation *operation)
+  * Every window, including a single one, stages only the rows its outputs need
+  * (a 1x1 stride 2 layer on 56 rows stages 55).
+  *
+- * The vendor additionally splits large depthwise layers into groups of 64
+- * channels; that is NOT done here (MobileNet V1's 128 channel depthwise layers
+- * run correctly as row windows over all channels).
++ * Depthwise channel groups: see rkt_dw_group_size() below.
+  */
++/*
++ * The vendor additionally splits a depthwise layer into CHANNEL GROUPS when
++ * its whole input does not fit the 5120 entry ring and it has more than 64
++ * channels (rknn-toolkit2 2.3.2):
++ *
++ *  - The group size G is the largest multiple of 64 (below C) whose whole input
++ *    fits 5120 entries, or 64 if none does; the last group takes the rest
++ *    (75x75x144 -> 64 + 64 + 16, 38x38x256 -> 192 + 64).
++ *  - Each group is laid out exactly like a layer of gc channels of its own:
++ *    the row windows, the bank count and the ring (which restarts at entry 0)
++ *    follow from rkt_entries_per_slice(width, gc).
++ *  - The group's input and output are c0 / 16 planes further in, its weights
++ *    c0 * k * k * 2 bytes (whole 64 channel weight groups) and its 0x5020
++ *    coefficient records c0 * 6 bytes (48 byte records per 8 channels).
++ */
++static unsigned
++rkt_dw_group_size(const struct rkt_operation *operation)
++{
++   unsigned c = operation->input_channels;
++   unsigned in_w = operation->input_width;
++   unsigned in_h = operation->input_height;
++   const unsigned ring = 5 * 1024;
++   unsigned g = 64;
++
++   /*
++    * The fit test counts the channels rounded up to 64: 56x56x96 takes 4704
++    * entries and fits, but the vendor still splits it 64 + 32, because 128
++    * channels would not fit (6272).
++    */
++   if (!operation->depthwise || c <= 64 ||
++       rkt_entries_per_slice(in_w, ALIGN(c, 64)) * in_h <= ring)
++      return c;
++
++   for (unsigned t = 128; t < c; t += 64)
++      if (rkt_entries_per_slice(in_w, t) * in_h <= ring)
++         g = t;
++   return g;
++}
++
+ static void
+-rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+-                       struct rkt_operation *operation)
++rkt_split_windows_rk3576(struct rkt_ml_subgraph *subgraph,
++                         struct rkt_operation *operation,
++                         unsigned c0, unsigned gc)
+ {
+    bool fc = rkt_rk3576_firstconv(operation);
++   bool group = gc != operation->input_channels;
+    unsigned in_w = operation->input_width;
+    unsigned in_h = operation->input_height;
+    unsigned out_h = operation->output_height;
+@@ -312,12 +351,12 @@ rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+       eps = fc_w / 16;
+       line_in = fc_w * operation->input_channels;
+    } else {
+-      eps = rkt_entries_per_slice(in_w, operation->input_channels);
++      eps = rkt_entries_per_slice(in_w, gc);
+       line_in = calc_line_stride(in_w);
+    }
+ 
+    unsigned weight_bytes = operation->depthwise
+-      ? operation->input_channels * k * operation->weights_width * 2
++      ? gc * k * operation->weights_width * 2
+       : ALIGN(operation->input_channels, FEATURE_ATOMIC_SIZE) *
+            operation->output_channels * k * operation->weights_width;
+    unsigned data_banks =
+@@ -325,6 +364,10 @@ rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+    unsigned budget = rkt_env_u32("ROCKET_CBUF_ENTRIES", data_banks * 1024);
+    unsigned ring_pos = 0;
+    int prev_hi = -1;
++   /* channel group c0: c0 / 16 planes of 16 channels further in */
++   unsigned in_plane = in_w * in_h * FEATURE_ATOMIC_SIZE;
++   unsigned out_plane = operation->output_width * operation->output_height *
++                        FEATURE_ATOMIC_SIZE;
+ 
+    for (unsigned o0 = 0; o0 < out_h;) {
+       int lo_s = (int)(o0 * s) - (int)pad_top;
+@@ -349,14 +392,25 @@ rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+       struct split_task task = {0};
+       task.num = util_dynarray_num_elements(&operation->tasks, struct split_task);
+       fill_task(subgraph, operation, &task);
++      if (group) {
++         task.input_channels_real = gc;
++         task.output_channels_real = gc;
++         task.input_channels = ALIGN(MAX2(gc, FEATURE_ATOMIC_SIZE), FEATURE_ATOMIC_SIZE);
++         task.output_channels = ALIGN(task.input_channels, 64);
++         task.dw_group = true;
++         task.dw_group_first = o0 == 0;
++         task.dw_c0 = c0;
++      }
+       task.input_banks = data_banks;
+       task.weights_banks = operation->cbuf_banks - data_banks;
+       task.input_data_entries = budget;
+       task.output_height = o1 - o0;
+       task.input_height = span;
+       task.staged_rows = staged;
+-      task.input_offset = (reuse ? new_lo : lo) * line_in;
+-      task.output_offset = o0 * calc_line_stride(operation->output_width);
++      task.input_offset = (reuse ? new_lo : lo) * line_in +
++                          (c0 / FEATURE_ATOMIC_SIZE) * in_plane;
++      task.output_offset = o0 * calc_line_stride(operation->output_width) +
++                           (c0 / FEATURE_ATOMIC_SIZE) * out_plane;
+       task.pad_top = o0 == 0 ? pad_top : 0;
+       task.pad_bottom = o1 >= out_h ? pad_bottom : 0;
+       task.pad_left = pad_left;
+@@ -384,6 +438,17 @@ rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
+    }
+ }
+ 
++static void
++rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
++                       struct rkt_operation *operation)
++{
++   unsigned c = operation->input_channels;
++   unsigned g = rkt_dw_group_size(operation);
++
++   for (unsigned c0 = 0; c0 < c; c0 += g)
++      rkt_split_windows_rk3576(subgraph, operation, c0, MIN2(g, c - c0));
++}
++
+ void
+ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
+                 struct rkt_operation *operation)
+-- 
+2.55.0
+

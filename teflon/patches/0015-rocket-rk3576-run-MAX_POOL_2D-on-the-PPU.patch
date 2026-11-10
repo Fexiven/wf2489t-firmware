@@ -1,0 +1,456 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:46:06 +0100
+Subject: [PATCH 15/23] rocket: rk3576: run MAX_POOL_2D on the PPU
+
+Rocket only claimed convolutions and ADD on RK3576, so the max pools of
+Inception and EfficientDet cut these models into many NPU/CPU partitions,
+each costing a layout conversion and a submit.
+
+Run MAX_POOL_2D (square kernels up to 5x5, the same quantization in and
+out) as one PPU + PPU RDMA task, as the vendor compiler (rknn-toolkit2
+2.3.2) emits it. rkt_ops.h reproduces the vendor's register streams for
+the compiled cases apart from addresses and plane strides. The two-core
+planner gives pooling all input rows and keeps it on core 0.
+
+A PPU-only task raises the PPU interrupt instead of the DPU one, so
+pooling is only claimed when the kernel reports
+DRM_ROCKET_PARAM_PPU_TASKS; on older kernels it stays on the CPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_device.c |   3 +
+ src/gallium/drivers/rocket/rkt_device.h |   3 +
+ src/gallium/drivers/rocket/rkt_mc.c     |  17 +++
+ src/gallium/drivers/rocket/rkt_ml.c     | 147 ++++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_ml.h     |   4 +
+ src/gallium/drivers/rocket/rkt_ops.h    | 120 +++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_regcmd.c |  14 +++
+ 7 files changed, 308 insertions(+)
+ create mode 100644 src/gallium/drivers/rocket/rkt_ops.h
+
+diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+index e90adf5..0d366d1 100644
+--- a/src/gallium/drivers/rocket/rkt_device.c
++++ b/src/gallium/drivers/rocket/rkt_device.c
+@@ -287,6 +287,9 @@ rkt_screen_create(int fd,
+    struct drm_rocket_get_param gp = {.param = DRM_ROCKET_PARAM_NUM_CORES};
+    rkt_mc_init(rkt_screen->soc,
+                drmIoctl(fd, DRM_IOCTL_ROCKET_GET_PARAM, &gp) == 0 ? gp.value : 0);
++   gp = (struct drm_rocket_get_param){.param = DRM_ROCKET_PARAM_PPU_TASKS};
++   rkt_screen->ppu_tasks =
++      drmIoctl(fd, DRM_IOCTL_ROCKET_GET_PARAM, &gp) == 0 && gp.value;
+    if (rkt_screen->soc == RKT_SOC_RK3576) {
+       /* RK3576: 16 banks x 64 KiB (1 MiB), 512 x 128-byte entries per bank. */
+       rkt_screen->cbuf_banks = 16;
+diff --git a/src/gallium/drivers/rocket/rkt_device.h b/src/gallium/drivers/rocket/rkt_device.h
+index 207f166..d6945d5 100644
+--- a/src/gallium/drivers/rocket/rkt_device.h
++++ b/src/gallium/drivers/rocket/rkt_device.h
+@@ -52,6 +52,9 @@ struct rkt_screen {
+    unsigned cbuf_banks;
+    unsigned cbuf_entries_per_bank;
+    unsigned cbuf_bank_size;
++
++   /* The kernel completes tasks that end in the PPU (pooling). */
++   bool ppu_tasks;
+ };
+ 
+ static inline struct rkt_screen *
+diff --git a/src/gallium/drivers/rocket/rkt_mc.c b/src/gallium/drivers/rocket/rkt_mc.c
+index 811b0ad..9e760d7 100644
+--- a/src/gallium/drivers/rocket/rkt_mc.c
++++ b/src/gallium/drivers/rocket/rkt_mc.c
+@@ -124,6 +124,15 @@ rkt_mc_in_rows(const struct rkt_operation *operation, unsigned r0, unsigned r1,
+       *hi = r1;
+       return;
+    }
++   if (operation->ops.kind != RKT_OPS_NONE) {
++      /*
++       * Pool / resize carry no conv geometry (stride and weights_height are
++       * 0): they read every input row.
++       */
++      *lo = 0;
++      *hi = operation->input_height;
++      return;
++   }
+ 
+    rkt_calc_explicit_padding(operation, &pad_top, &pad_bottom, &pad_left,
+                              &pad_right);
+@@ -140,6 +149,14 @@ rkt_mc_in_rows(const struct rkt_operation *operation, unsigned r0, unsigned r1,
+ static bool
+ mc_region_ok(const struct rkt_operation *operation)
+ {
++   /*
++    * Pool / resize tasks are emitted for core 0 over all rows; a two-core
++    * range would make their consumers wait for a core 1 half that is never
++    * computed.
++    */
++   if (operation->ops.kind != RKT_OPS_NONE)
++      return false;
++
+    return operation->soc == RKT_SOC_RK3576 &&
+           operation->output_height >= 2 * MC_MIN_ROWS &&
+           (operation->ew_add || (!operation->addition_input &&
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index bcad3c3..308e746 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -534,6 +534,8 @@ count_tensors(const struct pipe_ml_operation *poperations,
+       case PIPE_ML_OPERATION_TYPE_ADD:
+          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
+          break;
++      case PIPE_ML_OPERATION_TYPE_POOLING:
++         break;
+       default:
+          DBG("poperation->type %d\n", poperation->type);
+          UNREACHABLE("Unsupported ML operation type");
+@@ -675,6 +677,132 @@ lower_add_rk3576(struct rkt_ml_subgraph *subgraph,
+    util_dynarray_init(&operation->ew_shadow->tasks, NULL);
+ }
+ 
++/*
++ * the input and output of a pool / resize: per-tensor quantization,
++ * identical scale and zero point (TFLite requires it for int8 MAX_POOL_2D and
++ * RESIZE_NEAREST_NEIGHBOR; the NPU copies values without requantizing), same
++ * signedness, batch 1, square, more than 4 channels (<= 4 would take the
++ * first-convolution input path in invoke).
++ */
++static bool
++rkt_ops_io_ok(const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *i = operation->input_tensors[0];
++   struct pipe_tensor *o = operation->output_tensors[0];
++
++   if (operation->output_count != 1 || i->resource != NULL)
++      return false;
++   if (!tensor_quantization_supported(i) || !tensor_quantization_supported(o))
++      return false;
++   if (i->scale != o->scale || i->zero_point != o->zero_point ||
++       i->is_signed != o->is_signed)
++      return false;
++   if (i->dims[0] != 1 || o->dims[0] != 1 || i->dims[3] != o->dims[3] ||
++       i->dims[3] <= 4)
++      return false;
++   if (i->dims[1] != i->dims[2] || o->dims[1] != o->dims[2])
++      return false;
++   return true;
++}
++
++/* TFLite SAME / VALID geometry of one pooling dimension */
++static bool
++rkt_ops_pool_dim(unsigned in, unsigned out, unsigned k, unsigned s, bool same,
++                 unsigned *before, unsigned *after)
++{
++   unsigned o = same ? DIV_ROUND_UP(in, s) : (in >= k ? (in - k) / s + 1 : 0);
++   if (o != out)
++      return false;
++   int total = same ? (int)((o - 1) * s + k) - (int)in : 0;
++   if (total < 0)
++      total = 0;
++   *before = total / 2;
++   *after = total - total / 2;
++   return true;
++}
++
++static bool
++rkt_ops_pool_supported(struct rkt_screen *screen,
++                       const struct pipe_ml_operation *operation)
++{
++   struct pipe_tensor *i = operation->input_tensors[0];
++   struct pipe_tensor *o = operation->output_tensors[0];
++   unsigned k = operation->pooling.filter_width;
++   unsigned s = operation->pooling.stride_x;
++   unsigned b, a;
++
++   /* MAX_POOL on the PPU needs a kernel that completes PPU tasks */
++   if (!screen->ppu_tasks || !rkt_ops_io_ok(operation))
++      return false;
++   if (operation->pooling.type != PIPE_ML_POOLING_TYPE_MAX)
++      return false;
++   if (k != operation->pooling.filter_height || s != operation->pooling.stride_y)
++      return false;
++   /* the vendor runs <= 5x5 as one PPU task and cascades bigger kernels */
++   if (k < 1 || k > 5 || s < 1 || s > 8)
++      return false;
++   if (!rkt_ops_pool_dim(i->dims[1], o->dims[1], k, s,
++                         operation->pooling.padding_same, &b, &a) || b > 7 || a > 7)
++      return false;
++   /* the vendor splits stride-1 pools wider than 28 (seen at 48) into column
++    * windows, stride-2 pools stay one task up to 112 */
++   if (i->dims[2] > (s == 1 ? 28u : 112u))
++      return false;
++   return true;
++}
++
++static void
++lower_ops_rk3576(struct rkt_ml_subgraph *subgraph,
++                 const struct pipe_ml_operation *poperation,
++                 struct rkt_operation *operation)
++{
++   struct pipe_context *pcontext = subgraph->base.context;
++   struct rkt_screen *screen = rkt_screen(pcontext->screen);
++   const struct pipe_tensor *i = poperation->input_tensors[0];
++   const struct pipe_tensor *o = poperation->output_tensors[0];
++   struct rkt_ops_params *p = &operation->ops;
++
++   util_dynarray_init(&operation->tasks, NULL);
++   operation->soc = screen->soc;
++   operation->cbuf_banks = screen->cbuf_banks;
++   operation->cbuf_entries_per_bank = screen->cbuf_entries_per_bank;
++   operation->cbuf_bank_size = screen->cbuf_bank_size;
++
++   operation->input_index = i->index;
++   operation->input_width = i->dims[1];
++   operation->input_height = i->dims[2];
++   operation->input_channels = i->dims[3];
++   operation->input_zero_point = rkt_ew_zp(i) + 0x80;
++   operation->input_scale = i->scale;
++
++   operation->output_index = o->index;
++   operation->output_width = o->dims[1];
++   operation->output_height = o->dims[2];
++   operation->output_channels = o->dims[3];
++   operation->output_zero_point = rkt_ew_zp(o) + 0x80;
++   operation->output_scale = o->scale;
++
++   memset(p, 0, sizeof(*p));
++   p->in_w = i->dims[1];
++   p->in_h = i->dims[2];
++   p->out_w = o->dims[1];
++   p->out_h = o->dims[2];
++   p->channels = i->dims[3];
++   p->groups = DIV_ROUND_UP(i->dims[3], FEATURE_ATOMIC_SIZE);
++
++   if (poperation->type == PIPE_ML_OPERATION_TYPE_POOLING) {
++      p->kind = RKT_OPS_MAXPOOL;
++      p->kw = poperation->pooling.filter_width;
++      p->kh = poperation->pooling.filter_height;
++      p->sx = poperation->pooling.stride_x;
++      p->sy = poperation->pooling.stride_y;
++      rkt_ops_pool_dim(p->in_w, p->out_w, p->kw, p->sx,
++                       poperation->pooling.padding_same, &p->pad_l, &p->pad_r);
++      rkt_ops_pool_dim(p->in_h, p->out_h, p->kh, p->sy,
++                       poperation->pooling.padding_same, &p->pad_t, &p->pad_b);
++   }
++}
++
+ /*
+  * Rocket applies no activation fused into an ADD, pooling or concatenation.
+  * Such an operation is still correct when the output's quantized range
+@@ -791,6 +919,11 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+       supported = operation->input_tensors[0]->resource == NULL &&
+                   operation->input_tensors[1]->resource == NULL;
+       break;
++   case PIPE_ML_OPERATION_TYPE_POOLING:
++      supported = rkt_screen(pcontext->screen)->soc == RKT_SOC_RK3576 &&
++                  rkt_ops_pool_supported(rkt_screen(pcontext->screen),
++                                         operation);
++      break;
+    default:
+       supported = false;
+    }
+@@ -1089,6 +1222,12 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+ 
+          break;
+       }
++      case PIPE_ML_OPERATION_TYPE_POOLING:
++         /* rkt_ops.h */
++         lower_ops_rk3576(subgraph, &poperations[i], &operation);
++         util_dynarray_append(&subgraph->operations, struct rkt_operation,
++                              operation);
++         break;
+       default:
+          DBG("poperation->type %d\n", poperations[i].type);
+          UNREACHABLE("Unsupported ML operation type");
+@@ -1184,6 +1323,14 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+          task.output_channels = operation->output_channels;
+          task.output_channels_real = operation->output_channels;
+          util_dynarray_append(&operation->tasks, struct split_task, task);
++      } else if (operation->ops.kind != RKT_OPS_NONE) {
++         /* PPU pool = one task */
++         struct split_task task = {0};
++         task.output_width = operation->output_width;
++         task.output_height = operation->output_height;
++         task.output_channels = operation->output_channels;
++         task.output_channels_real = operation->output_channels;
++         util_dynarray_append(&operation->tasks, struct split_task, task);
+       } else
+          rkt_split_tasks(subgraph, operation);
+       compile_operation(subgraph, operation);
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index e23e3e3..5f5da10 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -12,6 +12,7 @@
+ 
+ #include "rkt_device.h"
+ #include "rkt_ew.h"
++#include "rkt_ops.h"
+ 
+ // http://nvdla.org/hw/v1/ias/unit_description.html#convolution-buffer
+ // CBUF (convolution buffer) bank count and entries-per-bank differ by SoC and
+@@ -190,6 +191,9 @@ struct rkt_operation {
+    struct rkt_ew_add ew;
+    struct rkt_operation *ew_shadow;
+ 
++   /* MAX_POOL_2D as a PPU task. ops.kind != RKT_OPS_NONE. */
++   struct rkt_ops_params ops;
++
+    /* SoC + CBUF geometry, copied from the screen so the per-operation task
+     * splitter and register encoders can branch without a screen handle. */
+    enum rkt_soc soc;
+diff --git a/src/gallium/drivers/rocket/rkt_ops.h b/src/gallium/drivers/rocket/rkt_ops.h
+new file mode 100644
+index 0000000..957c92b
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_ops.h
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (c) 2026 rk3576-npu-open contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * RK3576 non-convolution operations as the vendor compiler (rknn-toolkit2
++ * 2.3.2, target rk3576) emits them:
++ *
++ *   MAX_POOL_2D              one PPU + PPU RDMA task (enable mask 0x60)
++ *
++ * The register values are reproduced from the vendor's .rknn for
++ * maxpool 40/20/10/5 x 64/32/128/24/8 ch, 3x3 s2, 2x2 s2, 5x5 s1, 3x3 s1.
++ * The only deliberate differences: surface strides are Mesa's tight planes
++ * (the vendor rounds every plane up to a multiple of 4 pixels), and the
++ * per-unit OP_ENs Mesa's RK3576 streams end with replace the vendor's PC
++ * descriptor enable mask (as for the EW ADD, rkt_ew.h).
++ *
++ * PPU tasks raise the PPU interrupt, not the DPU one. A rocket kernel driver
++ * that only unmasks and accepts DPU_0/DPU_1 would time out on them, so
++ * MAX_POOL is only claimed when the kernel reports DRM_ROCKET_PARAM_PPU_TASKS.
++ */
++
++#ifndef RKT_OPS_H
++#define RKT_OPS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++#include "rkt_ew.h"
++
++#define RKT_OPS_MAX_REGS 112
++
++enum rkt_ops_kind {
++   RKT_OPS_NONE = 0,
++   RKT_OPS_MAXPOOL,
++};
++
++struct rkt_ops_params {
++   enum rkt_ops_kind kind;
++   /* Mesa's width = TFLite dim 1, height = dim 2 (square shapes only) */
++   unsigned in_w, in_h, out_w, out_h;
++   unsigned channels;        /* real channels */
++   unsigned groups;          /* 16-channel groups */
++   /* pool */
++   unsigned kw, kh, sx, sy;
++   unsigned pad_l, pad_t, pad_r, pad_b;
++   uint32_t in_addr, out_addr;
++};
++
++/* the unit OP_EN value every RK3576 task ends with */
++#define RKT_OPS_OPEN 0x1d
++
++/*
++ * MAX_POOL_2D: PPU reading the input through the PPU RDMA. Field layout from
++ * the vendor's streams (RK3588 register names, same offsets on RK3576):
++ *   0x600c/10/14  input  width-1 / height-1 / channels-1 (16-aligned)
++ *   0x6018/1c/20  output width-1 / height-1 / channels-1
++ *   0x6024        0x11: max pooling, input from the PPU RDMA
++ *   0x6034        kernel w-1 [3:0], h-1 [11:8], stride x-1 [19:16], y-1 [23:20]
++ *   0x6040        pad left [3:0], top [7:4], right [11:8], bottom [15:12]
++ *   0x6044..50    pad value -128 (19 bit), the int8-domain minimum
++ *   0x6070/7c/84  output address / surface stride / surface stride
++ *   0x700c/10/14  input cube, 0x701c input address,
++ *   0x7024/28     input line / surface stride, 0x7030 = 0x40
++ */
++static inline unsigned
++rkt_ops_pool_emit(const struct rkt_ops_params *p, uint64_t *out)
++{
++   unsigned n = 0;
++   unsigned c = p->groups * 16;
++   uint32_t in_plane = p->in_w * p->in_h * 16;
++   uint32_t out_plane = p->out_w * p->out_h * 16;
++   uint32_t open = RKT_OPS_OPEN;
++
++#define R_PPU(reg, val)  out[n++] = rkt_ew_word(0x4001, (reg), (uint32_t)(val))
++#define R_PDMA(reg, val) out[n++] = rkt_ew_word(0x8001, (reg), (uint32_t)(val))
++
++   R_PPU(0x6004, 0x0000000e);
++   R_PDMA(0x7004, 0x0000000e);
++   R_PPU(0x600c, p->in_w - 1);
++   R_PPU(0x6010, p->in_h - 1);
++   R_PPU(0x6014, c - 1);
++   R_PPU(0x6018, p->out_w - 1);
++   R_PPU(0x601c, p->out_h - 1);
++   R_PPU(0x6020, c - 1);
++   R_PPU(0x6024, 0x00000011);
++   R_PPU(0x6034, ((p->sy - 1) << 20) | ((p->sx - 1) << 16) |
++                 ((p->kh - 1) << 8) | (p->kw - 1));
++   R_PPU(0x6038, 0x00000000);
++   R_PPU(0x603c, 0x00000000);
++   R_PPU(0x6040, (p->pad_b << 12) | (p->pad_r << 8) | (p->pad_t << 4) |
++                 p->pad_l);
++   R_PPU(0x6044, 0x0007ff80);
++   R_PPU(0x6048, 0x0007ff80);
++   R_PPU(0x604c, 0x0007ff80);
++   R_PPU(0x6050, 0x0007ff80);
++   R_PPU(0x6054, 0x00000000);
++   R_PPU(0x6058, 0x00000000);
++   R_PPU(0x605c, 0x00000000);
++   R_PPU(0x6070, p->out_addr);
++   R_PPU(0x607c, out_plane);
++   R_PPU(0x6084, out_plane);
++   R_PPU(0x60dc, 0x00000000);
++   R_PDMA(0x700c, p->in_w - 1);
++   R_PDMA(0x7010, p->in_h - 1);
++   R_PDMA(0x7014, c - 1);
++   R_PDMA(0x701c, p->in_addr);
++   R_PDMA(0x7024, p->in_w * 16);
++   R_PDMA(0x7028, in_plane);
++   R_PDMA(0x7030, 0x00000040);
++
++   R_PPU(0x6008, open);
++   R_PDMA(0x7008, open);
++
++#undef R_PPU
++#undef R_PDMA
++   return n;
++}
++
++#endif /* RKT_OPS_H */
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 6c108a3..64e530c 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -2278,6 +2278,20 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+       return;
+    }
+ 
++   if (operation->soc == RKT_SOC_RK3576 && operation->ops.kind != RKT_OPS_NONE) {
++      /* rkt_ops.h: PPU max pool */
++      struct rkt_ops_params p = operation->ops;
++      uint64_t words[RKT_OPS_MAX_REGS];
++      unsigned n;
++
++      p.in_addr = rkt_get_tensor(subgraph, operation->input_index)->phys_addr;
++      p.out_addr = rkt_get_tensor(subgraph, operation->output_index)->phys_addr;
++      n = rkt_ops_pool_emit(&p, words);
++      for (unsigned i = 0; i < n; i++)
++         util_dynarray_append(regs, uint64_t, words[i]);
++      return;
++   }
++
+    if (operation->soc == RKT_SOC_RK3576) {
+       /*
+        * RK3576 register map. The 224x224x3 first convolution uses the in_ch<=4
+-- 
+2.55.0
+

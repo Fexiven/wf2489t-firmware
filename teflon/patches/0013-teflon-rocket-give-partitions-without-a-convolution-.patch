@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:09:42 +0100
+Subject: [PATCH 13/23] teflon,rocket: give partitions without a convolution
+ back to the CPU
+
+Whether an operation is worth claiming can depend on the rest of the
+graph: on RK3576 a partition of claimed operations that contains no
+convolution, such as a lone ADD in the CPU post-processing of MoveNet or
+YOLOX, costs an NPU round trip (submit, wait and two layout conversions)
+for an operation the CPU does in microseconds. ml_operation_supported
+sees one operation at a time and cannot tell.
+
+Add an optional pipe_context::ml_operations_filter, which Teflon calls
+once per graph with every operation in execution order and the result of
+ml_operation_supported for each; the driver may give operations back.
+Drivers that do not set it are unchanged.
+
+Rocket sets it on RK3576. It computes the partitions the way TFLite's
+PartitionGraphIntoIndependentNodeSubsets() does (greedy, in execution
+order) and gives back the operations of every partition without a
+convolution or fully connected layer, repeating until nothing changes,
+as giving operations back changes the partitions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_device.c   |   2 +
+ src/gallium/drivers/rocket/rkt_ml.c       | 142 ++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_ml.h       |   5 +
+ src/gallium/frontends/teflon/tfl_device.c |  39 +++++-
+ src/gallium/include/pipe/p_context.h      |  24 ++++
+ 5 files changed, 210 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_device.c b/src/gallium/drivers/rocket/rkt_device.c
+index 8a2496b..e90adf5 100644
+--- a/src/gallium/drivers/rocket/rkt_device.c
++++ b/src/gallium/drivers/rocket/rkt_device.c
+@@ -179,6 +179,8 @@ rkt_create_context(struct pipe_screen *screen,
+    pctx->clear_buffer = u_default_clear_buffer;
+ 
+    pctx->ml_operation_supported = rkt_ml_operation_supported;
++   if (rkt_screen(screen)->soc == RKT_SOC_RK3576)
++      pctx->ml_operations_filter = rkt_ml_operations_filter;
+    pctx->ml_subgraph_create = rkt_ml_subgraph_create;
+    pctx->ml_subgraph_invoke = rkt_ml_subgraph_invoke;
+    pctx->ml_subgraph_read_output = rkt_ml_subgraph_read_outputs;
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index 7409f07..9ccf3f9 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -798,6 +798,148 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
+    return supported;
+ }
+ 
++/*
++ * The graph as rkt_ml_operations_filter() sees it: the producer of every
++ * operation input, and the partitions Teflon (TFLite) will group the
++ * supported operations into.
++ */
++struct rkt_ml_graph {
++   const struct pipe_ml_operation *ops;
++   unsigned count;
++   /* producer[i][j]: the operation writing input j of operation i, or -1 */
++   int **producer;
++   /* per operation, its partition, or -1 */
++   int *partition;
++};
++
++static void
++rkt_ml_graph_init(struct rkt_ml_graph *g, const struct pipe_ml_operation *ops,
++                  unsigned count)
++{
++   g->ops = ops;
++   g->count = count;
++   g->producer = calloc(count, sizeof(*g->producer));
++   g->partition = calloc(count, sizeof(*g->partition));
++
++   for (unsigned i = 0; i < count; i++) {
++      g->producer[i] = malloc(MAX2(ops[i].input_count, 1) * sizeof(int));
++      for (unsigned j = 0; j < ops[i].input_count; j++) {
++         g->producer[i][j] = -1;
++         /* compare the pointers only: unused inputs may not be valid tensors */
++         for (unsigned k = 0; k < count && g->producer[i][j] < 0; k++)
++            for (unsigned l = 0; l < ops[k].output_count; l++)
++               if (ops[k].output_tensors[l] == ops[i].input_tensors[j])
++                  g->producer[i][j] = k;
++      }
++   }
++}
++
++static void
++rkt_ml_graph_fini(struct rkt_ml_graph *g)
++{
++   for (unsigned i = 0; i < g->count; i++)
++      free(g->producer[i]);
++   free(g->producer);
++   free(g->partition);
++}
++
++/*
++ * Group the operations like TFLite's PartitionGraphIntoIndependentNodeSubsets:
++ * each partition takes, in execution order and until nothing changes, every
++ * operation of its kind (supported or not) whose inputs are ready.
++ */
++static void
++rkt_ml_graph_partition(struct rkt_ml_graph *g, const bool *supported)
++{
++   int n = g->count, partition = 0;
++
++   for (int i = 0; i < n; i++)
++      g->partition[i] = -1;
++
++   for (;;) {
++      int type = -1, added = 0;
++      bool progress = true;
++
++      while (progress) {
++         progress = false;
++         for (int i = 0; i < n; i++) {
++            bool ready = true;
++
++            if (g->partition[i] >= 0)
++               continue;
++            for (unsigned j = 0; j < g->ops[i].input_count; j++) {
++               int p = g->producer[i][j];
++               if (p >= 0 && g->partition[p] < 0)
++                  ready = false;
++            }
++            if (!ready)
++               continue;
++            if (type < 0)
++               type = supported[i];
++            if (supported[i] != type)
++               continue;
++            g->partition[i] = partition;
++            added++;
++            progress = true;
++         }
++      }
++      if (!added || partition >= n)
++         break;
++      partition++;
++   }
++}
++
++/*
++ * A partition without a convolution (a lone ADD in the CPU post-processing
++ * of MoveNet or YOLOX) costs an NPU round trip -- submit, wait and two
++ * layout conversions -- for an operation the CPU does in microseconds.
++ * Give its operations back. Returns true if an operation was given back.
++ */
++static bool
++drop_partitions_without_convolution(struct rkt_ml_graph *g, bool *supported)
++{
++   bool *has_conv = calloc(g->count + 1, sizeof(bool));
++   bool changed = false;
++
++   rkt_ml_graph_partition(g, supported);
++
++   for (unsigned i = 0; i < g->count; i++) {
++      if (supported[i] && g->partition[i] >= 0 &&
++          (g->ops[i].type == PIPE_ML_OPERATION_TYPE_CONVOLUTION ||
++           g->ops[i].type == PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED))
++         has_conv[g->partition[i]] = true;
++   }
++   for (unsigned i = 0; i < g->count; i++) {
++      if (supported[i] && g->partition[i] >= 0 && !has_conv[g->partition[i]]) {
++         supported[i] = false;
++         changed = true;
++      }
++   }
++
++   free(has_conv);
++   return changed;
++}
++
++/*
++ * RK3576 (rkt_create_context): graph-level rules on top of
++ * rkt_ml_operation_supported(). Giving an operation back changes the
++ * partitions, so repeat until nothing changes.
++ */
++void
++rkt_ml_operations_filter(struct pipe_context *pcontext,
++                         const struct pipe_ml_operation *operations,
++                         unsigned count, bool *supported)
++{
++   struct rkt_ml_graph g;
++
++   rkt_ml_graph_init(&g, operations, count);
++   for (int pass = 0; pass < 8; pass++) {
++      if (!drop_partitions_without_convolution(&g, supported))
++         break;
++   }
++   rkt_ml_graph_fini(&g);
++}
++
+ struct pipe_ml_subgraph *
+ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+                        const struct pipe_ml_operation *poperations,
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 0c70c6f..e23e3e3 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -242,6 +242,11 @@ struct rkt_ml_subgraph {
+ bool
+ rkt_ml_operation_supported(struct pipe_context *pcontext, const struct pipe_ml_operation *operation);
+ 
++void
++rkt_ml_operations_filter(struct pipe_context *pcontext,
++                         const struct pipe_ml_operation *operations,
++                         unsigned count, bool *supported);
++
+ struct pipe_ml_subgraph *
+ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+                        const struct pipe_ml_operation *poperations,
+diff --git a/src/gallium/frontends/teflon/tfl_device.c b/src/gallium/frontends/teflon/tfl_device.c
+index b698a26..38b187e 100644
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -761,6 +761,32 @@ check_op_support(TfLiteDelegate *tf_delegate, TfLiteContext *tf_context, TfLiteN
+    return supported;
+ }
+ 
++/*
++ * Let the driver give operations back after looking at the whole graph
++ * (pipe_context::ml_operations_filter).
++ */
++static void
++filter_operations(struct teflon_delegate *delegate, TfLiteContext *tf_context,
++                  TfLiteIntArray *plan, bool *supported)
++{
++   struct pipe_context *context = delegate->context;
++   struct pipe_ml_operation *operations = calloc(plan->size, sizeof(*operations));
++
++   for (int i = 0; i < plan->size; i++) {
++      TfLiteNode *node;
++      TfLiteRegistration *registration;
++
++      tf_context->GetNodeAndRegistration(tf_context, plan->data[i], &node, &registration);
++      fill_operation(delegate, tf_context, node, registration, &operations[i]);
++   }
++
++   context->ml_operations_filter(context, operations, plan->size, supported);
++
++   for (int i = 0; i < plan->size; i++)
++      free_operation(&operations[i]);
++   free(operations);
++}
++
+ static TfLiteStatus
+ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+ {
+@@ -779,6 +805,7 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+ 
+    // Get a list of supported nodes.
+    TfLiteIntArray *supported_nodes = malloc(plan->size * sizeof(int) + sizeof(*supported_nodes));
++   bool *node_supported = calloc(plan->size, sizeof(bool));
+    supported_nodes->size = plan->size;
+    unsigned node_count = 0;
+    for (int i = 0; i < plan->size; i++) {
+@@ -825,9 +852,17 @@ PrepareDelegate(TfLiteContext *tf_context, TfLiteDelegate *tf_delegate)
+       }
+       teflon_debug("\n");
+ 
+-      if (supported)
+-         supported_nodes->data[node_count++] = node_index;
++      node_supported[i] = supported;
++   }
++
++   if (delegate->context->ml_operations_filter)
++      filter_operations(delegate, tf_context, plan, node_supported);
++
++   for (int i = 0; i < plan->size; i++) {
++      if (node_supported[i])
++         supported_nodes->data[node_count++] = plan->data[i];
+    }
++   free(node_supported);
+    supported_nodes->size = node_count;
+ 
+    TfLiteRegistration registration;
+diff --git a/src/gallium/include/pipe/p_context.h b/src/gallium/include/pipe/p_context.h
+index e70a1d4..76b1a11 100644
+--- a/src/gallium/include/pipe/p_context.h
++++ b/src/gallium/include/pipe/p_context.h
+@@ -1262,6 +1262,30 @@ struct pipe_context {
+     */
+     bool (*ml_operation_supported)(struct pipe_context *context, const struct pipe_ml_operation *operation);
+ 
++   /**
++    * Optional. Lets the driver give operations back to the frontend after
++    * looking at the whole graph, for constraints that a single operation
++    * does not show (which operations end up in the same subgraph, where a
++    * tensor is produced and consumed). NULL keeps every operation that
++    * ml_operation_supported accepted.
++    *
++    * The frontend groups the operations that stay supported into subgraphs
++    * the way TensorFlow Lite partitions a graph: greedily, in execution
++    * order, each subgraph taking every supported operation whose inputs
++    * are ready.
++    *
++    * \param ctx         pipe context
++    * \param operations  every operation of the graph, in execution order;
++    *                    of an unsupported one only the input and output
++    *                    tensors are meaningful
++    * \param count       number of operations
++    * \param supported   per operation, the result of ml_operation_supported;
++    *                    the driver may clear entries, never set them
++    */
++   void (*ml_operations_filter)(struct pipe_context *context,
++                                const struct pipe_ml_operation *operations,
++                                unsigned count, bool *supported);
++
+    /**
+     * Compiles a ML subgraph, to be executed later. The returned pipe_ml_subgraph
+     * should contain all information needed to execute the subgraph with as
+-- 
+2.55.0
+

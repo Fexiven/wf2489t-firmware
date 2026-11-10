@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:10 +0100
+Subject: [PATCH 01/23] rocket: rk3576: place row windows in the CBUF like the
+ vendor compiler
+
+The RK3576 splitter counted CBUF entries in 128-byte units while the
+registers count 64-byte entries. That gave off-by-one row windows (67 rows
+where rknn-toolkit2 2.3.2 uses 68), cumulative CBUF write offsets for later
+windows, and the "reuse previous rows" bit (0x1018 bit 31) on 1x1 windows,
+where the vendor restarts at entry 0 with the bit clear.
+
+Implement the rule the vendor compiler emits, derived from 1245 compiled
+single-layer models (exact on all of them):
+
+ - the input part of the CBUF is a ring of D x 1024 entries of 64 bytes,
+   D = 5 when the task input needs more than 4096 entries, else 4
+   (0x1018 low bytes, 0x1040 bank flag);
+ - a window is the largest run of output rows whose input span, overlap
+   rows included, fits the ring;
+ - only rows not already in the CBUF are loaded; they are written at the
+   running ring position (0x1040 low), the window reads from the position
+   of its first row (0x103c low);
+ - a window that keeps nothing from the previous one starts at entry 0
+   with 0x1018 bit 31 clear (every 1x1 conv, the first conv);
+ - 0x401c / 0x40b8 are written from one plane value;
+ - regular convs with ic % 16 != 0 keep the real ic - 1 in 0x1028/0x107c.
+
+The first-conv encoder is parameterised on the input size instead of
+replaying the 224x224 capture (SSD-MobileNetV2's 300x300 input gets
+windows of 134 + 16 rows).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_ml.h     |  13 +++
+ src/gallium/drivers/rocket/rkt_regcmd.c |  93 +++++++++++----
+ src/gallium/drivers/rocket/rkt_task.c   | 144 ++++++++++++++++++++++++
+ src/gallium/drivers/rocket/rkt_task.h   |   2 +
+ 4 files changed, 230 insertions(+), 22 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index f485214..98f3e2f 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -67,6 +67,19 @@ struct split_task {
+     */
+    unsigned staged_rows;
+ 
++   /*
++    * RK3576 CBUF placement as rknn-toolkit2 2.3.2 emits it (rkt_split_tasks_rk3576).
++    * The input part of the CBUF is a ring of data_banks * 1024 entries of 64 bytes.
++    * cbuf_wr is the entry this task's staged rows are written to (0x1040 low),
++    * cbuf_rd the entry of the first row its window reads (0x103c low), and
++    * data_reuse says the window keeps rows of the previous one (0x1018 bit 31).
++    */
++   bool rk3576_vendor;
++   bool data_reuse;
++   unsigned data_banks;
++   unsigned cbuf_wr;
++   unsigned cbuf_rd;
++
+    unsigned output_width;
+    unsigned output_height;
+    unsigned output_channels;
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 10cc811..c5a219b 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -12,6 +12,7 @@
+ #include "rkt_coefs.h"
+ #include "rkt_ml.h"
+ #include "rkt_registers.h"
++#include "rkt_task.h"
+ 
+ /*
+  * RK3576 OUT_CVT extra right-shift, a board-debug knob for the normal encoder.
+@@ -140,6 +141,20 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+ #define R_DPU(reg, val)  emit_raw(regs, 0x1001, (reg), (val))
+ #define R_RDMA(reg, val) emit_raw(regs, 0x2001, (reg), (val))
+ 
++   /*
++    * geometry from the layer and the row window instead of the
++    * 224x224 capture constants. With one window over a 224x224 input every
++    * value below is the old constant. fc_ow/fc_oh: output size, win_o/win_i:
++    * output rows / input rows of this window (rkt_split_tasks_rk3576), banks:
++    * 4 or 5 (0x1018/0x1040; the vendor's 300x300 first conv uses 5 and two
++    * windows of 134 + 16 output rows).
++    */
++   unsigned fc_ow = operation->output_width;
++   unsigned fc_oh = operation->output_height;
++   unsigned win_o = task->output_height;
++   unsigned win_i = task->input_height;
++   unsigned banks = task->data_banks ? task->data_banks : 4;
++
+    /* S_POINTER arming for all four units (POINTER=0, PP enabled). */
+    /* S_POINTER per task. 0x0e = ping-pong ON (producer/executer auto-alternate group
+     * each task) -> on the multi-task graph they desync and the geometry lands in a group
+@@ -156,11 +171,11 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x100c, 0x2000a006);
+    R_CNA(0x1010, 0x00000fff);
+    R_CNA(0x1014, 0x00000012);   /* stride (2,2) */
+-   R_CNA(0x1018, 0x40000404);
++   R_CNA(0x1018, 0x40000000 | (banks << 8) | banks);
+    R_CNA(0x101c, 0x00000600);
+    R_CNA(0x1020, 0x00000030);
+    R_CNA(0x1024, 0x0202001f);   /* out_ch-1 = 31 */
+-   R_CNA(0x1028, 0x0d20000b);
++   R_CNA(0x1028, (((rkt_fc_width(operation->input_width) / 16) * win_i) << 16) | 0xb);
+    /*
+     * The input width the CNA is told about, which is no longer the tensor's.
+     * rkt_fc_width() widens it so the last window reads real bytes instead of
+@@ -181,14 +196,14 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+     * covers the last window.
+     */
+    unsigned fc_w = rkt_fc_width(operation->input_width);
+-   unsigned fc_h = operation->input_height;
++   unsigned fc_h = win_i;
+    unsigned fc_units = fc_w * 3 / FEATURE_ATOMIC_SIZE;
+    R_CNA(0x102c, ((fc_w - 1) << 16) | (fc_h - 1));
+-   R_CNA(0x1030, 0x0060006f);   /* out_w-1 = 111 */
+-   R_CNA(0x1034, 0x000030ff);   /* out_w*out_h-1 = 12543 */
+-   R_CNA(0x1038, 0x00000007);
+-   R_CNA(0x103c, 0x000f0000);
+-   R_CNA(0x1040, 0x10000000);   /* CBUF_CON0 -- matches the vendor runtime capture */
++   R_CNA(0x1030, 0x00600000 | (fc_ow - 1));
++   R_CNA(0x1034, fc_ow * win_o - 1);
++   R_CNA(0x1038, 0x00000007 | (task_num > 0 ? 0x80000000 : 0));
++   R_CNA(0x103c, (fc_w / 16) << 16);
++   R_CNA(0x1040, banks == 5 ? 0x14000000 : 0x10000000);   /* CBUF_CON0 -- matches the vendor runtime capture */
+    R_CNA(0x1044, (fc_w << 16) | 0x0f);
+    R_CNA(0x1048, 0x000e38e0);
+    R_CNA(0x104c, 0x40004000);   /* CVT (quant) */
+@@ -311,7 +326,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+ 
+    /* CORE. */
+    R_CORE(0x3018, 0x10000081); /* MISC/MAC cfg (first-conv in_ch=3) */
+-   R_CORE(0x301c, 0x006f006f); /* (out_h-1, out_w-1) */
++   R_CORE(0x301c, ((win_o - 1) << 16) | (fc_ow - 1));
+    R_CORE(0x3020, 0x0000001f); /* out_ch-1 */
+    R_CORE(0x3024, 0x00000000);
+ 
+@@ -320,13 +335,13 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4010, 0x00000000);
+    R_DPU(0x4014, 0x00000000);
+    R_DPU(0x4018, output_addr); /* output (DST) base addr */
+-   R_DPU(0x401c, 0x00003100); /* out_w*out_h */
+-   R_DPU(0x4020, 0x0000006f); /* out_w-1 */
+-   R_DPU(0x4024, 0x0000006f); /* out_h-1 */
++   R_DPU(0x401c, fc_ow * fc_oh);
++   R_DPU(0x4020, fc_ow - 1);
++   R_DPU(0x4024, win_o - 1);
+    R_DPU(0x4028, 0x00000000);
+    R_DPU(0x402c, 0x0000001f); /* out_ch-1 */
+    R_DPU(0x4030, 0x001f0710);
+-   R_DPU(0x4034, 0x006f006f); /* (out_h-1, out_w-1) */
++   R_DPU(0x4034, ((win_o - 1) << 16) | (fc_ow - 1));
+    R_DPU(0x4038, 0x00120080);
+    R_DPU(0x403c, 0x00000000);
+    R_DPU(0x4044, 0x00000001);
+@@ -434,7 +449,7 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+       R_DPU(0x40b0, rkt_env_u32("ROCKET_FC_SCALE", fc_scale));
+       R_DPU(0x40b4, rkt_env_u32("ROCKET_FC_SHIFT", fc_shift));
+    }
+-   R_DPU(0x40b8, 0x00003100); /* out_w*out_h */
++   R_DPU(0x40b8, 2 * fc_ow * fc_oh - fc_ow * win_o);
+    R_DPU(0x40bc, 0x00000000);
+    R_DPU(0x40c0, 0x04440100);
+    R_DPU(0x40c8, 0x00000000);
+@@ -455,8 +470,8 @@ fill_first_regcmd_rk3576_firstconv(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4194, 0x00000000);
+ 
+    /* DPU_RDMA. */
+-   R_RDMA(0x500c, 0x0000006f); /* out_w-1 */
+-   R_RDMA(0x5010, 0x0000006f); /* out_h-1 */
++   R_RDMA(0x500c, fc_ow - 1);
++   R_RDMA(0x5010, win_o - 1);
+    R_RDMA(0x5014, 0x0000001f); /* out_ch-1 */
+    R_RDMA(0x5018, 0x00000000);
+    R_RDMA(0x501c, 0x00000710);
+@@ -665,6 +680,9 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    bool tile_jobs = getenv("ROCKET_TILE_JOBS") != NULL;
+    bool tile_cbuf = getenv("ROCKET_TILE_CBUF") != NULL;
+    uint32_t reuse = (wnum > 0 && (!tile_jobs || tile_cbuf)) ? task->cbuf_reuse_row * surf : 0;  /* DATA_REUSE base */
++   /* the vendor's CBUF ring (rkt_split_tasks_rk3576) */
++   if (task->rk3576_vendor)
++      reuse = task->cbuf_rd;
+ 
+    /*
+     * DPU/CORE output-height field: one surface line per output row of the
+@@ -809,6 +827,15 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+     * does NOT split still wants it, which the general rule does not say.
+     */
+    bool dw_split = split || (dw && !getenv("ROCKET_DW_NOSPLITVALS"));
++   /*
++    * with the vendor split the pair says how many 1024-entry banks the
++    * input ring has (4 or 5, low two bytes) and bit 31 says this window keeps
++    * rows of the previous one. rknn-toolkit2 2.3.2, ~1250 compiled layers.
++    */
++   if (task->rk3576_vendor)
++      R_CNA(0x1018, 0x40000000 | (task->data_banks << 8) | task->data_banks |
++                    (task->data_reuse ? 0x80000000 : 0));
++   else
+    R_CNA(0x1018, (dw_split ? 0x40000505 : 0x40000404) | (wnum > 0 ? 0x80000000 : 0));
+    /*
+     * The CNA counts output channels in PAIRS, so an odd count is rounded up
+@@ -864,7 +891,14 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x101c, dw ? (oc * k * k * 2) : (ic_pad * oc_pad * k * k));
+    R_CNA(0x1020, (dw ? oc : ic_pad) * k * k);
+    R_CNA(0x1024, (k_word << 16) | (dw ? 1 : (oc_pad - 1)));
+-   R_CNA(0x1028, ((surf * stg_irows) << 16) | (ic_pad - 1));
++   /*
++    * The vendor pads the WEIGHT side of a regular conv to 16 input channels
++    * (0x101c, 0x1020, 0x1030 above, as this branch does) but keeps the real
++    * count in the two FEATURE side fields, 0x1028 and 0x107c: 155 of 155
++    * compiled layers with ic % 16 != 0.
++    */
++   unsigned ic_feat = ic;
++   R_CNA(0x1028, ((surf * stg_irows) << 16) | (ic_feat - 1));
+    R_CNA(0x102c, ((inw - 1) << 16) | (win_irows - 1));
+    R_CNA(0x1030, (wbpk << 16) | (ow - 1));
+    R_CNA(0x1034, ow * win_orows - 1);
+@@ -885,6 +919,10 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+     * never fires (wt_rd=0) while the dw's small weights do -- an execution-state skip
+     * ("weights already staged"). A fresh (empty) weight bank should force the pw layer
+     * to DMA its weights. dw keeps bank 0 (it fetches fine). Test: pw wt_rd 0 -> >0? */
++   if (task->rk3576_vendor)
++      R_CNA(0x1040, (task->data_banks == 5 ? 0x14000000 : 0x10000000) | task->cbuf_wr
++                    | CNA_CBUF_CON0_WEIGHT_BANK(dw ? 0 : rkt_env_u32("ROCKET_WT_BANK", 0)));
++   else
+    R_CNA(0x1040, (dw_split ? 0x14000000 : 0x10000000)
+                  | ((wnum > 0 && (!tile_jobs || tile_cbuf)) ? task->cbuf_input_row_start * surf : 0)
+                  | ((rkt_env_u32("ROCKET_FC_BANK", 0) & 0x7) << 8)
+@@ -903,7 +941,7 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    R_CNA(0x1070, 0x00000000);
+    R_CNA(0x1074, 0x00000000);
+    R_CNA(0x1078, ((inw - 1) << 16) | (stg_irows - 1));
+-   R_CNA(0x107c, ic_pad - 1);
++   R_CNA(0x107c, ic_feat - 1);
+    /* stride-2: depthwise (conv0) uses 0x00000101; a normal conv needs the
+     * 0x0202 SURF_STRIDE high field (vendor capture of this k=5 s=2 conv). */
+    /* The non-capped single-task dw value 0x01010101 is a
+@@ -990,7 +1028,19 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+    R_DPU(0x4010, 0x00000000);
+    R_DPU(0x4014, 0x00000000);
+    R_DPU(0x4018, output_addr);
+-   R_DPU(0x401c, ow * full_oh);
++   /*
++    * 0x401c is the output surface (16 channel plane) stride in 16 byte atoms,
++    * and 0x40b8 is derived from it: (dw ? 4 : 2) * plane - ow * window rows,
++    * on all ~1250 vendor layers. The vendor rounds the plane up to a
++    * multiple of 4 atoms (64 bytes), which is where its "+6" / "+12" on odd
++    * sizes comes from. This driver lays its tensors out with the unrounded
++    * plane (buffer sizes, the next layer's 0x1094, the readback), so it keeps
++    * ow * oh here and in 0x40b8; MobileNet V1's 7x7 layers (plane 49) run
++    * correctly that way. Rounding only these two registers desynchronises them
++    * from the buffers.
++    */
++   unsigned plane = ow * full_oh;
++   R_DPU(0x401c, plane);
+    R_DPU(0x4020, ow - 1);
+    R_DPU(0x4024, dpu_lines);
+    R_DPU(0x4028, 0x00000000);
+@@ -1213,7 +1263,7 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+               (int)shift - 1, cvt_scale, shift_val);
+       R_DPU(0x40b4, shift_val); /* OUT_CVT shift (+0x80 de-scale) */
+    }
+-   R_DPU(0x40b8, ow * ((dw ? 4 : 2) * full_oh - win_orows));
++   R_DPU(0x40b8, (dw ? 4 : 2) * plane - ow * win_orows);
+    R_DPU(0x40bc, 0x00000000);
+    R_DPU(0x40c0, 0x04440100);
+    R_DPU(0x40c8, 0x00000000);
+@@ -2067,8 +2117,7 @@ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+        * which handles both the single (non-windowed) task and the multiple
+        * row-window tasks the 112-wide layers are split into (rkt_split_tasks).
+        */
+-      if (operation->input_channels <= 4 && operation->input_width == 224 &&
+-          !operation->depthwise)
++      if (rkt_rk3576_firstconv(operation))
+          fill_first_regcmd_rk3576_firstconv(subgraph, operation, regs, task_num);
+       else
+          fill_regcmd_rk3576_normal(subgraph, operation, regs, task_num);
+diff --git a/src/gallium/drivers/rocket/rkt_task.c b/src/gallium/drivers/rocket/rkt_task.c
+index 6d6d4fa..dab894a 100644
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -246,10 +246,154 @@ fill_task(struct rkt_ml_subgraph *subgraph,
+       task->surfaces_per_row *= 2;
+ }
+ 
++/*
++ * RK3576 first convolution (in_ch 3, the RGB image): true when the layer goes
++ * through fill_first_regcmd_rk3576_firstconv. That encoder replays the vendor
++ * capture of the 224x224x3 -> 112x112x32, k3 s2 layer, parameterised on the
++ * input size and the vendor's first-conv modes (rkt_fc_any_shape()).
++ */
++bool
++rkt_rk3576_firstconv(const struct rkt_operation *operation)
++{
++   if (operation->soc != RKT_SOC_RK3576 || operation->depthwise ||
++       operation->input_channels > 4)
++      return false;
++   return operation->input_width == 224 ||
++          (operation->input_channels == 3 && operation->output_channels == 32 &&
++           operation->weights_width == 3 && operation->weights_height == 3 &&
++           operation->stride == 2);
++}
++
++/*
++ * RK3576 row windows, the rule rknn-toolkit2 2.3.2 uses.
++ *
++ * Derived from ~1250 single layer models compiled for rk3576. In the vendor's
++ * single-core command stream:
++ *
++ *  - The input part of the CBUF holds data_banks x 1024 entries of 64 bytes
++ *    (5120 or 4096). A row costs rkt_entries_per_slice(width, channels) entries
++ *    (fc_w / 16 for the RGB first conv).
++ *  - A window [o0, o1) of output rows reads the input rows
++ *    lo = o0 * s - pad_top .. hi = (o1 - 1) * s - pad_top + k - 1, clipped to
++ *    the image. The window is the largest one whose SPAN (hi - lo + 1 rows, the
++ *    overlap with the previous window included) fits the budget.
++ *  - Only the rows not already in the CBUF are staged. The CBUF is a ring: the
++ *    staged rows are written at the running position modulo the budget, and the
++ *    window reads from the position of its first row, i.e. the overlap rows just
++ *    before the write position. A window that keeps no rows of the previous one
++ *    (1x1, or no overlap) starts again at entry 0, and so does the first conv.
++ *  - data_banks is 5 when the whole input of the layer takes more than 4096
++ *    entries (and the weights are not large), else 4.
++ *
++ * Every window, including a single one, stages only the rows its outputs need
++ * (a 1x1 stride 2 layer on 56 rows stages 55).
++ *
++ * The vendor additionally splits large depthwise layers into groups of 64
++ * channels; that is NOT done here (MobileNet V1's 128 channel depthwise layers
++ * run correctly as row windows over all channels).
++ */
++static void
++rkt_split_tasks_rk3576(struct rkt_ml_subgraph *subgraph,
++                       struct rkt_operation *operation)
++{
++   bool fc = rkt_rk3576_firstconv(operation);
++   unsigned in_w = operation->input_width;
++   unsigned in_h = operation->input_height;
++   unsigned out_h = operation->output_height;
++   unsigned k = operation->weights_height;
++   unsigned s = operation->stride;
++   unsigned pad_top, pad_bottom, pad_left, pad_right;
++   unsigned eps, line_in;
++
++   calc_explicit_padding(operation, &pad_top, &pad_bottom, &pad_left, &pad_right);
++
++   if (fc) {
++      unsigned fc_w = rkt_fc_width(in_w);
++      eps = fc_w / 16;
++      line_in = fc_w * operation->input_channels;
++   } else {
++      eps = rkt_entries_per_slice(in_w, operation->input_channels);
++      line_in = calc_line_stride(in_w);
++   }
++
++   unsigned weight_bytes = operation->depthwise
++      ? operation->input_channels * k * operation->weights_width * 2
++      : ALIGN(operation->input_channels, FEATURE_ATOMIC_SIZE) *
++           operation->output_channels * k * operation->weights_width;
++   unsigned data_banks =
++      (eps * in_h > 4096 && (operation->depthwise || weight_bytes <= 131072)) ? 5 : 4;
++   unsigned budget = rkt_env_u32("ROCKET_CBUF_ENTRIES", data_banks * 1024);
++   unsigned ring_pos = 0;
++   int prev_hi = -1;
++
++   for (unsigned o0 = 0; o0 < out_h;) {
++      int lo_s = (int)(o0 * s) - (int)pad_top;
++      unsigned lo = lo_s < 0 ? 0 : lo_s;
++      unsigned o1 = o0 + 1, hi = 0;
++
++      /* largest o1 whose span fits; always at least one output row */
++      for (unsigned c = o0 + 1; c <= out_h; c++) {
++         int h = (int)((c - 1) * s) - (int)pad_top + (int)k - 1;
++         unsigned hc = MIN2((unsigned)MAX2(h, 0), in_h - 1);
++         if (c > o0 + 1 && (hc - lo + 1) * eps > budget)
++            break;
++         o1 = c;
++         hi = hc;
++      }
++
++      unsigned span = hi - lo + 1;
++      unsigned new_lo = MAX2((int)lo, prev_hi + 1);
++      unsigned staged = hi >= new_lo ? hi - new_lo + 1 : 0;
++      bool reuse = !fc && staged < span;
++
++      struct split_task task = {0};
++      task.num = util_dynarray_num_elements(&operation->tasks, struct split_task);
++      fill_task(subgraph, operation, &task);
++      task.input_banks = data_banks;
++      task.weights_banks = operation->cbuf_banks - data_banks;
++      task.input_data_entries = budget;
++      task.output_height = o1 - o0;
++      task.input_height = span;
++      task.staged_rows = staged;
++      task.input_offset = (reuse ? new_lo : lo) * line_in;
++      task.output_offset = o0 * calc_line_stride(operation->output_width);
++      task.pad_top = o0 == 0 ? pad_top : 0;
++      task.pad_bottom = o1 >= out_h ? pad_bottom : 0;
++      task.pad_left = pad_left;
++      task.pad_right = pad_right;
++      task.atomic_count = task.output_width * task.output_height;
++
++      task.rk3576_vendor = true;
++      task.data_banks = data_banks;
++      task.data_reuse = reuse;
++      if (reuse) {
++         task.cbuf_wr = ring_pos;
++         task.cbuf_rd = (ring_pos + budget - ((new_lo - lo) * eps) % budget) % budget;
++         ring_pos = (ring_pos + staged * eps) % budget;
++      } else {
++         /* nothing kept: restage the whole span from entry 0 */
++         task.staged_rows = span;
++         task.cbuf_wr = 0;
++         task.cbuf_rd = 0;
++         ring_pos = (span * eps) % budget;
++      }
++
++      util_dynarray_append(&operation->tasks, struct split_task, task);
++      prev_hi = hi;
++      o0 = o1;
++   }
++}
++
+ void
+ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
+                 struct rkt_operation *operation)
+ {
++   if (operation->soc == RKT_SOC_RK3576 &&
++       (operation->input_channels > 4 || rkt_rk3576_firstconv(operation))) {
++      rkt_split_tasks_rk3576(subgraph, operation);
++      return;
++   }
++
+    /* Function mostly taken from NVDLA */
+    unsigned entries_per_slice = calc_entries_per_slice(operation);
+    unsigned input_banks_required = calc_input_banks(operation);
+diff --git a/src/gallium/drivers/rocket/rkt_task.h b/src/gallium/drivers/rocket/rkt_task.h
+index 84bb9aa..6b52e97 100644
+--- a/src/gallium/drivers/rocket/rkt_task.h
++++ b/src/gallium/drivers/rocket/rkt_task.h
+@@ -11,4 +11,6 @@
+ void rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
+                      struct rkt_operation *operation);
+ 
++bool rkt_rk3576_firstconv(const struct rkt_operation *operation);
++
+ #endif /* RKT_TASK_H */
+\ No newline at end of file
+-- 
+2.55.0
+

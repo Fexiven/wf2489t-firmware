@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:58:11 +0100
+Subject: [PATCH 20/23] rocket: rk3576: fold a PAD into a first convolution
+
+YOLOX pads its 416x416x3 input image by one pixel before the 3x3
+stride 2 VALID first convolution. Such a PAD (<= 4 channels) was left to
+the CPU, where TFLite's PAD takes 1.8 ms for this image, and the NPU
+partition started behind it.
+
+The first-convolution encoder already programs explicit padding (0x1080)
+with the input zero point as the pad value (0x1084, 0x1070 for the raw
+int8 input), as the SAME first convolutions of the other models use. So
+a small-channel PAD is folded like the larger ones: the convolution reads
+the PAD's input, in the tight first-convolution layout the CPU uploads,
+with the PAD added to its own padding.
+
+rkt_ml_operations_filter() keeps such a PAD only when every consumer is
+a convolution the first-conv encoder takes (rkt_fc_any_shape), and the
+tight-input rule looks through a folded PAD at its input.
+
+YOLOX: 18.1 -> 16.4 ms, outputs byte-identical. Test models with a PAD
+of 0 to 3 pixels per side in front of 1- and 3-channel convolutions
+(k 3/5/7, stride 1/2, first-conv modes 2 and 6) are byte-identical to the
+CPU PAD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c | 32 +++++++++++++++++++++++++----
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index d8cebfb..b81c30e 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -1025,8 +1025,13 @@ rkt_pad_supported(const struct pipe_ml_operation *operation)
+    if (i->scale != o->scale || i->zero_point != o->zero_point ||
+        i->is_signed != o->is_signed)
+       return false;
+-   if (operation->pad.before_z || operation->pad.after_z || i->dims[0] != 1 ||
+-       i->dims[3] <= 4)
++   /*
++    * <= 4 channels: the input of a first convolution, which reads the PAD's
++    * input in its tight layout with the padding in its CNA registers
++    * (rkt_ml_operations_filter() checks that the consumers are such
++    * convolutions).
++    */
++   if (operation->pad.before_z || operation->pad.after_z || i->dims[0] != 1)
+       return false;
+    /* the CNA pad fields: up to 7 per side together with the conv's own */
+    if (operation->pad.before_x > 4 || operation->pad.after_x > 4 ||
+@@ -1368,6 +1373,17 @@ drop_misplaced(struct rkt_ml_graph *g, bool *supported)
+             if (j != 0 || !supported[k] || g->partition[k] != g->partition[i] ||
+                 ops[k].type != PIPE_ML_OPERATION_TYPE_CONVOLUTION)
+                ok = false;
++            /*
++             * a small-channel PAD: only the first-conv encoder takes the
++             * padding, whatever the convolution's input width
++             */
++            else if (out->dims[3] <= 4 &&
++                     !rkt_fc_any_shape(out->dims[3],
++                                       ops[k].conv.weight_tensor->dims[1],
++                                       ops[k].conv.weight_tensor->dims[2],
++                                       ops[k].conv.stride_x,
++                                       ops[k].conv.depthwise))
++               ok = false;
+          }
+       }
+       if (!ok || !consumers) {
+@@ -1382,18 +1398,26 @@ drop_misplaced(struct rkt_ml_graph *g, bool *supported)
+     * therefore not come from another claimed operation (it would be
+     * written in the NC1HWC2 layout) nor feed a claimed operation that is
+     * not such a convolution. The first convolution of a model reads the
+-    * graph input and keeps it.
++    * graph input and keeps it, also through a PAD folded into it.
+     */
+    for (int i = 0; i < n; i++) {
+       const struct pipe_tensor *t;
++      int pad = g->producer[i][0];
+ 
+       if (!supported[i] || !tight_small_input(&ops[i]))
+          continue;
+       t = ops[i].input_tensors[0];
++      /* a PAD folded into the convolution: it reads the PAD's input */
++      if (pad >= 0 && supported[pad] && g->partition[pad] == g->partition[i] &&
++          ops[pad].type == PIPE_ML_OPERATION_TYPE_PAD)
++         t = ops[pad].input_tensors[0];
++      else
++         pad = -1;
+       for (int k = 0; k < n; k++) {
+          bool reads = false, writes = false;
+ 
+-         if (k == i || !supported[k] || g->partition[k] != g->partition[i])
++         if (k == i || k == pad || !supported[k] ||
++             g->partition[k] != g->partition[i])
+             continue;
+          for (unsigned j = 0; j < ops[k].output_count; j++)
+             writes |= ops[k].output_tensors[j] == t;
+-- 
+2.55.0
+

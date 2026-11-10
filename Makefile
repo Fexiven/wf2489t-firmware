@@ -3,7 +3,7 @@
 #   make uboot    out/uboot-copy1.img  (FIT for copy 1 of the "uboot" partition)
 #   make kernel   out/kernel/*.deb     (kernel, Wi-Fi driver, linux-image-wf2489t)
 #   make repo     out/repo             (apt repository: wf2489t package, kernel,
-#                                       firmware, TouchKio; signed if
+#                                       Mesa Teflon, firmware, TouchKio; signed if
 #                                       WF2489T_SIGNING_KEY is set)
 #   make image    out/wf2489t-debian.img, out/root.ext4 (needs /dev/kvm)
 #   make all      everything

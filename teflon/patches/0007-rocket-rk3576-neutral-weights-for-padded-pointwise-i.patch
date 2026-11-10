@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:21:10 +0100
+Subject: [PATCH 07/23] rocket: rk3576: neutral weights for padded pointwise
+ input channels
+
+The CMAC computes sum(x_s * w_s) and the hardware adds B * sum(x_s) with
+B = 0x80 - wt_zp, both over every channel the CNA reads, padded ones
+included. The pointwise packer stored padded input channels as 0, which
+weighs B, not 0; the bias fold then only cancels it when the padded input
+bytes hold in_zp - 0x80. That is true for an uploaded graph input but not
+for a tensor written by a previous convolution of the same subgraph (the
+DPU leaves 0 there). MobileNetV2 op 6 (56x56x24 -> 144) fed by op 5 was
+off by a constant 49 on every channel, and the full model was 90 % wrong.
+
+Store padded channels as wt_zp - 0x80 (neutral whatever the input holds)
+and drop the padded-channel term from the weight sum. Single layers with
+uploaded inputs give identical results.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/rocket/rkt_coefs.c | 63 +++++++++++++-------------
+ 1 file changed, 32 insertions(+), 31 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_coefs.c b/src/gallium/drivers/rocket/rkt_coefs.c
+index 384b757..3a4303d 100644
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -565,6 +565,30 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+       bool pw_flat = getenv("ROCKET_PW_FLAT") != NULL;
+       bool pw_icgroup = getenv("ROCKET_PW_ICGROUP") != NULL;
+ 
++      /*
++       * THE PADDED INPUT CHANNELS GET THE NEUTRAL WEIGHT.
++       *
++       * The CMAC computes sum(x_s * w_s) with x_s = x - 0x80 and
++       * w_s = w_q - 0x80 as stored, and the hardware adds B * sum(x_s) with
++       * B = 0x80 - wt_zp (the B field of the bias record, rkt_fill_biases),
++       * both over every channel the CNA reads,
++       * the padded ones included. A padded channel stored as 0 therefore
++       * weighs B, not 0, and its input byte enters the result. The bias fold
++       * (calculate_weight_sum) cancels that only when the padded input bytes
++       * hold in_zp - 0x80, which is what rkt_ml_subgraph_invoke writes when it
++       * uploads a graph input. A tensor produced by an earlier conv of the
++       * same subgraph is written by the DPU, which leaves the channels past
++       * the real count of its last 16-channel group at 0 (MobileNetV2 op 6,
++       * 56x56x24 -> 144 fed by op 5's NPU output, was off by a constant 49
++       * on every output channel).
++       *
++       * Stored as wt_zp - 0x80 (w_q = wt_zp, what the generic path already
++       * writes for its padded lanes), a padded channel contributes
++       * x_s * (wt_zp - 0x80) + B * x_s = 0 whatever it holds, and the
++       * padded-channel term of calculate_weight_sum goes away with it.
++       */
++      uint8_t pad_w = (uint8_t)(zero_point - 0x80);
++
+       for (unsigned oc = 0; oc < oc_n; oc++)
+          for (unsigned ic = 0; ic < ic_n; ic++) {
+             unsigned n;
+@@ -602,10 +626,12 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+              * fifteen past it. Neither has weights of its own in the tensor,
+              * and both stay at the zero point.
+              */
+-            weights_out[n] = (oc < output_channels_real &&
+-                              ic < input_channels_real)
+-                                ? weights_in[oc][0][0][ic] - 0x80
+-                                : 0;
++            if (oc >= output_channels_real)
++               weights_out[n] = 0;
++            else
++               weights_out[n] = ic < input_channels_real
++                                   ? weights_in[oc][0][0][ic] - 0x80
++                                   : pad_w;
+          }
+ 
+       /*
+@@ -793,34 +819,9 @@ calculate_weight_sum(const struct pipe_ml_operation *poperation, unsigned oc,
+             for (unsigned ic = 0; ic < input_channels; ic++)
+                sum += weights[oc][x][y][ic] - weight_zero_point;
+       /*
+-       * THE PADDED INPUT CHANNELS ARE IN THE HARDWARE'S SUM, so they have to
+-       * be in this one.
+-       *
+-       * Since round 197 the pointwise weight buffer is laid out to
+-       * ALIGN(ic, FEATURE_ATOMIC_SIZE) and since round 202 the CNA is told
+-       * that count, so the hardware accumulates over the padded channels too.
+-       * Their weights are written as biased zero, which is w_q = 0x80, so each
+-       * one contributes (0x80 - weight_zero_point) to sum(w_q - wt_zp) and
+-       * this loop, which walks the real channels only, missed all of them.
+-       *
+-       * A[oc] = bias - (in_zp - 0x80) * sw, so a short sw lands as a constant
+-       * offset on every pixel of the channel. Round 202 left pw33x64w56 at
+-       * slope 0.9997 with the offset collapsed to -35.3..-30.3, standard
+-       * deviation 0.85, which is the shape of exactly one missing constant.
+-       *
+-       * A shape whose ic is already a multiple of the atom pads by nothing and
+-       * this term is zero, which is what makes pw64x41w56 and conv2d-cal the
+-       * control.
+-       *
+-       * ROCKET_NO_ICPAD_SUM drops the term.
++       * The padded input channels carry the neutral weight (see
++       * rkt_fill_weights), so they add nothing to the hardware's sum.
+        */
+-      if (weights_width == 1 && weights_height == 1 &&
+-          !getenv("ROCKET_NO_ICPAD_SUM")) {
+-         unsigned padded = rkt_pw_ic_padded(input_channels);
+-
+-         sum += (int32_t)(padded - input_channels) *
+-                ((int32_t)0x80 - (int32_t)weight_zero_point);
+-      }
+    }
+    return sum;
+ }
+-- 
+2.55.0
+
