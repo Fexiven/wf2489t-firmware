@@ -8,7 +8,9 @@
 #
 # Publishes: Person in room (any person >= KIOSK_PERSON_THRESHOLD, two checks in
 # a row, on until KIOSK_PERSON_HOLD s without one), Person near (a person box at
-# least KIOSK_PERSON_NEAR of the frame height), Person count, Person score.
+# least KIOSK_PERSON_NEAR of the frame height), Person count, Person score, and
+# every 30 s NPU load (from the rocket driver's fdinfo), NPU clock, NPU
+# temperature and the time per check.
 # Display: off after KIOSK_PERSON_SCREEN_OFF s without a person, on again with
 # KIOSK_PERSON_WAKE = person (a person in the room) | near.
 # Settings from /etc/default/kiosk (KIOSK_MQTT_*, KIOSK_PERSON_*; the older
@@ -43,6 +45,7 @@ FAST, FAST_FOR = 0.5, 10                                   # seconds between che
 SCREEN_OFF = float(env("KIOSK_PERSON_SCREEN_OFF") or env("KIOSK_MOTION_SCREEN_OFF") or 300)
                                                            # display off without a person (0 = never)
 WAKE = env("KIOSK_PERSON_WAKE") or "person"                # display on with: person (in room), near
+STATS_EVERY = 30                                           # seconds between NPU/check statistics
 
 
 def sh(*args):
@@ -213,6 +216,15 @@ class Mqtt:
             self.pub(f"homeassistant/binary_sensor/{i}/{key}/config",
                      f'{{"name":"{name}","unique_id":"{i}_{key}","object_id":"{i}_{key}",'
                      f'"device_class":"{cls}","state_topic":"touchkio/{i}/{key}/state",{avail},{dev}}}')
+        for key, name, unit, extra in (("load", "NPU load", "%", ""),
+                                       ("freq", "NPU clock", "MHz", '"device_class":"frequency",'),
+                                       ("temp", "NPU temperature", "°C", '"device_class":"temperature",'),
+                                       ("check", "Person check time", "ms", '"device_class":"duration",')):
+            self.pub(f"homeassistant/sensor/{i}/npu_{key}/config",
+                     f'{{"name":"{name}","unique_id":"{i}_npu_{key}","object_id":"{i}_npu_{key}",'
+                     f'"state_class":"measurement","entity_category":"diagnostic",{extra}'
+                     f'"state_topic":"touchkio/{i}/person/npu","value_template":"{{{{ value_json.{key} }}}}",'
+                     f'"unit_of_measurement":"{unit}",{avail},{dev}}}')
         for key, name, unit in (("count", "Person count", ""), ("score", "Person score", "%")):
             self.pub(f"homeassistant/sensor/{i}/person_{key}/config",
                      f'{{"name":"{name}","unique_id":"{i}_person_{key}","object_id":"{i}_person_{key}",'
@@ -234,9 +246,61 @@ class Mqtt:
     def info(self, count, score):
         self.pub(f"touchkio/{self.id}/person/info", f'{{"count":{count},"score":{round(score * 100)}}}')
 
+    def npu(self, stats):
+        self.pub(f"touchkio/{self.id}/person/npu",
+                 "{" + ",".join(f'"{k}":{"null" if v is None else v}' for k, v in stats.items()) + "}")
+
     def display(self, on):
         """TouchKio's display light (wlopm), so that Home Assistant sees the change too."""
         self.pub(f"touchkio/{self.id}/display/power/set", "ON" if on else "OFF", retain=False)
+
+
+class Stats:
+    """NPU load from the engine time the rocket driver reports per client in
+    fdinfo (drm-engine-npu<core>, kernel patch rk3576-npu-open 0012; this
+    process is the client), the NPU clock (drm-curfreq-npu0), the NPU
+    temperature and the mean time per check (frame to detections)."""
+
+    def __init__(self):
+        self.zone = next((z for z in glob.glob("/sys/class/thermal/thermal_zone*")
+                          if open(f"{z}/type").read().strip() == "npu-thermal"), None)
+        self.t, (self.busy, _, _) = time.monotonic(), self.engines()
+        self.check_s, self.checks = 0.0, 0
+
+    @staticmethod
+    def engines():
+        """NPU time of all cores (ns), number of cores, clock (Hz) of this process."""
+        busy, cores, freq = 0, 0, None
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                if os.path.realpath(f"/proc/self/fd/{fd}") != "/dev/accel/accel0":
+                    continue
+                for line in open(f"/proc/self/fdinfo/{fd}"):
+                    key, _, value = line.partition(":")
+                    if key.startswith("drm-engine-npu"):
+                        busy, cores = busy + int(value.split()[0]), cores + 1
+                    elif key.startswith("drm-curfreq-npu"):
+                        freq = int(value.split()[0])
+            except (OSError, ValueError):
+                pass
+        return busy, cores, freq
+
+    def check(self, seconds):
+        self.check_s, self.checks = self.check_s + seconds, self.checks + 1
+
+    def take(self):
+        """The statistics since the last call."""
+        now, (busy, cores, freq) = time.monotonic(), self.engines()
+        load = None
+        if cores:
+            load = round((busy - self.busy) / 1e9 / (now - self.t) / cores * 100, 1)
+        temp = None
+        if self.zone:
+            temp = round(int(open(f"{self.zone}/temp").read()) / 1000, 1)
+        stats = {"load": load, "freq": freq and freq // 1000000, "temp": temp,
+                 "check": round(self.check_s / self.checks * 1000) if self.checks else None}
+        self.t, self.busy, self.check_s, self.checks = now, busy, 0.0, 0
+        return stats
 
 
 def load_detector():
@@ -279,6 +343,7 @@ def run(mqtt, det):
     p = Presence(THRESHOLD)
     screen_off = False
     last_check = last_info = 0.0
+    stats, last_stats = Stats(), time.monotonic()
     info = (-1, -1)
     mqtt.state("person_room", False)
     mqtt.state("person_near", False)
@@ -299,6 +364,7 @@ def run(mqtt, det):
             continue
         last_check = now
         dets = det.run(det.small(raw), min(THRESHOLD, 0.2))
+        stats.check(time.monotonic() - now)
         room, near = p.room, p.near
         seen_near = p.update(now, dets)
         if p.room != room:
@@ -313,6 +379,9 @@ def run(mqtt, det):
             screen_off = False                         # only undo our own switch-off
             mqtt.display(True)
             settle = 10                                # the display lights the room: new exposure
+        if now - last_stats >= STATS_EVERY:
+            last_stats = now
+            mqtt.npu(stats.take())
         if SCREEN_OFF and not screen_off and now - p.last_seen > SCREEN_OFF:
             screen_off = True
             mqtt.display(False)
