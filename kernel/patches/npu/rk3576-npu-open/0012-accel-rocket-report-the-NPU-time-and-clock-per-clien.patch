@@ -1,0 +1,160 @@
+From 17ff2f0f7c48b87aaaa2863ddb32dd5aa11ce808 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:33:09 +0100
+Subject: [PATCH 12/12] accel/rocket: report the NPU time and clock per client
+ in fdinfo
+
+There is no way to see how busy the NPU is: devfreq keeps its load to
+itself and runtime PM only says when a core was powered (which includes
+the autosuspend delay after every job).
+
+Account the time each job runs on its core and print it per client in
+fdinfo as drm-engine-npu<core>, with the shared NPU clock as
+drm-curfreq-npu<core> and the client's memory (drm_show_memory_stats),
+as in Documentation/gpu/drm-usage-stats.rst. Two samples of the engine
+time give the utilisation, so generic tools can show it.
+
+The counters live in the client's IOMMU domain: a job holds a reference
+to it and can complete after its file was closed.
+
+Example, a person detector checking one camera frame per second with
+EfficientDet-Lite0 on both cores:
+
+  drm-driver:	rocket
+  drm-client-id:	8
+  drm-engine-npu0:	273113161 ns
+  drm-curfreq-npu0:	950000000 Hz
+  drm-engine-npu1:	208623400 ns
+  drm-curfreq-npu1:	950000000 Hz
+  drm-total-memory:	68952 KiB
+  drm-shared-memory:	0
+---
+ drivers/accel/rocket/rocket_drv.c | 35 +++++++++++++++++++++++++++++--
+ drivers/accel/rocket/rocket_drv.h | 10 +++++++++
+ drivers/accel/rocket/rocket_job.c |  4 ++++
+ drivers/accel/rocket/rocket_job.h |  3 +++
+ 4 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index 148c0db8d..d6440cf98 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -39,7 +39,7 @@ rocket_iommu_domain_destroy(struct kref *kref)
+ static struct rocket_iommu_domain*
+ rocket_iommu_domain_create(struct device *dev)
+ {
+-	struct rocket_iommu_domain *domain = kmalloc_obj(*domain);
++	struct rocket_iommu_domain *domain = kzalloc_obj(*domain);
+ 	void *err;
+ 
+ 	if (!domain)
+@@ -173,7 +173,37 @@ static const struct drm_ioctl_desc rocket_drm_driver_ioctls[] = {
+ 	ROCKET_IOCTL(GET_PARAM, get_param),
+ };
+ 
+-DEFINE_DRM_ACCEL_FOPS(rocket_accel_driver_fops);
++/*
++ * Per client: the time its jobs ran on each core (drm-engine-npu<core>) and
++ * the NPU clock (drm-curfreq-npu<core>, all cores share it), see
++ * Documentation/gpu/drm-usage-stats.rst. Tools sample the engine time twice
++ * for the utilisation.
++ */
++static void rocket_show_fdinfo(struct drm_printer *p, struct drm_file *file)
++{
++	struct rocket_file_priv *rocket_priv = file->driver_priv;
++	struct rocket_device *rdev = rocket_priv->rdev;
++	unsigned long rate = 0;
++	unsigned int core;
++
++	if (rdev->devfreq.devfreq)
++		rate = READ_ONCE(rdev->devfreq.rate);
++
++	for (core = 0; core < min_t(unsigned int, rdev->num_cores, ROCKET_MAX_CORES); core++) {
++		drm_printf(p, "drm-engine-npu%u:\t%llu ns\n", core,
++			   atomic64_read(&rocket_priv->domain->busy_ns[core]));
++		if (rate)
++			drm_printf(p, "drm-curfreq-npu%u:\t%lu Hz\n", core, rate);
++	}
++
++	drm_show_memory_stats(p, file);
++}
++
++static const struct file_operations rocket_accel_driver_fops = {
++	.owner		= THIS_MODULE,
++	DRM_ACCEL_FOPS,
++	.show_fdinfo	= drm_show_fdinfo,
++};
+ 
+ /*
+  * Rocket driver version:
+@@ -187,6 +217,7 @@ static const struct drm_driver rocket_drm_driver = {
+ 	.ioctls			= rocket_drm_driver_ioctls,
+ 	.num_ioctls		= ARRAY_SIZE(rocket_drm_driver_ioctls),
+ 	.fops			= &rocket_accel_driver_fops,
++	.show_fdinfo		= rocket_show_fdinfo,
+ 	.name			= "rocket",
+ 	.desc			= "rocket DRM",
+ };
+diff --git a/drivers/accel/rocket/rocket_drv.h b/drivers/accel/rocket/rocket_drv.h
+index c12711ee9..464a4ad89 100644
+--- a/drivers/accel/rocket/rocket_drv.h
++++ b/drivers/accel/rocket/rocket_drv.h
+@@ -13,9 +13,19 @@
+ extern const struct dev_pm_ops rocket_pm_ops;
+ extern const struct of_device_id rocket_dt_match[];
+ 
++/* RK3588 has three NPU cores, RK3576 two */
++#define ROCKET_MAX_CORES	3
++
+ struct rocket_iommu_domain {
+ 	struct iommu_domain *domain;
+ 	struct kref kref;
++
++	/*
++	 * NPU time of the client's jobs per core, for fdinfo. Here and not in
++	 * rocket_file_priv because a job holds a reference to the domain and
++	 * may complete after the file is closed.
++	 */
++	atomic64_t busy_ns[ROCKET_MAX_CORES];
+ };
+ 
+ struct rocket_file_priv {
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index 1a3fd01bc..948a7c3ad 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -417,6 +417,7 @@ static struct dma_fence *rocket_job_run(struct drm_sched_job *sched_job)
+ 	scoped_guard(spinlock_irqsave, &core->job_lock) {
+ 		core->in_flight_job = job;
+ 		rocket_devfreq_record_busy(rdev);
++		job->start = ktime_get();
+ 		rocket_job_hw_submit(core, job);
+ 	}
+ 
+@@ -454,6 +455,9 @@ static void rocket_job_next_locked(struct rocket_core *core)
+ 
+ 	core->in_flight_job = NULL;
+ 	rocket_devfreq_record_idle(core->rdev);
++	if (core->index < ROCKET_MAX_CORES)
++		atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), job->start)),
++			     &job->domain->busy_ns[core->index]);
+ 	dma_fence_signal(job->done_fence);
+ 	pm_runtime_mark_last_busy(core->dev);
+ 	pm_runtime_put_autosuspend(core->dev);
+diff --git a/drivers/accel/rocket/rocket_job.h b/drivers/accel/rocket/rocket_job.h
+index 78a0d10df..186529b90 100644
+--- a/drivers/accel/rocket/rocket_job.h
++++ b/drivers/accel/rocket/rocket_job.h
+@@ -38,6 +38,9 @@ struct rocket_job {
+ 
+ 	struct rocket_iommu_domain *domain;
+ 
++	/* when the job started on the core, for its busy time */
++	ktime_t start;
++
+ 	struct kref refcount;
+ 
+ 	/* the submitting client and its entity slot, see rocket_device.excl_* */
+-- 
+2.55.0
+
