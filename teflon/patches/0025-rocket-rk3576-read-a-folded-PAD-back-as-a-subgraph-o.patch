@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:36:03 +0100
+Subject: [PATCH 25/25] rocket: rk3576: read a folded PAD back as a subgraph
+ output
+
+A PAD is folded into the convolutions that read it and has no buffer of
+its own. TFLite can still ask for its output: when the tensor is also an
+output of the graph (or of the partition), rkt_ml_subgraph_read_outputs()
+found no producer for it and dereferenced NULL. Reproduced with YOLOX
+nano and any of its PADs (ops 0, 3, 12, 78) exposed as an extra graph
+output; the crash was in partition_invoke on the first invoke.
+
+The filter cannot refuse such a PAD, since the graph outputs are not
+known before TFLite has partitioned the graph. Remember every folded PAD
+instead and build its output on the CPU when it is read back: the PAD's
+input as the convolutions read it (the tight first-convolution layout
+that invoke uploaded, or NC1HWC2) back to NHWC, padded with the output
+zero point. This costs nothing unless the tensor is read.
+
+The other operations that are views or internal tensors already give a
+readable output: a zero-copy concatenation input is a view of the output
+BO, the 2x - 1 resize and the concatenation packing write their real
+output last, and an ADD has a task of its own. An output that no
+operation writes now gives an error message instead of a crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_ml.c | 136 +++++++++++++++++++++++++---
+ src/gallium/drivers/rocket/rkt_ml.h |  17 ++++
+ 2 files changed, 139 insertions(+), 14 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_ml.c b/src/gallium/drivers/rocket/rkt_ml.c
+index be3ae72..52dadc5 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -1656,6 +1656,7 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+    tensor_count = count_tensors(poperations, count);
+    util_dynarray_init(&subgraph->tensors, NULL);
+    util_dynarray_init(&subgraph->operations, NULL);
++   util_dynarray_init(&subgraph->folded_pads, NULL);
+    if (!util_dynarray_resize(&subgraph->tensors, struct pipe_resource *,
+                              tensor_count))
+       return NULL;
+@@ -1667,9 +1668,26 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
+       operation.add_tensor = -1;
+ 
+       switch (poperations[i].type) {
+-      case PIPE_ML_OPERATION_TYPE_PAD:
++      case PIPE_ML_OPERATION_TYPE_PAD: {
+          /* folded into its consumers below */
++         const struct pipe_tensor *pi = poperations[i].input_tensors[0];
++         const struct pipe_tensor *po = poperations[i].output_tensors[0];
++         struct rkt_folded_pad pad = {
++            .input_index = pi->index,
++            .output_index = po->index,
++            .in_d1 = pi->dims[1],
++            .in_d2 = pi->dims[2],
++            .out_d1 = po->dims[1],
++            .out_d2 = po->dims[2],
++            .channels = pi->dims[3],
++            .before_d1 = poperations[i].pad.before_x,
++            .before_d2 = poperations[i].pad.before_y,
++            .value = (uint8_t)po->zero_point,
++         };
++         util_dynarray_append(&subgraph->folded_pads, struct rkt_folded_pad,
++                              pad);
+          break;
++      }
+       case PIPE_ML_OPERATION_TYPE_CONCATENATION:
+          lower_concat_rk3576(subgraph, &poperations[i], &operation);
+          util_dynarray_append(&subgraph->operations, struct rkt_operation,
+@@ -2619,6 +2637,92 @@ submit_jobs:;
+    DBG("Submitted graph\n");
+ }
+ 
++/*
++ * Wait for the writers of tensor idx: a two-core producer fences its
++ * core 0 half on its sync BO only, and a concatenation output has the
++ * producers of its inputs.
++ */
++static void
++wait_mc_producers(struct pipe_context *pcontext,
++                  struct rkt_ml_subgraph *subgraph, unsigned idx)
++{
++   struct rkt_operation *prods[64];
++   unsigned np = real_producers(subgraph, idx, prods, 64);
++
++   for (unsigned q = 0; q < np; q++) {
++      struct pipe_transfer *sync_transfer = NULL;
++
++      if (!prods[q]->mc_sync)
++         continue;
++      pipe_buffer_map(pcontext, prods[q]->mc_sync, PIPE_MAP_READ,
++                      &sync_transfer);
++      pipe_buffer_unmap(pcontext, sync_transfer);
++   }
++}
++
++static const struct rkt_folded_pad *
++find_folded_pad(struct rkt_ml_subgraph *subgraph, unsigned idx)
++{
++   util_dynarray_foreach (&subgraph->folded_pads, struct rkt_folded_pad, pad)
++      if (pad->output_index == idx)
++         return pad;
++   return NULL;
++}
++
++/*
++ * The output of a folded PAD (rkt_folded_pad), read as an output of the
++ * subgraph: the PAD's input as the convolutions read it, either the tight
++ * first-convolution layout that invoke uploaded (rkt_ml_subgraph_invoke)
++ * or NC1HWC2, back to NHWC, then padded with the output zero point.
++ */
++static void
++read_folded_pad(struct pipe_context *pcontext,
++                struct rkt_ml_subgraph *subgraph,
++                const struct rkt_folded_pad *pad, uint8_t *out,
++                bool is_signed)
++{
++   struct rkt_screen *screen = rkt_screen(pcontext->screen);
++   struct rkt_operation *consumer =
++      find_first_consumer(subgraph, pad->input_index);
++   struct rkt_resource *input = rkt_get_tensor(subgraph, pad->input_index);
++   const unsigned c = pad->channels;
++   const unsigned n = pad->in_d1 * pad->in_d2 * c;
++   struct pipe_transfer *transfer = NULL;
++   uint8_t *nhwc, *map;
++
++   memset(out, pad->value, pad->out_d1 * pad->out_d2 * c);
++   if (!consumer || !input) {
++      fprintf(stderr, "rocket: PAD -> t%u: input t%u has no buffer\n",
++              pad->output_index, pad->input_index);
++      return;
++   }
++
++   nhwc = malloc(n);
++   wait_mc_producers(pcontext, subgraph, pad->input_index);
++   map = pipe_buffer_map(pcontext, &input->base, PIPE_MAP_READ, &transfer);
++
++   if (screen->soc == RKT_SOC_RK3576 && !consumer->depthwise &&
++       consumer->input_channels <= 4) {
++      /* the first-convolution input: rows of rkt_fc_width() pixels */
++      unsigned row = consumer->input_width * c;
++      unsigned stride = rkt_fc_width(consumer->input_width) * c;
++
++      for (unsigned y = 0; y < consumer->input_height; y++)
++         memcpy(nhwc + y * row, map + y * stride, row);
++      if (is_signed && !rkt_int8_raw_input(consumer))
++         rkt_int8_flip(nhwc, n);
++   } else {
++      rkt_ovh_nc1hwc2_to_nhwc(nhwc, map, pad->in_d1 * pad->in_d2, c,
++                              is_signed ? 0 : 0x80);
++   }
++   pipe_buffer_unmap(pcontext, transfer);
++
++   for (unsigned y = 0; y < pad->in_d1; y++)
++      memcpy(out + ((y + pad->before_d1) * pad->out_d2 + pad->before_d2) * c,
++             nhwc + y * pad->in_d2 * c, pad->in_d2 * c);
++   free(nhwc);
++}
++
+ void
+ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+                              struct pipe_ml_subgraph *psubgraph,
+@@ -2631,30 +2735,33 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
+    DBG("Processing output\n");
+ 
+    for (int i = 0; i < outputs_count; i++) {
++      const struct rkt_folded_pad *pad =
++         find_folded_pad(subgraph, output_idxs[i]);
++
++      if (pad) {
++         read_folded_pad(pcontext, subgraph, pad, outputs[i],
++                         is_signed && is_signed[i]);
++         continue;
++      }
+ 
+       struct rkt_operation *operation = find_producer(subgraph, output_idxs[i]);
+       struct rkt_resource *output_tensor =
+          rkt_get_tensor(subgraph, output_idxs[i]);
+       struct pipe_transfer *transfer = NULL;
+       uint8_t *raw_output;
++
++      if (!operation || !output_tensor) {
++         fprintf(stderr, "rocket: output t%u is not written by the NPU\n",
++                 output_idxs[i]);
++         continue;
++      }
++
+       uint8_t(*output_in)[operation->output_height][operation->output_width]
+                          [FEATURE_ATOMIC_SIZE];
+       uint8_t(*output_out)[operation->output_width][operation->output_channels];
+ 
+       /* a two-core producer: its core 0 half is fenced on the sync BO */
+-      {
+-         /* a concatenation output has the producers of its inputs */
+-         struct rkt_operation *prods[64];
+-         unsigned np = real_producers(subgraph, output_idxs[i], prods, 64);
+-         for (unsigned q = 0; q < np; q++) {
+-            if (!prods[q]->mc_sync)
+-               continue;
+-            struct pipe_transfer *sync_transfer = NULL;
+-            pipe_buffer_map(pcontext, prods[q]->mc_sync, PIPE_MAP_READ,
+-                            &sync_transfer);
+-            pipe_buffer_unmap(pcontext, sync_transfer);
+-         }
+-      }
++      wait_mc_producers(pcontext, subgraph, output_idxs[i]);
+ 
+       DBG("Before pipe_buffer_map\n");
+       raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
+@@ -2731,6 +2838,7 @@ rkt_ml_subgraph_destroy(struct pipe_context *context,
+       if (tensor)
+          pipe_resource_reference(tensor, NULL);
+    util_dynarray_fini(&subgraph->tensors);
++   util_dynarray_fini(&subgraph->folded_pads);
+ 
+    free(subgraph);
+ }
+diff --git a/src/gallium/drivers/rocket/rkt_ml.h b/src/gallium/drivers/rocket/rkt_ml.h
+index 09be7ca..e92f7a9 100644
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -274,6 +274,23 @@ struct rkt_ml_subgraph {
+    /* the submit jobs, built on the first invoke */
+    struct util_dynarray ovh_jobs; /* drm_rocket_job */
+    bool ovh_jobs_valid;
++
++   /* the PADs folded into convolutions, rkt_folded_pad */
++   struct util_dynarray folded_pads;
++};
++
++/*
++ * A PAD folded into the convolutions that read it (rkt_ml_subgraph_create)
++ * has no buffer of its own. When its output is also an output of the
++ * subgraph, rkt_ml_subgraph_read_outputs() builds it on the CPU from the
++ * PAD's input. Dimensions as TFLite's NHWC dims 1 and 2.
++ */
++struct rkt_folded_pad {
++   unsigned input_index;
++   unsigned output_index;
++   unsigned in_d1, in_d2, out_d1, out_d2, channels;
++   unsigned before_d1, before_d2;
++   uint8_t value; /* the output zero point, as TFLite stores it */
+ };
+ 
+ bool
+-- 
+2.55.0
+

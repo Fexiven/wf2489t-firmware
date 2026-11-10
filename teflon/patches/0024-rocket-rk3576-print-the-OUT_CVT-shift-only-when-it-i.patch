@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fexiven <48439988+Fexiven@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:38:38 +0100
+Subject: [PATCH 24/25] rocket: rk3576: print the OUT_CVT shift only when it is
+ overridden
+
+The OUT_CVT shift was printed to stderr for every convolution of every
+model while compiling, about 150 lines for a detection model, which
+ends up in the journal of any service using the delegate. Print it only
+together with the ROCKET_OUT_SHIFT_ABS override it is a diagnostic for.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6ragSxZN7WKWgGsfgrMX1
+---
+ src/gallium/drivers/rocket/rkt_regcmd.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/rocket/rkt_regcmd.c b/src/gallium/drivers/rocket/rkt_regcmd.c
+index 12e8799..6cc6bdf 100644
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -1384,16 +1384,17 @@ fill_regcmd_rk3576_normal(struct rkt_ml_subgraph *subgraph,
+        * shift to an ABSOLUTE N (small N = max amplify, no negative-wrap risk),
+        * to decide whether the zero-rail is a non-zero MAC crushed by requant
+        * (output lights up as the shift drops) or a genuine empty MAC (stays out_zp
+-       * across the whole sweep). Also prints the computed shift for reference.
++       * across the whole sweep). Then also prints the computed shift for reference.
+        */
+       const char *abs_s = getenv("ROCKET_OUT_SHIFT_ABS");
+       uint32_t shift_val =
+          abs_s ? (uint32_t)atoi(abs_s)
+                : operation->rq_exact ? operation->rq_shift
+                                      : (shift - 1 + rkt_out_shift_add());
+-      fprintf(stderr,
+-              "rocket: OUT_CVT computed_shift=%d scale=0x%x -> emitting shift=%u\n",
+-              (int)shift - 1, cvt_scale, shift_val);
++      if (abs_s)
++         fprintf(stderr,
++                 "rocket: OUT_CVT computed_shift=%d scale=0x%x -> emitting shift=%u\n",
++                 (int)shift - 1, cvt_scale, shift_val);
+       R_DPU(0x40b4, shift_val); /* OUT_CVT shift (+0x80 de-scale) */
+    }
+    R_DPU(0x40b8, (dw ? 4 : 2) * plane - ow * win_orows);
+-- 
+2.55.0
+
